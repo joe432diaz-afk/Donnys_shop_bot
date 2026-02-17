@@ -18,11 +18,11 @@ if not TOKEN:
 # ------------------- CONFIG -------------------
 CHANNEL_ID = -1003833257976  # Admin channel ID
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
-ADMINS = [1003833257976]  # Your main admin numeric ID
+ADMINS = []  # Will auto-add first admin
 # ---------------------------------------------
 
 # Conversation states
-SELECT_PRODUCT, SELECT_QUANTITY, NAME, ADDRESS, SHIPPING, DISCOUNT, CONFIRM, ADMIN_PANEL, ADMIN_ORDER_SELECT, ADMIN_ACTION, ADD_ADMIN = range(11)
+SELECT_PRODUCT, SELECT_QUANTITY, NAME, ADDRESS, SHIPPING, DISCOUNT, CONFIRM, ADMIN_PANEL, ADMIN_ACTION, ADD_ADMIN = range(10)
 
 # Store orders
 user_orders = {}       # {user_id: {order info}}
@@ -201,8 +201,17 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- Admin Panel ----------------
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("❌ You are not authorized to use this.")
+    user_id = update.effective_user.id
+    # Auto-add first admin if list is empty
+    if len(ADMINS) == 0:
+        ADMINS.append(user_id)
+        await update.message.reply_text(f"✅ Your ID {user_id} has been added as the first admin.")
+
+    # Show numeric ID for debug
+    await update.message.reply_text(f"Your numeric Telegram ID is: `{user_id}`", parse_mode="Markdown")
+
+    if user_id not in ADMINS:
+        await update.message.reply_text("❌ You are not authorized to use the admin panel.")
         return ConversationHandler.END
 
     keyboard = []
@@ -216,78 +225,6 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("📋 Admin Panel - Select an order or manage admins:", reply_markup=reply_markup)
     return ADMIN_PANEL
-
-# ---------------- Admin actions ----------------
-async def admin_order_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "back":
-        return await start(update, context)
-
-    if query.data == "add_new_admin":
-        await query.edit_message_text("Send numeric Telegram ID of new admin:")
-        return ADD_ADMIN
-
-    order_number = int(query.data.replace("admin_order_", ""))
-    if order_number not in all_orders:
-        await query.edit_message_text("Order not found.")
-        return ADMIN_PANEL
-
-    order = all_orders[order_number]["info"]
-    status = all_orders[order_number]["status"]
-    summary = (
-        f"📄 Order #{order_number}\n"
-        f"User: @{update.effective_user.username}\n"
-        f"Product: {order['product']}\n"
-        f"Quantity: {order['quantity']}\n"
-        f"Name: {order['name']}\n"
-        f"Address: {order['address']}\n"
-        f"Shipping: {order['shipping']}\n"
-        f"Discount: {order['discount']}\n"
-        f"Amount: £{order['final_price']}\n"
-        f"Status: {status}"
-    )
-    keyboard = [
-        [InlineKeyboardButton("Mark Paid", callback_data=f"mark_paid_{order_number}")],
-        [InlineKeyboardButton("Mark Dispatched", callback_data=f"mark_dispatched_{order_number}")],
-        [InlineKeyboardButton("Cancel Order", callback_data=f"cancel_order_{order_number}")],
-        [InlineKeyboardButton("Back to Admin Panel", callback_data="back")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(summary, reply_markup=reply_markup)
-    return ADMIN_ACTION
-
-# ---------------- Handle Admin Action ----------------
-async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-    if data == "back":
-        return await admin(update, context)
-
-    action, order_number = data.split("_", 1)[0], int(data.split("_", 1)[1])
-    order_data = all_orders.get(order_number)
-    if not order_data:
-        await query.edit_message_text("Order not found.")
-        return ADMIN_PANEL
-
-    user_id = order_data["user_id"]
-
-    if action == "mark":
-        if "paid" in data:
-            all_orders[order_number]["status"] = "Paid, awaiting dispatch"
-            await context.bot.send_message(user_id, f"✅ Your order #{order_number} has been marked as Paid, awaiting dispatch.\nLTC Wallet (copyable): `{CRYPTO_WALLET}`")
-        elif "dispatched" in data:
-            all_orders[order_number]["status"] = "Dispatched"
-            await context.bot.send_message(user_id, f"📦 Your order #{order_number} has been Dispatched!")
-
-    elif action == "cancel":
-        all_orders[order_number]["status"] = "Cancelled"
-        await context.bot.send_message(user_id, f"❌ Your order #{order_number} has been Cancelled.")
-
-    return await admin(update, context)
 
 # ---------------- Add New Admin ----------------
 async def add_new_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -315,8 +252,7 @@ conv_handler = ConversationHandler(
         SHIPPING: [CallbackQueryHandler(shipping_select)],
         DISCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, discount_input)],
         CONFIRM: [CallbackQueryHandler(confirm_payment, pattern="confirm_payment_")],
-        ADMIN_PANEL: [CallbackQueryHandler(admin_order_select, pattern="admin_order_.*|add_new_admin|back")],
-        ADMIN_ACTION: [CallbackQueryHandler(admin_action, pattern="mark_paid_.*|mark_dispatched_.*|cancel_order_.*|back")],
+        ADMIN_PANEL: [CallbackQueryHandler(admin, pattern="admin_order_.*|add_new_admin|back")],
         ADD_ADMIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_new_admin)]
     },
     fallbacks=[CommandHandler("cancel", cancel)],
