@@ -28,8 +28,13 @@ cur.execute("""
 CREATE TABLE IF NOT EXISTS products (
     id TEXT PRIMARY KEY,
     name TEXT,
-    price REAL,
-    photo TEXT
+    description TEXT,
+    photo_file_id TEXT,
+    price_3_5 REAL,
+    price_7 REAL,
+    price_14 REAL,
+    price_28 REAL,
+    price_58 REAL
 )
 """)
 
@@ -39,6 +44,7 @@ CREATE TABLE IF NOT EXISTS orders (
     user_id INTEGER,
     product_id TEXT,
     product_name TEXT,
+    weight TEXT,
     price REAL,
     status TEXT,
     name TEXT,
@@ -49,12 +55,12 @@ db.commit()
 
 # ================= HELPERS =================
 def get_products():
-    cur.execute("SELECT id, name, price, photo FROM products")
+    cur.execute("SELECT id, name, description, photo_file_id, price_3_5 FROM products")
     return cur.fetchall()
 
 def main_menu():
     buttons = []
-    for pid, name, price, _ in get_products():
+    for pid, name, desc, photo_id, price in get_products():
         buttons.append([InlineKeyboardButton(f"{name} (£{price})", callback_data=f"prod_{pid}")])
     buttons.append([InlineKeyboardButton("📦 My Orders", callback_data="my_orders")])
     return InlineKeyboardMarkup(buttons)
@@ -63,27 +69,70 @@ def main_menu():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🌿 Welcome\nSelect a product:", reply_markup=main_menu())
 
-# ================= PRODUCT FLOW =================
+# ================= PRODUCT SELECTION =================
 async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     pid = q.data.replace("prod_", "")
-    cur.execute("SELECT name, price FROM products WHERE id=?", (pid,))
+    cur.execute(
+        "SELECT name, description, price_3_5, price_7, price_14, price_28, price_58, photo_file_id FROM products WHERE id=?",
+        (pid,)
+    )
     product = cur.fetchone()
 
     if not product:
         await q.edit_message_text("❌ Product not found.", reply_markup=main_menu())
         return
 
+    # Save session
     USER_SESSIONS[q.from_user.id] = {
         "product_id": pid,
         "product_name": product[0],
-        "price": product[1],
-        "step": "name"
+        "description": product[1],
+        "photo_file_id": product[7],
+        "prices": {
+            "3.5": product[2],
+            "7": product[3],
+            "14": product[4],
+            "28": product[5],
+            "58": product[6]
+        },
+        "step": "weight"
     }
 
-    await q.edit_message_text("✍️ Send your FULL NAME:")
+    # Weight selection buttons
+    buttons = [
+        [InlineKeyboardButton(f"{w}g (£{p})", callback_data=f"weight_{w}")] 
+        for w, p in USER_SESSIONS[q.from_user.id]["prices"].items()
+    ]
+
+    # Send photo with description and buttons
+    await context.bot.send_photo(
+        chat_id=q.from_user.id,
+        photo=USER_SESSIONS[q.from_user.id]["photo_file_id"],
+        caption=f"📦 {product[0]}\n{product[1]}\n\nChoose weight:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+    # Delete the previous message to keep chat clean
+    await q.delete_message()
+
+# ================= WEIGHT SELECTION =================
+async def weight_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    s = USER_SESSIONS.get(uid)
+
+    if not s or s.get("step") != "weight":
+        await q.edit_message_text("❌ No active product selection.")
+        return
+
+    weight = q.data.replace("weight_", "")
+    s["weight"] = weight
+    s["price"] = s["prices"][weight]
+    s["step"] = "name"
+    await q.edit_message_text(f"💰 Selected {weight}g — £{s['price']}\n\nSend your FULL NAME:")
 
 # ================= TEXT HANDLER =================
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -92,28 +141,58 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -------- ADMIN PRODUCT CREATION --------
     admin = ADMIN_SESSIONS.get(uid)
     if admin:
-        if admin["step"] == "name":
+        step = admin.get("step")
+
+        if step == "name":
             admin["name"] = update.message.text
-            admin["step"] = "price"
-            await update.message.reply_text("💰 Send product price:")
+            admin["step"] = "description"
+            await update.message.reply_text("📝 Send product DESCRIPTION:")
             return
 
-        if admin["step"] == "price":
-            try:
-                admin["price"] = float(update.message.text)
-            except:
-                await update.message.reply_text("❌ Invalid price.")
-                return
+        if step == "description":
+            admin["description"] = update.message.text
             admin["step"] = "photo"
-            await update.message.reply_text("📷 Send product photo URL:")
+            await update.message.reply_text("📷 Send product PHOTO (as image, not URL):")
             return
 
-        if admin["step"] == "photo":
+        if step == "photo":
+            if update.message.photo:
+                photo_file = update.message.photo[-1].file_id
+                admin["photo_file_id"] = photo_file
+                admin["step"] = "prices"
+                await update.message.reply_text(
+                    "💰 Send product prices for each weight in the format:\n"
+                    "3.5,7,14,28,58 (comma separated, e.g., 10,20,35,60,100)"
+                )
+                return
+            else:
+                await update.message.reply_text("❌ Please send a photo, not text or URL.")
+                return
+
+        if step == "prices":
+            try:
+                prices = list(map(float, update.message.text.split(",")))
+                if len(prices) != 5:
+                    raise ValueError
+            except:
+                await update.message.reply_text("❌ Invalid format. Send 5 comma-separated numbers.")
+                return
+
+            admin["price_3_5"], admin["price_7"], admin["price_14"], admin["price_28"], admin["price_58"] = prices
             pid = admin["name"].lower().replace(" ", "_")
-            cur.execute(
-                "INSERT OR REPLACE INTO products VALUES (?, ?, ?, ?)",
-                (pid, admin["name"], admin["price"], update.message.text)
-            )
+            cur.execute("""
+            INSERT OR REPLACE INTO products VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                pid,
+                admin["name"],
+                admin["description"],
+                admin["photo_file_id"],
+                admin["price_3_5"],
+                admin["price_7"],
+                admin["price_14"],
+                admin["price_28"],
+                admin["price_58"]
+            ))
             db.commit()
             ADMIN_SESSIONS.pop(uid)
             await update.message.reply_text("✅ Product added!", reply_markup=main_menu())
@@ -136,12 +215,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         oid = random.randint(100000, 999999)
 
         cur.execute("""
-        INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO orders (order_id, user_id, product_id, product_name, weight, price, status, name, address)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             oid,
             uid,
             s["product_id"],
             s["product_name"],
+            s["weight"],
             s["price"],
             "Pending payment",
             s["name"],
@@ -151,14 +232,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             f"✅ ORDER #{oid}\n\n"
-            f"{s['product_name']}\n"
+            f"{s['product_name']} — {s['weight']}g\n"
             f"💰 £{s['price']}\n\n"
             f"💳 LTC ONLY:\n{CRYPTO_WALLET}"
         )
 
         await context.bot.send_message(
             CHANNEL_ID,
-            f"🆕 ORDER #{oid}\n{s['product_name']} £{s['price']}\n{s['name']}\n{s['address']}"
+            f"🆕 ORDER #{oid}\n{s['product_name']} — {s['weight']}g £{s['price']}\n{s['name']}\n{s['address']}"
         )
 
         USER_SESSIONS.pop(uid)
@@ -167,9 +248,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     uid = q.from_user.id
-    cur.execute("SELECT order_id, product_name, status FROM orders WHERE user_id=?", (uid,))
+    cur.execute("SELECT order_id, product_name, weight, status FROM orders WHERE user_id=?", (uid,))
     rows = cur.fetchall()
 
     if not rows:
@@ -177,8 +257,8 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = "📦 Your Orders:\n\n"
-    for oid, name, status in rows:
-        text += f"#{oid} — {name}\nStatus: {status}\n\n"
+    for oid, name, weight, status in rows:
+        text += f"#{oid} — {name} ({weight}g)\nStatus: {status}\n\n"
 
     await q.edit_message_text(text, reply_markup=main_menu())
 
@@ -208,7 +288,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if q.data == "admin_orders":
-        cur.execute("SELECT order_id, product_name, status FROM orders")
+        cur.execute("SELECT order_id, product_name, weight, status FROM orders")
         rows = cur.fetchall()
 
         if not rows:
@@ -217,8 +297,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = "📦 ORDERS:\n\n"
         buttons = []
-        for oid, name, status in rows:
-            text += f"#{oid} — {name} ({status})\n"
+        for oid, name, weight, status in rows:
+            text += f"#{oid} — {name} ({weight}g) ({status})\n"
             buttons.append([
                 InlineKeyboardButton("✅ Paid", callback_data=f"paid_{oid}"),
                 InlineKeyboardButton("📦 Dispatch", callback_data=f"dispatch_{oid}")
@@ -245,11 +325,13 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("admin", admin))
 
 app.add_handler(CallbackQueryHandler(product_select, pattern="^prod_"))
+app.add_handler(CallbackQueryHandler(weight_select, pattern="^weight_"))
 app.add_handler(CallbackQueryHandler(my_orders, pattern="^my_orders$"))
 app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
 app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(paid_|dispatch_)"))
 
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+app.add_handler(MessageHandler(filters.PHOTO, text_handler))  # handle photos
 
 print("✅ BOT RUNNING")
 app.run_polling()
