@@ -11,7 +11,7 @@ from telegram.ext import (
 )
 
 # ================= CONFIG =================
-TOKEN = os.environ.get("TOKEN")  # or replace with your token directly
+TOKEN = os.environ.get("TOKEN")  # Replace with your bot token if needed
 CHANNEL_ID = -1003833257976
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 
@@ -99,6 +99,7 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_admin_text(update, context)
         await handle_contact(update, context)
         await handle_review_text(update, context)
+        await handle_admin_reply(update, context)
         return
 
     if s["step"] == "name":
@@ -154,7 +155,7 @@ async def user_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await q.edit_message_text(text, parse_mode="Markdown")
 
-# ================= PROMPT REVIEW =================
+# ================= REVIEWS =================
 async def prompt_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -163,7 +164,6 @@ async def prompt_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CONTACT_SESSIONS[uid] = {"step": "review", "order_id": order_id}
     await q.edit_message_text("✨ Please leave a review for your order. Send number of stars (1-5):")
 
-# ================= VIEW REVIEWS =================
 async def view_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -187,15 +187,14 @@ async def contact_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     session = CONTACT_SESSIONS.get(uid)
-    if not session:
+    if not session or session.get("step") != "contact_user":
         return
-    if session.get("step") == "contact_user":
-        msg = update.message.text
-        for admin_id in ADMINS:
-            ADMIN_SUPPORT[admin_id] = uid
-            await context.bot.send_message(admin_id, f"📨 Message from @{update.message.from_user.username or uid}:\n{msg}")
-        await update.message.reply_text("✅ Message sent to admin.", reply_markup=main_menu())
-        session["step"] = "await_reply"
+    msg = update.message.text
+    for admin_id in ADMINS:
+        ADMIN_SUPPORT[admin_id] = uid
+        await context.bot.send_message(admin_id, f"📨 Message from @{update.message.from_user.username or uid}:\n{msg}")
+    await update.message.reply_text("✅ Message sent to admin.", reply_markup=main_menu())
+    session["step"] = "await_reply"
 
 async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.message.from_user.id
@@ -256,7 +255,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("🛠 *ADMIN PANEL*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
-# ================= APP =================
+# ================= RUN APP =================
 app = ApplicationBuilder().token(TOKEN).build()
 
 # --- Handlers ---
@@ -264,6 +263,7 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("admin", admin))
 app.add_handler(CommandHandler("cancel", cancel))
 
+# User callbacks
 app.add_handler(CallbackQueryHandler(product_select, pattern="^prod_"))
 app.add_handler(CallbackQueryHandler(quantity_select, pattern="^qty_"))
 app.add_handler(CallbackQueryHandler(user_paid, pattern="^paid_"))
@@ -271,8 +271,12 @@ app.add_handler(CallbackQueryHandler(prompt_review, pattern="^review_"))
 app.add_handler(CallbackQueryHandler(view_reviews, pattern="view_reviews"))
 app.add_handler(CallbackQueryHandler(contact_support, pattern="contact_support"))
 app.add_handler(CallbackQueryHandler(back, pattern="^back$"))
-app.add_handler(CallbackQueryHandler(admin_callback, pattern=".*"))  # catch all admin buttons
 
+# Admin callbacks (fixed)
+app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
+app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(add_|edit_|del_|price_|editphoto_|admin_manage_products)$"))
+
+# Messages
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contact))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_reply))
