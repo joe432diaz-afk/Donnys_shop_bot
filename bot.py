@@ -1,6 +1,6 @@
 import os
 import random
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -12,7 +12,7 @@ from telegram.ext import (
 
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN")
-CHANNEL_ID = -1003833257976  # Admin channel
+CHANNEL_ID = -1003833257976  # Admin notifications
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 
 ADMINS = set()
@@ -23,9 +23,9 @@ user_contact_history = {}
 
 # ===== PRODUCTS AND PRICES =====
 PRODUCTS = {
-    "lcg": "Lemon Cherry Gelato",
-    "dawg": "Dawg",
-    "cherry": "Cherry Punch",
+    "lcg": {"name": "Lemon Cherry Gelato", "photo": None},
+    "dawg": {"name": "Dawg", "photo": None},
+    "cherry": {"name": "Cherry Punch", "photo": None},
 }
 
 PRICES = {
@@ -34,12 +34,10 @@ PRICES = {
     "cherry": {"3.5": 30, "7": 50, "14": 80, "28": 150, "56": 270},
 }
 
-# ============== MAIN MENU =================
+# ================== MAIN MENU ==================
 def main_menu_keyboard():
-    buttons = [
-        [InlineKeyboardButton(name, callback_data=f"prod_{key}")] 
-        for key, name in PRODUCTS.items()
-    ]
+    buttons = [[InlineKeyboardButton(p["name"], callback_data=f"prod_{key}")]
+               for key, p in PRODUCTS.items()]
     buttons.append([InlineKeyboardButton("🛒 Basket", callback_data="view_basket")])
     buttons.append([InlineKeyboardButton("💬 Contact Donny", callback_data="contact_admin")])
     return InlineKeyboardMarkup(buttons)
@@ -52,7 +50,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_keyboard()
     )
 
-# ============== BASKET =================
+# ================== BASKET ==================
 def basket_text(user_id):
     basket = user_baskets.get(user_id, {})
     if not basket:
@@ -60,16 +58,15 @@ def basket_text(user_id):
     text = "🛒 Your Basket:\n"
     total = 0
     for key, item in basket.items():
-        text += f"{PRODUCTS[key]} – {item['qty']}g – £{item['price']}\n"
+        text += f"{PRODUCTS[key]['name']} – {item['qty']}g – £{item['price']}\n"
         total += item['price']
     text += f"\n💰 Total: £{total}"
     return text
 
 def basket_buttons(user_id):
     basket = user_baskets.get(user_id, {})
-    buttons = []
-    for key in basket:
-        buttons.append([InlineKeyboardButton(f"Remove {PRODUCTS[key]}", callback_data=f"remove_{key}")])
+    buttons = [[InlineKeyboardButton(f"Remove {PRODUCTS[key]['name']}", callback_data=f"remove_{key}")]
+               for key in basket]
     if basket:
         buttons.append([InlineKeyboardButton("✅ Checkout", callback_data="checkout")])
     buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
@@ -78,12 +75,9 @@ def basket_buttons(user_id):
 async def view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
-        basket_text(q.from_user.id),
-        reply_markup=basket_buttons(q.from_user.id)
-    )
+    await q.edit_message_text(basket_text(q.from_user.id), reply_markup=basket_buttons(q.from_user.id))
 
-# ============== PRODUCT FLOW =================
+# ================== PRODUCT SELECTION ==================
 async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -91,13 +85,18 @@ async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if key not in PRODUCTS:
         await q.edit_message_text("❌ Product not found.")
         return
-    # Show quantity buttons
-    buttons = [
-        [InlineKeyboardButton(f"{g}g (£{PRICES[key][g]})", callback_data=f"add_{key}_{g}")]
-        for g in PRICES[key]
-    ]
+    # Quantity buttons
+    buttons = [[InlineKeyboardButton(f"{g}g (£{PRICES[key][g]})", callback_data=f"add_{key}_{g}")]
+               for g in PRICES[key]]
     buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
-    await q.edit_message_text(f"🛒 {PRODUCTS[key]} – choose quantity:", reply_markup=InlineKeyboardMarkup(buttons))
+    # Show photo if exists
+    if PRODUCTS[key]["photo"]:
+        await q.edit_message_media(
+            media=InputMediaPhoto(PRODUCTS[key]["photo"], caption=f"🛒 {PRODUCTS[key]['name']} – choose quantity:"),
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    else:
+        await q.edit_message_text(f"🛒 {PRODUCTS[key]['name']} – choose quantity:", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def add_to_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -108,9 +107,9 @@ async def add_to_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_baskets:
         user_baskets[user_id] = {}
     user_baskets[user_id][key] = {"qty": qty, "price": price}
-    await q.edit_message_text(f"✅ Added {PRODUCTS[key]} {qty}g (£{price}) to your basket.", reply_markup=main_menu_keyboard())
+    await q.edit_message_text(f"✅ Added {PRODUCTS[key]['name']} {qty}g (£{price}) to your basket.", reply_markup=main_menu_keyboard())
 
-# ============== REMOVE ITEM =================
+# ================== REMOVE ITEM ==================
 async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -118,7 +117,7 @@ async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_baskets.get(q.from_user.id, {}).pop(key, None)
     await view_basket(update, context)
 
-# ============== CHECKOUT =================
+# ================== CHECKOUT ==================
 async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -153,23 +152,23 @@ async def checkout_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "basket": s["basket"],
             "total": total
         }
-        # Send summary to user
+        # User summary
         summary = f"✅ *ORDER SUMMARY*\nOrder #: {order_id}\n"
         for k, v in s['basket'].items():
-            summary += f"{PRODUCTS[k]} – {v['qty']}g – £{v['price']}\n"
+            summary += f"{PRODUCTS[k]['name']} – {v['qty']}g – £{v['price']}\n"
         summary += f"\n💰 Total: £{total}\n💳 *LTC ONLY*\n`{CRYPTO_WALLET}`"
         buttons = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I HAVE PAID", callback_data=f"paid_{order_id}")]])
         await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=buttons)
-        # Notify admin
+        # Admin notification
         admin_msg = f"🆕 *NEW ORDER #{order_id}*\n👤 {s['name']}\n📍 {s['address']}\n"
         for k,v in s['basket'].items():
-            admin_msg += f"{PRODUCTS[k]} – {v['qty']}g – £{v['price']}\n"
+            admin_msg += f"{PRODUCTS[k]['name']} – {v['qty']}g – £{v['price']}\n"
         admin_msg += f"\n💰 Total: £{total}"
         await context.bot.send_message(CHANNEL_ID, admin_msg, parse_mode="Markdown")
         user_baskets[uid] = {}  # clear basket
         sessions.pop(uid)
 
-# ============== USER PAID =================
+# ================== USER PAID ==================
 async def user_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -179,7 +178,7 @@ async def user_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = f"✅ *PAYMENT MARKED*\nOrder #: {order_id}\nStatus: *{o['status']}*\n💰 Total: £{o['total']}\n💳 LTC Address:\n`{CRYPTO_WALLET}`"
     await q.edit_message_text(text, parse_mode="Markdown")
 
-# ============== CONTACT ADMIN =================
+# ================== CONTACT ADMIN ==================
 async def contact_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -196,13 +195,13 @@ async def contact_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Message sent to Donny.", reply_markup=main_menu_keyboard())
         sessions.pop(uid)
 
-# ============== BACK =================
+# ================== BACK ==================
 async def back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await q.edit_message_text("Main Menu:", reply_markup=main_menu_keyboard())
 
-# ============== APP =================
+# ================== APP ==================
 app = ApplicationBuilder().token(TOKEN).build()
 
 # Commands
