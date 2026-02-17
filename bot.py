@@ -12,8 +12,8 @@ CHANNEL_ID = -1003833257976  # replace with your channel
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 
 ADMINS = set()
-USER_SESSIONS = {}
-ADMIN_SESSIONS = {}
+USER_SESSIONS = {}   # basket, checkout, reviews, chat
+ADMIN_SESSIONS = {}  # admin product flow
 
 # ================= DATABASE =================
 db = sqlite3.connect("shop.db", check_same_thread=False)
@@ -92,25 +92,11 @@ def build_basket_text(basket):
     text += f"\n💰 Total: £{total}"
     return text, total
 
-async def show_basket(q, context):
-    uid = q.from_user.id
-    basket = USER_SESSIONS[uid]["basket"]
-    text, total = build_basket_text(basket)
-    buttons = []
-    for idx, item in enumerate(basket):
-        buttons.append([
-            InlineKeyboardButton(f"➕ {item['name']} x{item['quantity']}", callback_data=f"add_{idx}"),
-            InlineKeyboardButton(f"➖ {item['name']} x{item['quantity']}", callback_data=f"remove_{idx}")
-        ])
-    buttons.append([InlineKeyboardButton("✅ Checkout", callback_data="checkout")])
-    await context.bot.send_message(chat_id=uid, text=text, reply_markup=InlineKeyboardMarkup(buttons))
-
-# ================= BOT HANDLERS =================
-# Start
+# ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🌿 Welcome to the shop!\nSelect a product:", reply_markup=main_menu())
 
-# Product selection
+# ================= PRODUCT SELECTION =================
 async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -134,7 +120,7 @@ async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  reply_markup=InlineKeyboardMarkup(buttons))
     await q.delete_message()
 
-# Weight selection
+# ================= WEIGHT SELECTION =================
 async def weight_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -153,7 +139,19 @@ async def weight_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session["step"] = "basket"
     await show_basket(q, context)
 
-# Basket actions
+async def show_basket(q, context):
+    uid = q.from_user.id
+    basket = USER_SESSIONS[uid]["basket"]
+    text, total = build_basket_text(basket)
+    buttons = []
+    for idx, item in enumerate(basket):
+        buttons.append([
+            InlineKeyboardButton(f"➕ {item['name']} x{item['quantity']}", callback_data=f"add_{idx}"),
+            InlineKeyboardButton(f"➖ {item['name']} x{item['quantity']}", callback_data=f"remove_{idx}")
+        ])
+    buttons.append([InlineKeyboardButton("✅ Checkout", callback_data="checkout")])
+    await context.bot.send_message(chat_id=uid, text=text, reply_markup=InlineKeyboardMarkup(buttons))
+
 async def basket_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -184,7 +182,7 @@ async def basket_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["step"] = "checkout_name"
         await q.edit_message_text("✍️ Send your FULL NAME for checkout:")
 
-# Checkout handler
+# ================= CHECKOUT =================
 async def checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     session = USER_SESSIONS.get(uid)
@@ -205,7 +203,7 @@ async def checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons = [[InlineKeyboardButton("✅ Confirm Order", callback_data="confirm_order")]]
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
-# Confirm order
+# ================= CONFIRM ORDER =================
 async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -225,7 +223,7 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(CHANNEL_ID, f"🆕 ORDER #{order_id}\nUser: {session['name']}\nAddress: {session['address']}\nTotal: £{session['total']}")
     USER_SESSIONS.pop(uid)
 
-# My orders
+# ================= MY ORDERS =================
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -247,7 +245,52 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")])
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
-# Reviews
+# ================= MY REVIEWS =================
+async def my_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    cur.execute("SELECT order_id, stars, text FROM reviews WHERE user_id=?", (uid,))
+    reviews = cur.fetchall()
+    if not reviews:
+        await q.edit_message_text("❌ You have no reviews yet.", reply_markup=main_menu())
+        return
+    text = "📝 Your Reviews:\n\n"
+    buttons = []
+    for oid, stars, rtext in reviews:
+        text += f"Order #{oid} — ⭐ {stars} stars\n{rtext}\n\n"
+        buttons.append([InlineKeyboardButton(f"👀 View/Edit Order #{oid} Review", callback_data=f"review_{oid}")])
+    buttons.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")])
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+# ================= CONTACT DONNY =================
+async def contact_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    USER_SESSIONS.setdefault(uid, {})["chat_open"] = True
+    buttons = [
+        [InlineKeyboardButton("📤 Hide Chat", callback_data="toggle_chat")],
+        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")]
+    ]
+    # Show last 10 messages
+    cur.execute("SELECT from_vendor, text FROM contact_messages WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,))
+    msgs = cur.fetchall()
+    text = "💬 Chat with Donny:\n\n"
+    for f,v in reversed(msgs):
+        sender = "Donny" if f else "You"
+        text += f"{sender}: {v}\n"
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def toggle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    session = USER_SESSIONS.get(uid, {})
+    session["chat_open"] = not session.get("chat_open", True)
+    await contact_menu(update, context)
+
+# ================= REVIEW HANDLER =================
 async def review_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -277,50 +320,24 @@ async def review_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data=="back_to_menu":
         await q.edit_message_text("Back to menu:", reply_markup=main_menu())
 
-# Contact Donny
-async def contact_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    USER_SESSIONS.setdefault(uid, {})["chat_open"] = True
-    buttons = [
-        [InlineKeyboardButton("📤 Hide Chat", callback_data="toggle_chat")],
-        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")]
-    ]
-    # Show last 10 messages
-    cur.execute("SELECT from_vendor, text FROM contact_messages WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,))
-    msgs = cur.fetchall()
-    text = "💬 Chat with Donny:\n\n"
-    for f,v in reversed(msgs):
-        sender = "Donny" if f else "You"
-        text += f"{sender}: {v}\n"
-    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-
-async def toggle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    session = USER_SESSIONS.get(uid, {})
-    session["chat_open"] = not session.get("chat_open", True)
-    await contact_menu(update, context)
-
-# Message handler (reviews + chat + checkout)
+# ================= MESSAGE HANDLER =================
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     text = update.message.text
-    session = USER_SESSIONS.get(uid, {})
-
     # Chat messages
+    session = USER_SESSIONS.get(uid, {})
     if session.get("chat_open"):
+        # Save user message
         cur.execute("INSERT INTO contact_messages (user_id, from_vendor, text) VALUES (?,?,?)",(uid,0,text))
         db.commit()
         await update.message.reply_text(f"You: {text}")
+        # Notify admin(s)
         for admin_id in ADMINS:
             await context.bot.send_message(admin_id, f"💬 From {uid}: {text} (user message)")
         return
-
     # Review writing
-    if session.get("step")=="writing_review":
+    if uid in USER_SESSIONS and USER_SESSIONS[uid].get("step")=="writing_review":
+        session = USER_SESSIONS[uid]
         oid = session["order_id"]
         try:
             parts = text.strip().split(" ",1)
@@ -337,29 +354,5 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Review saved! {stars}★\n\n{review_text}")
         USER_SESSIONS.pop(uid)
         return
-
     # Checkout flow
     await checkout_handler(update, context)
-
-# ================= RUN BOT =================
-if __name__ == "__main__":
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-
-    # Callback queries
-    app.add_handler(CallbackQueryHandler(product_select, pattern="^prod_"))
-    app.add_handler(CallbackQueryHandler(weight_select, pattern="^weight_"))
-    app.add_handler(CallbackQueryHandler(basket_actions, pattern="^(add_|remove_|checkout)$"))
-    app.add_handler(CallbackQueryHandler(confirm_order, pattern="^confirm_order$"))
-    app.add_handler(CallbackQueryHandler(my_orders, pattern="^my_orders$"))
-    app.add_handler(CallbackQueryHandler(review_handler, pattern="^(review_|viewreview_|back_to_menu)$"))
-    app.add_handler(CallbackQueryHandler(contact_menu, pattern="^contact_menu$"))
-    app.add_handler(CallbackQueryHandler(toggle_chat, pattern="^toggle_chat$"))
-
-    # Messages
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-
-    print("Bot is running...")
-    app.run_polling()
