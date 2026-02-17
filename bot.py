@@ -2,361 +2,225 @@ import os
 import random
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-ApplicationBuilder,
-CommandHandler,
-CallbackQueryHandler,
-MessageHandler,
-ContextTypes,
-filters,
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 
-================= CONFIG =================
-
-TOKEN = os.environ.get("8383232415:AAGDzTvKSird6CCg4NyXHnwpim4KN6q24WQ")
-CHANNEL_ID = -1003833257976
+# ================= CONFIG =================
+TOKEN = os.environ.get("TOKEN")
+CHANNEL_ID = -1003833257976  # Admin channel
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 
 ADMINS = set()
 orders = {}
 sessions = {}
+user_baskets = {}
+user_contact_history = {}
 
-===== PRODUCTS AND PRICES =====
-
+# ===== PRODUCTS AND PRICES =====
 PRODUCTS = {
-"lcg": "Lemon Cherry Gelato",
-"dawg": "Dawg",
-"cherry": "Cherry Punch",
+    "lcg": "Lemon Cherry Gelato",
+    "dawg": "Dawg",
+    "cherry": "Cherry Punch",
 }
 
 PRICES = {
-"lcg": {"3.5": 30, "7": 50, "14": 80, "28": 150, "56": 270},
-"dawg": {"3.5": 30, "7": 50, "14": 80, "28": 150, "56": 270},
-"cherry": {"3.5": 30, "7": 50, "14": 80, "28": 150, "56": 270},
+    "lcg": {"3.5": 30, "7": 50, "14": 80, "28": 150, "56": 270},
+    "dawg": {"3.5": 30, "7": 50, "14": 80, "28": 150, "56": 270},
+    "cherry": {"3.5": 30, "7": 50, "14": 80, "28": 150, "56": 270},
 }
 
-============== MENUS =================
-
-def main_menu():
-buttons = [
-[InlineKeyboardButton(f"{name}", callback_data=f"prod_{key}")]
-for key, name in PRODUCTS.items()
-]
-return InlineKeyboardMarkup(buttons)
-
-============== START =================
+# ============== MAIN MENU =================
+def main_menu_keyboard():
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=f"prod_{key}")] 
+        for key, name in PRODUCTS.items()
+    ]
+    buttons.append([InlineKeyboardButton("🛒 Basket", callback_data="view_basket")])
+    buttons.append([InlineKeyboardButton("💬 Contact Donny", callback_data="contact_admin")])
+    return InlineKeyboardMarkup(buttons)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-await update.message.reply_text(
-"👋 Welcome to Donny’s Shop\n\nSelect a product:",
-reply_markup=main_menu()
-)
+    await update.message.reply_text(
+        "👋 Welcome to Donny’s Shop!\n\n"
+        "Here for all your spiritual chest cheat codes and healing tools.\n\n"
+        "Select a product or contact Donny:",
+        reply_markup=main_menu_keyboard()
+    )
 
-============== CANCEL =================
+# ============== BASKET =================
+def basket_text(user_id):
+    basket = user_baskets.get(user_id, {})
+    if not basket:
+        return "🛒 Your basket is empty."
+    text = "🛒 Your Basket:\n"
+    total = 0
+    for key, item in basket.items():
+        text += f"{PRODUCTS[key]} – {item['qty']}g – £{item['price']}\n"
+        total += item['price']
+    text += f"\n💰 Total: £{total}"
+    return text
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-sessions.pop(update.effective_user.id, None)
-await update.message.reply_text(
-"❌ Action cancelled.\nBack to main menu:",
-reply_markup=main_menu()
-)
+def basket_buttons(user_id):
+    basket = user_baskets.get(user_id, {})
+    buttons = []
+    for key in basket:
+        buttons.append([InlineKeyboardButton(f"Remove {PRODUCTS[key]}", callback_data=f"remove_{key}")])
+    if basket:
+        buttons.append([InlineKeyboardButton("✅ Checkout", callback_data="checkout")])
+    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
+    return InlineKeyboardMarkup(buttons)
 
-============== PRODUCT FLOW =================
+async def view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        basket_text(q.from_user.id),
+        reply_markup=basket_buttons(q.from_user.id)
+    )
 
+# ============== PRODUCT FLOW =================
 async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-q = update.callback_query
-await q.answer()
+    q = update.callback_query
+    await q.answer()
+    key = q.data.replace("prod_", "")
+    if key not in PRODUCTS:
+        await q.edit_message_text("❌ Product not found.")
+        return
+    # Show quantity buttons
+    buttons = [
+        [InlineKeyboardButton(f"{g}g (£{PRICES[key][g]})", callback_data=f"add_{key}_{g}")]
+        for g in PRICES[key]
+    ]
+    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
+    await q.edit_message_text(f"🛒 {PRODUCTS[key]} – choose quantity:", reply_markup=InlineKeyboardMarkup(buttons))
 
-key = q.data.replace("prod_", "")  
-if key not in PRODUCTS:  
-    await q.edit_message_text("❌ Product not found.")  
-    return  
+async def add_to_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, key, qty = q.data.split("_")
+    price = PRICES[key][qty]
+    user_id = q.from_user.id
+    if user_id not in user_baskets:
+        user_baskets[user_id] = {}
+    user_baskets[user_id][key] = {"qty": qty, "price": price}
+    await q.edit_message_text(f"✅ Added {PRODUCTS[key]} {qty}g (£{price}) to your basket.", reply_markup=main_menu_keyboard())
 
-sessions[q.from_user.id] = {  
-    "product_key": key,  
-    "product": PRODUCTS[key],  
-    "step": "qty"  
-}  
+# ============== REMOVE ITEM =================
+async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    key = q.data.replace("remove_", "")
+    user_baskets.get(q.from_user.id, {}).pop(key, None)
+    await view_basket(update, context)
 
-buttons = [  
-    [InlineKeyboardButton(f"{g}g (£{PRICES[key][g]})", callback_data=f"qty_{g}")]  
-    for g in PRICES[key]  
-]  
-buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])  
+# ============== CHECKOUT =================
+async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = q.from_user.id
+    basket = user_baskets.get(user_id, {})
+    if not basket:
+        await q.edit_message_text("🛒 Your basket is empty.", reply_markup=main_menu_keyboard())
+        return
+    sessions[user_id] = {"step": "checkout_name", "basket": basket}
+    await q.edit_message_text("✍️ Send your FULL NAME for checkout:")
 
-await q.edit_message_text(  
-    f"🛒 {PRODUCTS[key]}\nChoose quantity:",  
-    reply_markup=InlineKeyboardMarkup(buttons)  
-)
+async def checkout_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.message.from_user.id
+    s = sessions.get(uid)
+    if not s or "basket" not in s:
+        return
+    if s["step"] == "checkout_name":
+        s["name"] = update.message.text
+        s["step"] = "checkout_address"
+        await update.message.reply_text("📍 Send your FULL ADDRESS:")
+        return
+    if s["step"] == "checkout_address":
+        s["address"] = update.message.text
+        # Create order
+        order_id = random.randint(100000, 999999)
+        total = sum([i['price'] for i in s['basket'].values()])
+        orders[order_id] = {
+            "user_id": uid,
+            "status": "Pending payment",
+            "name": s["name"],
+            "address": s["address"],
+            "basket": s["basket"],
+            "total": total
+        }
+        # Send summary to user
+        summary = f"✅ *ORDER SUMMARY*\nOrder #: {order_id}\n"
+        for k, v in s['basket'].items():
+            summary += f"{PRODUCTS[k]} – {v['qty']}g – £{v['price']}\n"
+        summary += f"\n💰 Total: £{total}\n💳 *LTC ONLY*\n`{CRYPTO_WALLET}`"
+        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I HAVE PAID", callback_data=f"paid_{order_id}")]])
+        await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=buttons)
+        # Notify admin
+        admin_msg = f"🆕 *NEW ORDER #{order_id}*\n👤 {s['name']}\n📍 {s['address']}\n"
+        for k,v in s['basket'].items():
+            admin_msg += f"{PRODUCTS[k]} – {v['qty']}g – £{v['price']}\n"
+        admin_msg += f"\n💰 Total: £{total}"
+        await context.bot.send_message(CHANNEL_ID, admin_msg, parse_mode="Markdown")
+        user_baskets[uid] = {}  # clear basket
+        sessions.pop(uid)
 
-async def quantity_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-q = update.callback_query
-await q.answer()
-
-qty = q.data.replace("qty_", "")  
-s = sessions[q.from_user.id]  
-s["qty"] = qty  
-s["price"] = PRICES[s["product_key"]][qty]  
-s["step"] = "name"  
-
-await q.edit_message_text("✍️ Send your FULL NAME:")
-
-============== TEXT INPUT =================
-
-async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-uid = update.message.from_user.id
-s = sessions.get(uid)
-if not s:
-# Check if admin is in editing name/prices
-admin_session = sessions.get(uid)
-if admin_session:
-await handle_admin_text(update, context, admin_session)
-return
-
-if s["step"] == "name":  
-    s["name"] = update.message.text  
-    s["step"] = "address"  
-    await update.message.reply_text("📍 Send your FULL ADDRESS:")  
-    return  
-
-if s["step"] == "address":  
-    s["address"] = update.message.text  
-    order_id = random.randint(100000, 999999)  
-
-    orders[order_id] = {  
-        "user_id": uid,  
-        "status": "Pending payment",  
-        **s  
-    }  
-
-    summary = (  
-        f"✅ *ORDER SUMMARY*\n\n"  
-        f"Order #: {order_id}\n"  
-        f"Product: {s['product']}\n"  
-        f"Qty: {s['qty']}g\n"  
-        f"Name: {s['name']}\n"  
-        f"Address: {s['address']}\n\n"  
-        f"💰 Amount to pay: *£{s['price']}*\n"  
-        f"💳 *LTC ONLY*\n`{CRYPTO_WALLET}`"  
-    )  
-
-    buttons = InlineKeyboardMarkup([  
-        [InlineKeyboardButton("✅ I HAVE PAID", callback_data=f"paid_{order_id}")],  
-        [InlineKeyboardButton("⬅ Back to Menu", callback_data="back")]  
-    ])  
-
-    await update.message.reply_text(  
-        summary,  
-        parse_mode="Markdown",  
-        reply_markup=buttons  
-    )  
-
-    # Admin notification with full info  
-    admin_msg = (  
-        f"🆕 *NEW ORDER #{order_id}*\n\n"  
-        f"{s['product']} – {s['qty']}g\n"  
-        f"£{s['price']}\n\n"  
-        f"👤 {s['name']}\n"  
-        f"📍 {s['address']}"  
-    )  
-
-    await context.bot.send_message(  
-        CHANNEL_ID,  
-        admin_msg,  
-        parse_mode="Markdown"  
-    )  
-
-    sessions.pop(uid)
-
-============== USER PAID =================
-
+# ============== USER PAID =================
 async def user_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-q = update.callback_query
-await q.answer()
+    q = update.callback_query
+    await q.answer()
+    order_id = int(q.data.replace("paid_", ""))
+    o = orders[order_id]
+    o["status"] = "Paid – awaiting dispatch"
+    text = f"✅ *PAYMENT MARKED*\nOrder #: {order_id}\nStatus: *{o['status']}*\n💰 Total: £{o['total']}\n💳 LTC Address:\n`{CRYPTO_WALLET}`"
+    await q.edit_message_text(text, parse_mode="Markdown")
 
-oid = int(q.data.replace("paid_", ""))  
-o = orders[oid]  
-o["status"] = "Paid – awaiting dispatch"  
+# ============== CONTACT ADMIN =================
+async def contact_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    sessions[uid] = {"step": "contact"}
+    await q.edit_message_text("💬 Send your message to Donny:")
 
-text = (  
-    f"✅ *PAYMENT MARKED*\n\n"  
-    f"Order #: {oid}\n"  
-    f"{o['product']} – {o['qty']}g\n\n"  
-    f"💰 Amount: *£{o['price']}*\n"  
-    f"💳 LTC Address:\n`{CRYPTO_WALLET}`\n\n"  
-    f"Status: *{o['status']}*"  
-)  
+async def contact_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.message.from_user.id
+    s = sessions.get(uid)
+    if s and s.get("step") == "contact":
+        user_contact_history.setdefault(uid, []).append(update.message.text)
+        await context.bot.send_message(CHANNEL_ID, f"💬 Message from {update.message.from_user.username or uid}:\n{update.message.text}")
+        await update.message.reply_text("✅ Message sent to Donny.", reply_markup=main_menu_keyboard())
+        sessions.pop(uid)
 
-await q.edit_message_text(text, parse_mode="Markdown")
-
-============== ADMIN PANEL =================
-
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-uid = update.effective_user.id
-
-if not ADMINS:  
-    ADMINS.add(uid)  
-    await update.message.reply_text(  
-        f"✅ You are now the main admin.\nID: `{uid}`",  
-        parse_mode="Markdown"  
-    )  
-
-if uid not in ADMINS:  
-    await update.message.reply_text("❌ Not authorised.")  
-    return  
-
-# Admin options  
-buttons = [  
-    [InlineKeyboardButton("📦 View Orders", callback_data="admin_view_orders")],  
-    [InlineKeyboardButton("🛠 Manage Products", callback_data="admin_manage_products")]  
-]  
-
-await update.message.reply_text(  
-    "🛠 *ADMIN PANEL*",  
-    parse_mode="Markdown",  
-    reply_markup=InlineKeyboardMarkup(buttons)  
-)
-
-============== ADMIN CALLBACKS =================
-
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-q = update.callback_query
-await q.answer()
-data = q.data
-uid = q.from_user.id
-
-# --- Manage Products Menu ---  
-if data == "admin_manage_products":  
-    buttons = [[InlineKeyboardButton("➕ Add Product", callback_data="add_product")]]  
-    for key, name in PRODUCTS.items():  
-        buttons.append([InlineKeyboardButton(f"✏️ Edit {name}", callback_data=f"edit_{key}")])  
-        buttons.append([InlineKeyboardButton(f"💲 Edit Prices", callback_data=f"price_{key}")])  
-        buttons.append([InlineKeyboardButton(f"❌ Delete {name}", callback_data=f"del_{key}")])  
-    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])  
-    await q.edit_message_text(  
-        "🛠 *PRODUCT MANAGEMENT*",  
-        parse_mode="Markdown",  
-        reply_markup=InlineKeyboardMarkup(buttons)  
-    )  
-    return  
-
-# --- Add Product ---  
-if data == "add_product":  
-    sessions[uid] = {"step": "add_name"}  
-    await q.edit_message_text("✍️ Send the NAME of the new product:")  
-    return  
-
-# --- Edit Product Name ---  
-if data.startswith("edit_"):  
-    key = data.replace("edit_", "")  
-    sessions[uid] = {"step": "edit_name", "key": key}  
-    await q.edit_message_text(f"✍️ Send the NEW NAME for {PRODUCTS[key]}:")  
-    return  
-
-# --- Edit Product Prices ---  
-if data.startswith("price_"):  
-    key = data.replace("price_", "")  
-    sessions[uid] = {"step": "edit_prices", "key": key}  
-    current = "\n".join([f"{g}:{p}" for g, p in PRICES[key].items()])  
-    await q.edit_message_text(f"✍️ Send new price tiers for {PRODUCTS[key]} in this format:\n`{current}`\nExample:\n3.5:30\n7:50\n14:80", parse_mode="Markdown")  
-    return  
-
-# --- Delete Product ---  
-if data.startswith("del_"):  
-    key = data.replace("del_", "")  
-    del PRODUCTS[key]  
-    del PRICES[key]  
-    await q.edit_message_text("✅ Product deleted.", reply_markup=main_menu())  
-    return  
-
-# --- Back ---  
-if data == "back":  
-    await q.edit_message_text("🛠 Back to Admin Panel", reply_markup=None)  
-    await admin(update, context)  
-    return
-
-============== ADMIN TEXT HANDLER =================
-
-async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, session):
-uid = update.message.from_user.id
-step = session["step"]
-
-# Add Product  
-if step == "add_name":  
-    name = update.message.text  
-    key = name.lower().replace(" ", "_")  
-    PRODUCTS[key] = name  
-    PRICES[key] = {}  
-    sessions[uid] = {"step": "add_prices", "key": key}  
-    await update.message.reply_text(f"Send price tiers for {name} in format:\n3.5:30\n7:50\n14:80")  
-    return  
-
-if step == "add_prices":  
-    key = session["key"]  
-    new_prices = {}  
-    try:  
-        for line in update.message.text.splitlines():  
-            g, p = line.strip().split(":")  
-            new_prices[g] = int(p)  
-        PRICES[key] = new_prices  
-        sessions.pop(uid)  
-        await update.message.reply_text(f"✅ Product {PRODUCTS[key]} added with prices {PRICES[key]}", reply_markup=main_menu())  
-    except Exception as e:  
-        await update.message.reply_text("❌ Invalid format. Use g:p per line, e.g., 3.5:30")  
-    return  
-
-# Edit Product Name  
-if step == "edit_name":  
-    key = session["key"]  
-    PRODUCTS[key] = update.message.text  
-    sessions.pop(uid)  
-    await update.message.reply_text(f"✅ Product name updated to {PRODUCTS[key]}", reply_markup=main_menu())  
-    return  
-
-# Edit Prices  
-if step == "edit_prices":  
-    key = session["key"]  
-    new_prices = {}  
-    try:  
-        for line in update.message.text.splitlines():  
-            g, p = line.strip().split(":")  
-            new_prices[g] = int(p)  
-        PRICES[key] = new_prices  
-        sessions.pop(uid)  
-        await update.message.reply_text(f"✅ Prices updated for {PRODUCTS[key]}: {PRICES[key]}", reply_markup=main_menu())  
-    except:  
-        await update.message.reply_text("❌ Invalid format. Use g:p per line, e.g., 3.5:30")  
-    return
-
-============== BACK =================
-
+# ============== BACK =================
 async def back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-q = update.callback_query
-await q.answer()
-await q.edit_message_text("Main menu:", reply_markup=main_menu())
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("Main Menu:", reply_markup=main_menu_keyboard())
 
-============== APP =================
-
+# ============== APP =================
 app = ApplicationBuilder().token(TOKEN).build()
 
+# Commands
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("admin", admin))
-app.add_handler(CommandHandler("cancel", cancel))
 
-User product flow
-
+# CallbackQuery Handlers
 app.add_handler(CallbackQueryHandler(product_select, pattern="^prod_"))
-app.add_handler(CallbackQueryHandler(quantity_select, pattern="^qty_"))
+app.add_handler(CallbackQueryHandler(add_to_basket, pattern="^add_"))
+app.add_handler(CallbackQueryHandler(view_basket, pattern="view_basket"))
+app.add_handler(CallbackQueryHandler(remove_item, pattern="^remove_"))
+app.add_handler(CallbackQueryHandler(checkout, pattern="checkout"))
 app.add_handler(CallbackQueryHandler(user_paid, pattern="^paid_"))
+app.add_handler(CallbackQueryHandler(contact_admin, pattern="contact_admin"))
 app.add_handler(CallbackQueryHandler(back, pattern="^back$"))
 
-Admin product management
-
-app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
-app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(add_|edit_|del_|price_|admin_manage_products)$"))
-
-Messages
-
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input))
+# Messages
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_text))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, contact_text))
 
 print("✅ BOT RUNNING")
 app.run_polling()
