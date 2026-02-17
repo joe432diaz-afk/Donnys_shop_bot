@@ -11,7 +11,7 @@ from telegram.ext import (
 )
 
 # ================= CONFIG =================
-TOKEN = os.environ.get("TOKEN")  # or "PASTE_YOUR_TOKEN_HERE"
+TOKEN = os.environ.get("8383232415:AAGDzTvKSird6CCg4NyXHnwpim4KN6q24WQ ")  # or "PASTE_YOUR_TOKEN_HERE"
 CHANNEL_ID = -1003833257976
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 
