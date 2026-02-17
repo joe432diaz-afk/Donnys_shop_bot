@@ -11,7 +11,7 @@ from telegram.ext import (
 )
 
 # ================= CONFIG =================
-TOKEN = os.environ.get("TOKEN")  # or replace with your bot token directly
+TOKEN = os.environ.get("TOKEN")  # or replace with your token directly
 CHANNEL_ID = -1003833257976
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 
@@ -154,7 +154,7 @@ async def user_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await q.edit_message_text(text, parse_mode="Markdown")
 
-# ================= REVIEWS =================
+# ================= PROMPT REVIEW =================
 async def prompt_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -163,6 +163,7 @@ async def prompt_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CONTACT_SESSIONS[uid] = {"step": "review", "order_id": order_id}
     await q.edit_message_text("✨ Please leave a review for your order. Send number of stars (1-5):")
 
+# ================= VIEW REVIEWS =================
 async def view_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -186,14 +187,15 @@ async def contact_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     session = CONTACT_SESSIONS.get(uid)
-    if not session or session.get("step") != "contact_user":
+    if not session:
         return
-    msg = update.message.text
-    for admin_id in ADMINS:
-        ADMIN_SUPPORT[admin_id] = uid
-        await context.bot.send_message(admin_id, f"📨 Message from @{update.message.from_user.username or uid}:\n{msg}")
-    await update.message.reply_text("✅ Message sent to admin.", reply_markup=main_menu())
-    session["step"] = "await_reply"
+    if session.get("step") == "contact_user":
+        msg = update.message.text
+        for admin_id in ADMINS:
+            ADMIN_SUPPORT[admin_id] = uid
+            await context.bot.send_message(admin_id, f"📨 Message from @{update.message.from_user.username or uid}:\n{msg}")
+        await update.message.reply_text("✅ Message sent to admin.", reply_markup=main_menu())
+        session["step"] = "await_reply"
 
 async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.message.from_user.id
