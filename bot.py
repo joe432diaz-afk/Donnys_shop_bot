@@ -15,14 +15,17 @@ TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise ValueError("TOKEN environment variable is missing!")
 
-ADMIN_USERNAME = "@highlandhaze420"
+# Admin channel (replace with your channel numeric ID)
+CHANNEL_ID = -1003833257976
+
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 
 # Conversation states
 SELECT_PRODUCT, SELECT_QUANTITY, NAME, ADDRESS, SHIPPING, DISCOUNT, CONFIRM = range(7)
 
-# Store user orders in memory
-user_orders = {}
+# Store user orders
+user_orders = {}       # {user_id: {order info}}
+all_orders = {}        # {order_number: {user_id, order info, status}}
 
 # Products
 products = {
@@ -34,13 +37,13 @@ products = {
 quantities = ["3.5g", "7g", "14g", "28g", "56g"]
 prices = {"3.5g":30, "7g":50, "14g":80, "28g":150, "56g":270}
 
-# ---------------------- Start ----------------------
+# ---------------- /start ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("Lemon Cherry Gelato", callback_data="product_lcg")],
         [InlineKeyboardButton("Dawg", callback_data="product_dawg")],
         [InlineKeyboardButton("Cherry Punch", callback_data="product_cherry")],
-        [InlineKeyboardButton("Contact Donny", callback_data="contact_donny")],
+        [InlineKeyboardButton("Contact Donny", callback_data="contact_donny")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
@@ -98,7 +101,7 @@ async def address_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_orders[update.message.from_user.id]["address"] = update.message.text
     keyboard = [
         [InlineKeyboardButton("T24", callback_data="T24")],
-        [InlineKeyboardButton("Back to Main Menu", callback_data="back")],
+        [InlineKeyboardButton("Back to Main Menu", callback_data="back")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Select your shipping method:", reply_markup=reply_markup)
@@ -124,12 +127,13 @@ async def discount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     final_price = order["price"]
     if code.lower() != "none":
-        final_price = int(final_price * 0.9)  # 10% discount example
+        final_price = int(final_price * 0.9)  # example 10% discount
     order["final_price"] = final_price
 
     # Generate order number
     order_number = random.randint(1000, 9999)
     order["order_number"] = order_number
+    all_orders[order_number] = {"user_id": update.message.from_user.id, "info": order.copy(), "status": "Pending"}
 
     summary = (
         f"✅ *Order Summary*\n"
@@ -142,17 +146,18 @@ async def discount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Discount: {order['discount']}\n"
         f"Amount to pay: £{final_price}\n"
         f"⏰ Payment timeframe: 3 hours\n"
-        f"💳 Send LTC ONLY to: {CRYPTO_WALLET}\n\n"
+        f"💳 LTC Wallet: {CRYPTO_WALLET}\n\n"
         f"Press 'Confirm Payment' when done or /cancel to cancel."
     )
 
-    keyboard = [[InlineKeyboardButton("Back to Menu", callback_data="back")],
-                [InlineKeyboardButton("Confirm Payment", callback_data="confirm_payment")]]
+    keyboard = [
+        [InlineKeyboardButton("Back to Main Menu", callback_data="back")],
+        [InlineKeyboardButton("Confirm Payment", callback_data=f"confirm_payment_{order_number}")]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=reply_markup)
 
-    # Notify admin
+    # Send to admin channel
     admin_message = (
         f"🛒 *New Order*\n"
         f"Order #: {order_number}\n"
@@ -163,10 +168,11 @@ async def discount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Address: {order['address']}\n"
         f"Shipping: {order['shipping']}\n"
         f"Discount: {order['discount']}\n"
-        f"Amount: £{final_price}"
+        f"Amount: £{final_price}\n"
+        f"Status: Pending"
     )
     try:
-        await context.bot.send_message(chat_id=ADMIN_USERNAME, text=admin_message, parse_mode="Markdown")
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=admin_message, parse_mode="Markdown")
     except Exception as e:
         print("Admin notification failed:", e)
 
@@ -177,7 +183,18 @@ async def confirm_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text("✅ Payment confirmed! Thank you for your order.\nBack to main menu.")
+    data = query.data
+    if data.startswith("confirm_payment_"):
+        order_number = int(data.replace("confirm_payment_", ""))
+        if order_number in all_orders:
+            all_orders[order_number]["status"] = "Paid, awaiting dispatch"
+            user_id = all_orders[order_number]["user_id"]
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✅ Payment confirmed for Order #{order_number}! Status: Paid, awaiting dispatch.\n"
+                     f"LTC Wallet still visible: {CRYPTO_WALLET}"
+            )
+            await query.edit_message_text(f"Order #{order_number} marked as Paid, awaiting dispatch.\nBack to main menu.")
     return await start(update, context)
 
 # ---------------- Cancel ----------------
@@ -197,7 +214,7 @@ conv_handler = ConversationHandler(
         ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, address_input)],
         SHIPPING: [CallbackQueryHandler(shipping_select)],
         DISCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, discount_input)],
-        CONFIRM: [CallbackQueryHandler(confirm_payment, pattern="confirm_payment")]
+        CONFIRM: [CallbackQueryHandler(confirm_payment, pattern="confirm_payment_")]
     },
     fallbacks=[CommandHandler("cancel", cancel)],
 )
