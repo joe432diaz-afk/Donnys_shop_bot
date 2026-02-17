@@ -48,6 +48,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu()
     )
 
+# ============== CANCEL (SAFETY) =================
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sessions.pop(update.effective_user.id, None)
+    await update.message.reply_text(
+        "❌ Action cancelled.\nBack to main menu:",
+        reply_markup=main_menu()
+    )
+
 # ============== PRODUCT =================
 async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -103,6 +111,8 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             **s
         }
 
+        print("ORDER CREATED:", order_id)
+
         summary = (
             f"✅ *ORDER SUMMARY*\n\n"
             f"Order #: {order_id}\n"
@@ -148,7 +158,10 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not ADMINS:
         ADMINS.add(uid)
-        await update.message.reply_text(f"✅ You are now admin.\nID: `{uid}`", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ You are now the main admin.\nYour ID: `{uid}`",
+            parse_mode="Markdown"
+        )
 
     if uid not in ADMINS:
         await update.message.reply_text("❌ Not authorised.")
@@ -184,7 +197,7 @@ async def admin_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     buttons = InlineKeyboardMarkup([
         [InlineKeyboardButton("💰 Mark Paid", callback_data=f"mark_paid_{oid}")],
-        [InlineKeyboardButton("🚚 Mark Dispatched", callback_data=f"mark_sent_{oid}")],
+        [InlineKeyboardButton("🚚 Mark Dispatched", callback_data=f"mark_sent_{oid}")]
     ])
 
     await q.edit_message_text(text, parse_mode="Markdown", reply_markup=buttons)
@@ -201,10 +214,17 @@ async def admin_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "mark_sent":
         orders[oid]["status"] = "Dispatched"
 
+    print("ADMIN UPDATE:", action, oid)
+
     await context.bot.send_message(
         orders[oid]["user_id"],
-        f"📦 Order #{oid} status updated:\n*{orders[oid]['status']}*",
+        f"📦 Order #{oid} status update:\n*{orders[oid]['status']}*",
         parse_mode="Markdown"
+    )
+
+    await context.bot.send_message(
+        CHANNEL_ID,
+        f"✅ Order #{oid} marked as {orders[oid]['status']}"
     )
 
     await q.edit_message_text("✅ Status updated.")
@@ -220,6 +240,7 @@ app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("admin", admin))
+app.add_handler(CommandHandler("cancel", cancel))
 
 app.add_handler(CallbackQueryHandler(product_select, pattern="^prod_"))
 app.add_handler(CallbackQueryHandler(quantity_select, pattern="^qty_"))
