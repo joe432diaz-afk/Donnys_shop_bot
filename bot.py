@@ -11,7 +11,7 @@ from telegram.ext import (
 )
 
 # ================= CONFIG =================
-TOKEN = os.environ.get("TOKEN")  # or replace with your bot token directly
+TOKEN = os.environ.get("TOKEN")  # or paste your token
 CHANNEL_ID = -1003833257976
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 
@@ -38,6 +38,7 @@ PRICES = {
 def main_menu():
     buttons = [[InlineKeyboardButton(name, callback_data=f"prod_{key}")] for key, name in PRODUCTS.items()]
     buttons.append([InlineKeyboardButton("⭐ Reviews", callback_data="view_reviews")])
+    buttons.append([InlineKeyboardButton("📦 My Orders", callback_data="my_orders")])
     buttons.append([InlineKeyboardButton("📞 Contact Support", callback_data="contact_support")])
     return InlineKeyboardMarkup(buttons)
 
@@ -74,11 +75,11 @@ async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def quantity_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    qty = q.data.replace("qty_", "")
     s = sessions.get(q.from_user.id)
     if not s:
         await q.edit_message_text("❌ Session expired. Please start again.", reply_markup=main_menu())
         return
+    qty = q.data.replace("qty_", "")
     s["qty"] = qty
     s["price"] = PRICES[s["product_key"]][qty]
     s["step"] = "name"
@@ -141,6 +142,27 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(CHANNEL_ID, admin_msg, parse_mode="Markdown")
         sessions.pop(uid)
 
+# ================= VIEW USER ORDERS =================
+async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    user_orders = {oid: o for oid, o in orders.items() if o["user_id"] == uid}
+
+    if not user_orders:
+        await q.edit_message_text("📦 You have no past orders.", reply_markup=main_menu())
+        return
+
+    text = "📦 Your Orders:\n\n"
+    buttons = []
+    for oid, o in user_orders.items():
+        review = next((r for r in REVIEWS if r["user_id"] == uid and r["product_key"] == o["product_key"]), None)
+        review_text = f"⭐ {review['stars']}★" if review else "No review"
+        text += f"#{oid} - {o['product']} {o['qty']}g\nStatus: {o['status']}\nReview: {review_text}\n\n"
+        buttons.append([InlineKeyboardButton("⭐ Leave/Edit Review", callback_data=f"review_{oid}")])
+    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
 # ================= USER PAID =================
 async def user_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -152,6 +174,8 @@ async def user_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ Order not found.")
         return
     order["status"] = "Paid – awaiting dispatch"
+    # Notify user
+    await context.bot.send_message(order["user_id"], f"✅ Your order #{oid} has been marked as PAID by admin!")
     await q.edit_message_text(
         f"✅ Payment marked for Order #{oid}\n\n"
         f"{order['product']} – {order['qty']}g\n"
@@ -196,7 +220,6 @@ async def handle_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("❌ Please send a number between 1 and 5.")
         return
 
-    # Save or update review
     existing = next((r for r in REVIEWS if r["user_id"] == uid and r["product_key"] == order["product_key"]), None)
     if existing:
         existing.update({"stars": session["stars"], "text": text})
@@ -293,6 +316,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             oid = int(data.replace("admin_paid_", ""))
             orders[oid]["status"] = "Paid – awaiting dispatch"
+            # Notify user
+            await context.bot.send_message(orders[oid]["user_id"], f"✅ Your order #{oid} has been marked as PAID by admin!")
             await q.edit_message_text(
                 f"📦 Order #{oid} marked as PAID ✅\n{orders[oid]['product']} – {orders[oid]['qty']}g\nStatus: {orders[oid]['status']}"
             )
@@ -305,6 +330,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             oid = int(data.replace("admin_dispatch_", ""))
             orders[oid]["status"] = "Dispatched"
+            # Notify user
+            await context.bot.send_message(orders[oid]["user_id"], f"📦 Your order #{oid} has been marked as DISPATCHED by admin!")
             await q.edit_message_text(
                 f"📦 Order #{oid} marked as DISPATCHED ✅\n{orders[oid]['product']} – {orders[oid]['qty']}g\nStatus: {orders[oid]['status']}"
             )
@@ -325,6 +352,7 @@ app.add_handler(CallbackQueryHandler(quantity_select, pattern="^qty_"))
 app.add_handler(CallbackQueryHandler(user_paid, pattern="^paid_"))
 app.add_handler(CallbackQueryHandler(prompt_review, pattern="^review_"))
 app.add_handler(CallbackQueryHandler(view_reviews, pattern="view_reviews"))
+app.add_handler(CallbackQueryHandler(my_orders, pattern="my_orders"))
 app.add_handler(CallbackQueryHandler(contact_support, pattern="contact_support"))
 app.add_handler(CallbackQueryHandler(back, pattern="^back$"))
 app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
