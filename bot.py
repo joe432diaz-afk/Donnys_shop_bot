@@ -15,15 +15,16 @@ TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise ValueError("TOKEN environment variable is missing!")
 
-# Admin channel (replace with your channel numeric ID)
-CHANNEL_ID = -1003833257976
-
+# ------------------- CONFIG -------------------
+CHANNEL_ID = -1003833257976  # Admin channel numeric ID
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
+ADMINS = [123456789]  # Replace with your numeric Telegram ID(s)
+# ---------------------------------------------
 
 # Conversation states
-SELECT_PRODUCT, SELECT_QUANTITY, NAME, ADDRESS, SHIPPING, DISCOUNT, CONFIRM = range(7)
+SELECT_PRODUCT, SELECT_QUANTITY, NAME, ADDRESS, SHIPPING, DISCOUNT, CONFIRM, ADMIN_PANEL, ADMIN_ORDER_SELECT, ADMIN_ACTION = range(10)
 
-# Store user orders
+# Store orders
 user_orders = {}       # {user_id: {order info}}
 all_orders = {}        # {order_number: {user_id, order info, status}}
 
@@ -33,7 +34,6 @@ products = {
     "dawg": "Dawg",
     "cherry": "Cherry Punch"
 }
-
 quantities = ["3.5g", "7g", "14g", "28g", "56g"]
 prices = {"3.5g":30, "7g":50, "14g":80, "28g":150, "56g":270}
 
@@ -57,7 +57,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.data == "contact_donny":
         await query.edit_message_text("📩 PM @itsDonny1212 for help!")
         return SELECT_PRODUCT
@@ -80,7 +79,6 @@ async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def select_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.data == "back":
         return await start(update, context)
 
@@ -111,7 +109,6 @@ async def address_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def shipping_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.data == "back":
         return await start(update, context)
 
@@ -127,7 +124,7 @@ async def discount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     final_price = order["price"]
     if code.lower() != "none":
-        final_price = int(final_price * 0.9)  # example 10% discount
+        final_price = int(final_price * 0.9)  # 10% discount
     order["final_price"] = final_price
 
     # Generate order number
@@ -146,7 +143,7 @@ async def discount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Discount: {order['discount']}\n"
         f"Amount to pay: £{final_price}\n"
         f"⏰ Payment timeframe: 3 hours\n"
-        f"💳 LTC Wallet: {CRYPTO_WALLET}\n\n"
+        f"💳 LTC Wallet: `{CRYPTO_WALLET}`\n\n"
         f"Press 'Confirm Payment' when done or /cancel to cancel."
     )
 
@@ -157,7 +154,7 @@ async def discount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=reply_markup)
 
-    # Send to admin channel
+    # Send admin notification to channel
     admin_message = (
         f"🛒 *New Order*\n"
         f"Order #: {order_number}\n"
@@ -192,7 +189,7 @@ async def confirm_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"✅ Payment confirmed for Order #{order_number}! Status: Paid, awaiting dispatch.\n"
-                     f"LTC Wallet still visible: {CRYPTO_WALLET}"
+                     f"LTC Wallet (copyable): `{CRYPTO_WALLET}`"
             )
             await query.edit_message_text(f"Order #{order_number} marked as Paid, awaiting dispatch.\nBack to main menu.")
     return await start(update, context)
@@ -202,11 +199,98 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Order cancelled. Returning to main menu.")
     return await start(update, context)
 
+# ---------------- Admin Panel ----------------
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMINS:
+        await update.message.reply_text("❌ You are not authorized to use this.")
+        return ConversationHandler.END
+
+    if not all_orders:
+        await update.message.reply_text("No orders yet.")
+        return ConversationHandler.END
+
+    keyboard = []
+    for order_number, data in all_orders.items():
+        status = data["status"]
+        keyboard.append([InlineKeyboardButton(f"Order #{order_number} - {status}", callback_data=f"admin_order_{order_number}")])
+    keyboard.append([InlineKeyboardButton("Back to Menu", callback_data="back")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("📋 Admin Panel - Select an order:", reply_markup=reply_markup)
+    return ADMIN_PANEL
+
+# ---------------- Admin order selection ----------------
+async def admin_order_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "back":
+        return await start(update, context)
+
+    order_number = int(query.data.replace("admin_order_", ""))
+    if order_number not in all_orders:
+        await query.edit_message_text("Order not found.")
+        return ADMIN_PANEL
+
+    order = all_orders[order_number]["info"]
+    status = all_orders[order_number]["status"]
+    summary = (
+        f"📄 Order #{order_number}\n"
+        f"User: @{update.effective_user.username}\n"
+        f"Product: {order['product']}\n"
+        f"Quantity: {order['quantity']}\n"
+        f"Name: {order['name']}\n"
+        f"Address: {order['address']}\n"
+        f"Shipping: {order['shipping']}\n"
+        f"Discount: {order['discount']}\n"
+        f"Amount: £{order['final_price']}\n"
+        f"Status: {status}"
+    )
+    keyboard = [
+        [InlineKeyboardButton("Mark Paid", callback_data=f"mark_paid_{order_number}")],
+        [InlineKeyboardButton("Mark Dispatched", callback_data=f"mark_dispatched_{order_number}")],
+        [InlineKeyboardButton("Cancel Order", callback_data=f"cancel_order_{order_number}")],
+        [InlineKeyboardButton("Back to Admin Panel", callback_data="back")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(summary, reply_markup=reply_markup)
+    return ADMIN_ACTION
+
+# ---------------- Admin actions ----------------
+async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data == "back":
+        return await admin(update, context)
+
+    action, order_number = data.split("_", 1)[0], int(data.split("_", 1)[1])
+    order_data = all_orders.get(order_number)
+    if not order_data:
+        await query.edit_message_text("Order not found.")
+        return ADMIN_PANEL
+
+    user_id = order_data["user_id"]
+
+    if action == "mark":
+        if "paid" in data:
+            all_orders[order_number]["status"] = "Paid, awaiting dispatch"
+            await context.bot.send_message(user_id, f"✅ Your order #{order_number} has been marked as Paid, awaiting dispatch.\nLTC Wallet (copyable): `{CRYPTO_WALLET}`")
+        elif "dispatched" in data:
+            all_orders[order_number]["status"] = "Dispatched"
+            await context.bot.send_message(user_id, f"📦 Your order #{order_number} has been Dispatched!")
+
+    elif action == "cancel":
+        all_orders[order_number]["status"] = "Cancelled"
+        await context.bot.send_message(user_id, f"❌ Your order #{order_number} has been Cancelled.")
+
+    return await admin(update, context)
+
 # ---------------- Application Setup ----------------
 app = ApplicationBuilder().token(TOKEN).build()
 
 conv_handler = ConversationHandler(
-    entry_points=[CommandHandler("start", start)],
+    entry_points=[CommandHandler("start", start), CommandHandler("admin", admin)],
     states={
         SELECT_PRODUCT: [CallbackQueryHandler(product_select)],
         SELECT_QUANTITY: [CallbackQueryHandler(select_quantity)],
@@ -214,7 +298,9 @@ conv_handler = ConversationHandler(
         ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, address_input)],
         SHIPPING: [CallbackQueryHandler(shipping_select)],
         DISCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, discount_input)],
-        CONFIRM: [CallbackQueryHandler(confirm_payment, pattern="confirm_payment_")]
+        CONFIRM: [CallbackQueryHandler(confirm_payment, pattern="confirm_payment_")],
+        ADMIN_PANEL: [CallbackQueryHandler(admin_order_select, pattern="admin_order_.*|back")],
+        ADMIN_ACTION: [CallbackQueryHandler(admin_action, pattern="mark_paid_.*|mark_dispatched_.*|cancel_order_.*|back")]
     },
     fallbacks=[CommandHandler("cancel", cancel)],
 )
