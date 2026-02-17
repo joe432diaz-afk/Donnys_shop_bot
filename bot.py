@@ -1,4 +1,5 @@
 import os
+import random
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -7,37 +8,39 @@ from telegram.ext import (
     CallbackQueryHandler,
     ConversationHandler,
     MessageHandler,
-    filters
+    filters,
 )
 
 TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise ValueError("TOKEN environment variable is missing!")
 
+ADMIN_USERNAME = "@highlandhaze420"
+CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
+
 # Conversation states
 SELECT_PRODUCT, SELECT_QUANTITY, NAME, ADDRESS, SHIPPING, DISCOUNT, CONFIRM = range(7)
 
-# Store user orders temporarily
+# Store user orders in memory
 user_orders = {}
 
-# Product info
+# Products
 products = {
-    "lcg": {"name": "Lemon Cherry Gelato"},
-    "dawg": {"name": "Dawg"},
-    "cherry": {"name": "Cherry Punch"}
+    "lcg": "Lemon Cherry Gelato",
+    "dawg": "Dawg",
+    "cherry": "Cherry Punch"
 }
 
 quantities = ["3.5g", "7g", "14g", "28g", "56g"]
 prices = {"3.5g":30, "7g":50, "14g":80, "28g":150, "56g":270}
-crypto_wallet = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 
-# /start command
+# ---------------------- Start ----------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("Lemon Cherry Gelato", callback_data="product_lcg")],
         [InlineKeyboardButton("Dawg", callback_data="product_dawg")],
         [InlineKeyboardButton("Cherry Punch", callback_data="product_cherry")],
-        [InlineKeyboardButton("Contact Donny", callback_data="contact_donny")]
+        [InlineKeyboardButton("Contact Donny", callback_data="contact_donny")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
@@ -47,29 +50,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return SELECT_PRODUCT
 
-# Product selection
+# ---------------- Product selection ----------------
 async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+
     if query.data == "contact_donny":
         await query.edit_message_text("📩 PM @itsDonny1212 for help!")
         return SELECT_PRODUCT
-    
-    # Determine which product
-    if query.data == "product_lcg":
-        user_orders[query.from_user.id] = {"product": "Lemon Cherry Gelato"}
-    elif query.data == "product_dawg":
-        user_orders[query.from_user.id] = {"product": "Dawg"}
-    elif query.data == "product_cherry":
-        user_orders[query.from_user.id] = {"product": "Cherry Punch"}
-    else:
-        return SELECT_PRODUCT
 
-    # Show quantity options
+    product_key = query.data.replace("product_", "")
+    user_orders[query.from_user.id] = {"product": products.get(product_key, "Unknown")}
+
     keyboard = [[InlineKeyboardButton(q, callback_data=q)] for q in quantities]
-    keyboard.append([InlineKeyboardButton("Back to Menu", callback_data="back")])
+    keyboard.append([InlineKeyboardButton("Back to Main Menu", callback_data="back")])
     reply_markup = InlineKeyboardMarkup(keyboard)
+
     await query.edit_message_text(
         f"🛒 *{user_orders[query.from_user.id]['product']}*\nSelect quantity:",
         parse_mode="Markdown",
@@ -77,7 +73,7 @@ async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return SELECT_QUANTITY
 
-# Quantity selection
+# ---------------- Quantity selection ----------------
 async def select_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -91,24 +87,24 @@ async def select_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("Enter your full name for checkout:")
     return NAME
 
-# Name input
+# ---------------- Name input ----------------
 async def name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_orders[update.message.from_user.id]["name"] = update.message.text
     await update.message.reply_text("Enter your shipping address:")
     return ADDRESS
 
-# Address input
+# ---------------- Address input ----------------
 async def address_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_orders[update.message.from_user.id]["address"] = update.message.text
     keyboard = [
         [InlineKeyboardButton("T24", callback_data="T24")],
-        [InlineKeyboardButton("Back to Menu", callback_data="back")]
+        [InlineKeyboardButton("Back to Main Menu", callback_data="back")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Select your shipping method:", reply_markup=reply_markup)
     return SHIPPING
 
-# Shipping selection
+# ---------------- Shipping selection ----------------
 async def shipping_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -120,20 +116,24 @@ async def shipping_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("Enter discount code if you have one, or type 'none':")
     return DISCOUNT
 
-# Discount input
+# ---------------- Discount input ----------------
 async def discount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = update.message.text
-    user_orders[update.message.from_user.id]["discount"] = code
     order = user_orders[update.message.from_user.id]
+    order["discount"] = code
 
     final_price = order["price"]
     if code.lower() != "none":
-        final_price = int(final_price * 0.9)  # example 10% discount
+        final_price = int(final_price * 0.9)  # 10% discount example
+    order["final_price"] = final_price
 
-    user_orders[update.message.from_user.id]["final_price"] = final_price
+    # Generate order number
+    order_number = random.randint(1000, 9999)
+    order["order_number"] = order_number
 
-    await update.message.reply_text(
-        f"✅ Order Summary:\n"
+    summary = (
+        f"✅ *Order Summary*\n"
+        f"Order #: {order_number}\n"
         f"Product: {order['product']}\n"
         f"Quantity: {order['quantity']}\n"
         f"Name: {order['name']}\n"
@@ -142,17 +142,50 @@ async def discount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Discount: {order['discount']}\n"
         f"Amount to pay: £{final_price}\n"
         f"⏰ Payment timeframe: 3 hours\n"
-        f"💳 Send LTC ONLY to: {crypto_wallet}\n\n"
-        f"After payment, PM @itsDonny1212 to confirm."
+        f"💳 Send LTC ONLY to: {CRYPTO_WALLET}\n\n"
+        f"Press 'Confirm Payment' when done or /cancel to cancel."
     )
-    return ConversationHandler.END
 
-# Cancel / fallback
+    keyboard = [[InlineKeyboardButton("Back to Menu", callback_data="back")],
+                [InlineKeyboardButton("Confirm Payment", callback_data="confirm_payment")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=reply_markup)
+
+    # Notify admin
+    admin_message = (
+        f"🛒 *New Order*\n"
+        f"Order #: {order_number}\n"
+        f"User: @{update.message.from_user.username}\n"
+        f"Product: {order['product']}\n"
+        f"Quantity: {order['quantity']}\n"
+        f"Name: {order['name']}\n"
+        f"Address: {order['address']}\n"
+        f"Shipping: {order['shipping']}\n"
+        f"Discount: {order['discount']}\n"
+        f"Amount: £{final_price}"
+    )
+    try:
+        await context.bot.send_message(chat_id=ADMIN_USERNAME, text=admin_message, parse_mode="Markdown")
+    except Exception as e:
+        print("Admin notification failed:", e)
+
+    return CONFIRM
+
+# ---------------- Confirm Payment ----------------
+async def confirm_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text("✅ Payment confirmed! Thank you for your order.\nBack to main menu.")
+    return await start(update, context)
+
+# ---------------- Cancel ----------------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Order cancelled. Returning to main menu.")
     return await start(update, context)
 
-# Build app
+# ---------------- Application Setup ----------------
 app = ApplicationBuilder().token(TOKEN).build()
 
 conv_handler = ConversationHandler(
@@ -163,7 +196,8 @@ conv_handler = ConversationHandler(
         NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, name_input)],
         ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, address_input)],
         SHIPPING: [CallbackQueryHandler(shipping_select)],
-        DISCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, discount_input)]
+        DISCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, discount_input)],
+        CONFIRM: [CallbackQueryHandler(confirm_payment, pattern="confirm_payment")]
     },
     fallbacks=[CommandHandler("cancel", cancel)],
 )
