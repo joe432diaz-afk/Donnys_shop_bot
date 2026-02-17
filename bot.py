@@ -18,8 +18,8 @@ CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 ADMINS = set()
 orders = {}
 sessions = {}
-REVIEWS = []  # stores dicts: {"user_id":..., "product_key":..., "stars":..., "text":...}
-CONTACT_SESSIONS = {}  # for handling user/admin contact/review sessions
+REVIEWS = []  # store {"user_id", "product_key", "stars", "text"}
+CONTACT_SESSIONS = {}  # for contact/review sessions
 
 # ===== PRODUCTS AND PRICES =====
 PRODUCTS = {
@@ -91,11 +91,10 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     s = sessions.get(uid)
     if not s:
-        # handle admin text sessions
+        # handle admin session
         admin_session = sessions.get(uid)
         if admin_session:
             await handle_admin_text(update, context, admin_session)
-        # handle contact/review text
         await handle_contact(update, context)
         await handle_review_text(update, context)
         return
@@ -192,7 +191,6 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = CONTACT_SESSIONS.get(uid)
     if not session:
         return
-
     if session.get("step") == "contact_user":
         msg = update.message.text
         CONTACT_SESSIONS[uid] = {"step": "await_admin_reply", "last_msg": msg}
@@ -205,13 +203,11 @@ async def handle_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     session = CONTACT_SESSIONS.get(uid)
     if not session or session.get("step") != "review":
         return
-
     order_id = session["order_id"]
     order = orders.get(order_id)
     if not order:
         CONTACT_SESSIONS.pop(uid)
         return
-
     text = update.message.text
     if "stars" not in session:
         try:
@@ -248,7 +244,39 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("🛠 *ADMIN PANEL*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
-# ================= RUN BOT =================
+# ================= ADMIN CALLBACK =================
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    uid = q.from_user.id
+    if uid not in ADMINS:
+        await q.edit_message_text("❌ Not authorised.")
+        return
+
+    # View Orders
+    if data == "admin_view_orders":
+        if not orders:
+            await q.edit_message_text("📦 No orders yet.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="back")]]))
+            return
+        text = "📦 Orders:\n\n"
+        for oid, o in orders.items():
+            text += f"#{oid} - {o['product']} {o['qty']}g - {o['status']}\n"
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="back")]]))
+        return
+
+    # Manage Products
+    if data == "admin_manage_products":
+        buttons = [[InlineKeyboardButton("➕ Add Product", callback_data="add_product")]]
+        for key, name in PRODUCTS.items():
+            buttons.append([InlineKeyboardButton(f"✏️ Edit {name}", callback_data=f"edit_{key}")])
+            buttons.append([InlineKeyboardButton(f"💲 Edit Prices", callback_data=f"price_{key}")])
+            buttons.append([InlineKeyboardButton(f"❌ Delete {name}", callback_data=f"del_{key}")])
+        buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
+        await q.edit_message_text("🛠 *PRODUCT MANAGEMENT*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+# ================= APP =================
 app = ApplicationBuilder().token(TOKEN).build()
 
 # Command handlers
@@ -264,6 +292,7 @@ app.add_handler(CallbackQueryHandler(prompt_review, pattern="^review_"))
 app.add_handler(CallbackQueryHandler(view_reviews, pattern="view_reviews"))
 app.add_handler(CallbackQueryHandler(contact_support, pattern="contact_support"))
 app.add_handler(CallbackQueryHandler(back, pattern="^back$"))
+app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
 
 # Messages
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input))
