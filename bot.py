@@ -16,13 +16,13 @@ if not TOKEN:
     raise ValueError("TOKEN environment variable is missing!")
 
 # ------------------- CONFIG -------------------
-CHANNEL_ID = -1003833257976  # Admin channel numeric ID
+CHANNEL_ID = -1003833257976  # Admin channel ID
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
-ADMINS = [123456789]  # Replace with your numeric Telegram ID(s)
+ADMINS = [1003833257976]  # Your main admin numeric ID
 # ---------------------------------------------
 
 # Conversation states
-SELECT_PRODUCT, SELECT_QUANTITY, NAME, ADDRESS, SHIPPING, DISCOUNT, CONFIRM, ADMIN_PANEL, ADMIN_ORDER_SELECT, ADMIN_ACTION = range(10)
+SELECT_PRODUCT, SELECT_QUANTITY, NAME, ADDRESS, SHIPPING, DISCOUNT, CONFIRM, ADMIN_PANEL, ADMIN_ORDER_SELECT, ADMIN_ACTION, ADD_ADMIN = range(11)
 
 # Store orders
 user_orders = {}       # {user_id: {order info}}
@@ -143,7 +143,7 @@ async def discount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Discount: {order['discount']}\n"
         f"Amount to pay: £{final_price}\n"
         f"⏰ Payment timeframe: 3 hours\n"
-        f"💳 LTC Wallet: `{CRYPTO_WALLET}`\n\n"
+        f"💳 LTC Wallet (copyable): `{CRYPTO_WALLET}`\n\n"
         f"Press 'Confirm Payment' when done or /cancel to cancel."
     )
 
@@ -154,7 +154,7 @@ async def discount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=reply_markup)
 
-    # Send admin notification to channel
+    # Admin channel notification
     admin_message = (
         f"🛒 *New Order*\n"
         f"Order #: {order_number}\n"
@@ -205,26 +205,29 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ You are not authorized to use this.")
         return ConversationHandler.END
 
-    if not all_orders:
-        await update.message.reply_text("No orders yet.")
-        return ConversationHandler.END
-
     keyboard = []
     for order_number, data in all_orders.items():
         status = data["status"]
         keyboard.append([InlineKeyboardButton(f"Order #{order_number} - {status}", callback_data=f"admin_order_{order_number}")])
+
+    # Add button to add new admin
+    keyboard.append([InlineKeyboardButton("➕ Add New Admin", callback_data="add_new_admin")])
     keyboard.append([InlineKeyboardButton("Back to Menu", callback_data="back")])
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("📋 Admin Panel - Select an order:", reply_markup=reply_markup)
+    await update.message.reply_text("📋 Admin Panel - Select an order or manage admins:", reply_markup=reply_markup)
     return ADMIN_PANEL
 
-# ---------------- Admin order selection ----------------
+# ---------------- Admin actions ----------------
 async def admin_order_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     if query.data == "back":
         return await start(update, context)
+
+    if query.data == "add_new_admin":
+        await query.edit_message_text("Send numeric Telegram ID of new admin:")
+        return ADD_ADMIN
 
     order_number = int(query.data.replace("admin_order_", ""))
     if order_number not in all_orders:
@@ -255,7 +258,7 @@ async def admin_order_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(summary, reply_markup=reply_markup)
     return ADMIN_ACTION
 
-# ---------------- Admin actions ----------------
+# ---------------- Handle Admin Action ----------------
 async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -286,6 +289,19 @@ async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return await admin(update, context)
 
+# ---------------- Add New Admin ----------------
+async def add_new_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        new_admin_id = int(update.message.text.strip())
+        if new_admin_id in ADMINS:
+            await update.message.reply_text(f"User {new_admin_id} is already an admin.")
+        else:
+            ADMINS.append(new_admin_id)
+            await update.message.reply_text(f"✅ User {new_admin_id} added as admin!")
+    except:
+        await update.message.reply_text("❌ Invalid numeric ID. Try again.")
+    return await admin(update, context)
+
 # ---------------- Application Setup ----------------
 app = ApplicationBuilder().token(TOKEN).build()
 
@@ -299,8 +315,9 @@ conv_handler = ConversationHandler(
         SHIPPING: [CallbackQueryHandler(shipping_select)],
         DISCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, discount_input)],
         CONFIRM: [CallbackQueryHandler(confirm_payment, pattern="confirm_payment_")],
-        ADMIN_PANEL: [CallbackQueryHandler(admin_order_select, pattern="admin_order_.*|back")],
-        ADMIN_ACTION: [CallbackQueryHandler(admin_action, pattern="mark_paid_.*|mark_dispatched_.*|cancel_order_.*|back")]
+        ADMIN_PANEL: [CallbackQueryHandler(admin_order_select, pattern="admin_order_.*|add_new_admin|back")],
+        ADMIN_ACTION: [CallbackQueryHandler(admin_action, pattern="mark_paid_.*|mark_dispatched_.*|cancel_order_.*|back")],
+        ADD_ADMIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_new_admin)]
     },
     fallbacks=[CommandHandler("cancel", cancel)],
 )
