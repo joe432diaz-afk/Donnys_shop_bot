@@ -20,8 +20,6 @@ orders = {}
 sessions = {}
 REVIEWS = []
 CONTACT_SESSIONS = {}
-USER_SUPPORT = {}  # user_id -> last admin reply
-ADMIN_SUPPORT = {} # admin_id -> user_id being replied to
 
 # ===== PRODUCTS AND PRICES =====
 PRODUCTS = {
@@ -86,7 +84,10 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     s = sessions.get(uid)
     if not s:
-        await handle_admin_text(update, context)
+        # Handle admin session or contact/review
+        admin_session = sessions.get(uid)
+        if admin_session:
+            await handle_admin_text(update, context, admin_session)
         await handle_contact(update, context)
         await handle_review_text(update, context)
         return
@@ -184,23 +185,9 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if session.get("step") == "contact_user":
         msg = update.message.text
-        for admin_id in ADMINS:
-            ADMIN_SUPPORT[admin_id] = uid
-            await context.bot.send_message(admin_id, f"📨 Message from @{update.message.from_user.username or uid}:\n{msg}")
+        CONTACT_SESSIONS[uid] = {"step": "await_admin_reply", "last_msg": msg}
+        await context.bot.send_message(CHANNEL_ID, f"📨 Message from @{update.message.from_user.username or uid}:\n{msg}")
         await update.message.reply_text("✅ Message sent to admin.", reply_markup=main_menu())
-        session["step"] = "await_reply"
-
-async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = update.message.from_user.id
-    if admin_id not in ADMINS:
-        return
-    user_id = ADMIN_SUPPORT.get(admin_id)
-    if not user_id:
-        await update.message.reply_text("❌ No active user conversation.")
-        return
-    msg = update.message.text
-    await context.bot.send_message(user_id, f"💬 Admin reply:\n{msg}")
-    await update.message.reply_text("✅ Reply sent to user.")
 
 # ================= HANDLE REVIEW =================
 async def handle_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -249,6 +236,58 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("🛠 *ADMIN PANEL*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
+# ================= ADMIN CALLBACK =================
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    uid = q.from_user.id
+    if uid not in ADMINS:
+        await q.edit_message_text("❌ Not authorised.")
+        return
+
+    # --- VIEW ORDERS ---
+    if data == "admin_view_orders":
+        if not orders:
+            await q.edit_message_text("📦 No orders yet.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="back")]]))
+            return
+        text = "📦 Orders:\n\n"
+        buttons = []
+        for oid, o in orders.items():
+            text += f"#{oid} - {o['product']} {o['qty']}g - {o['status']}\n"
+            buttons.append([
+                InlineKeyboardButton(f"✅ Paid {oid}", callback_data=f"admin_paid_{oid}"),
+                InlineKeyboardButton(f"📦 Dispatch {oid}", callback_data=f"admin_dispatch_{oid}")
+            ])
+        buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    # --- MARK PAID ---
+    if data.startswith("admin_paid_"):
+        oid = int(data.replace("admin_paid_", ""))
+        orders[oid]["status"] = "Paid – awaiting dispatch"
+        await q.answer(f"Order #{oid} marked as Paid")
+        return
+
+    # --- MARK DISPATCHED ---
+    if data.startswith("admin_dispatch_"):
+        oid = int(data.replace("admin_dispatch_", ""))
+        orders[oid]["status"] = "Dispatched"
+        await q.answer(f"Order #{oid} marked as Dispatched")
+        return
+
+    # --- MANAGE PRODUCTS ---
+    if data == "admin_manage_products":
+        buttons = [[InlineKeyboardButton("➕ Add Product", callback_data="add_product")]]
+        for key, name in PRODUCTS.items():
+            buttons.append([InlineKeyboardButton(f"✏️ Edit {name}", callback_data=f"edit_{key}")])
+            buttons.append([InlineKeyboardButton(f"💲 Edit Prices", callback_data=f"price_{key}")])
+            buttons.append([InlineKeyboardButton(f"❌ Delete {name}", callback_data=f"del_{key}")])
+        buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
+        await q.edit_message_text("🛠 *PRODUCT MANAGEMENT*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
 # ================= APP =================
 app = ApplicationBuilder().token(TOKEN).build()
 
@@ -264,12 +303,9 @@ app.add_handler(CallbackQueryHandler(prompt_review, pattern="^review_"))
 app.add_handler(CallbackQueryHandler(view_reviews, pattern="view_reviews"))
 app.add_handler(CallbackQueryHandler(contact_support, pattern="contact_support"))
 app.add_handler(CallbackQueryHandler(back, pattern="^back$"))
-app.add_handler(CallbackQueryHandler(admin_callback, pattern=".*"))  # catch all admin buttons
+app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
 
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contact))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_reply))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_review_text))
 
 print("✅ BOT RUNNING")
 app.run_polling()
