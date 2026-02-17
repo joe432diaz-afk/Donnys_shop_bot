@@ -95,50 +95,47 @@ async def quantity_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     s = sessions.get(uid)
-    if not s:
+    if s:
+        if s["step"] == "name":
+            s["name"] = update.message.text
+            s["step"] = "address"
+            await update.message.reply_text("📍 Send your FULL ADDRESS:")
+            return
+        elif s["step"] == "address":
+            s["address"] = update.message.text
+            order_id = random.randint(100000, 999999)
+            orders[order_id] = {"user_id": uid, "status": "Pending payment", **s}
+
+            summary = (
+                f"✅ *ORDER SUMMARY*\n\n"
+                f"Order #: {order_id}\n"
+                f"Product: {s['product']}\n"
+                f"Qty: {s['qty']}g\n"
+                f"Name: {s['name']}\n"
+                f"Address: {s['address']}\n\n"
+                f"💰 Amount to pay: *£{s['price']}*\n"
+                f"💳 *LTC ONLY*\n`{CRYPTO_WALLET}`"
+            )
+            buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ I HAVE PAID", callback_data=f"paid_{order_id}")],
+                [InlineKeyboardButton("⭐ Leave Review", callback_data=f"review_{order_id}")],
+                [InlineKeyboardButton("⬅ Back to Menu", callback_data="back")]
+            ])
+            await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=buttons)
+
+            admin_msg = (
+                f"🆕 *NEW ORDER #{order_id}*\n"
+                f"{s['product']} – {s['qty']}g\n£{s['price']}\n"
+                f"👤 {s['name']}\n📍 {s['address']}"
+            )
+            await context.bot.send_message(CHANNEL_ID, admin_msg, parse_mode="Markdown")
+            sessions.pop(uid)
+    else:
+        # handle admin, review, contact messages
         await handle_admin_text(update, context)
         await handle_contact(update, context)
         await handle_review_text(update, context)
         await handle_admin_reply(update, context)
-        return
-
-    if s["step"] == "name":
-        s["name"] = update.message.text
-        s["step"] = "address"
-        await update.message.reply_text("📍 Send your FULL ADDRESS:")
-        return
-
-    if s["step"] == "address":
-        s["address"] = update.message.text
-        order_id = random.randint(100000, 999999)
-        orders[order_id] = {"user_id": uid, "status": "Pending payment", **s}
-
-        summary = (
-            f"✅ *ORDER SUMMARY*\n\n"
-            f"Order #: {order_id}\n"
-            f"Product: {s['product']}\n"
-            f"Qty: {s['qty']}g\n"
-            f"Name: {s['name']}\n"
-            f"Address: {s['address']}\n\n"
-            f"💰 Amount to pay: *£{s['price']}*\n"
-            f"💳 *LTC ONLY*\n`{CRYPTO_WALLET}`"
-        )
-
-        buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ I HAVE PAID", callback_data=f"paid_{order_id}")],
-            [InlineKeyboardButton("⭐ Leave Review", callback_data=f"review_{order_id}")],
-            [InlineKeyboardButton("⬅ Back to Menu", callback_data="back")]
-        ])
-
-        await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=buttons)
-
-        admin_msg = (
-            f"🆕 *NEW ORDER #{order_id}*\n"
-            f"{s['product']} – {s['qty']}g\n£{s['price']}\n"
-            f"👤 {s['name']}\n📍 {s['address']}"
-        )
-        await context.bot.send_message(CHANNEL_ID, admin_msg, parse_mode="Markdown")
-        sessions.pop(uid)
 
 # ================= USER PAID =================
 async def user_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -154,6 +151,12 @@ async def user_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Status: *{o['status']}*"
     )
     await q.edit_message_text(text, parse_mode="Markdown")
+
+# ================= BACK =================
+async def back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("Main menu:", reply_markup=main_menu())
 
 # ================= REVIEWS =================
 async def prompt_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,12 +237,6 @@ async def handle_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         CONTACT_SESSIONS.pop(uid)
         await update.message.reply_text("✅ Thank you for your review!", reply_markup=main_menu())
 
-# ================= BACK =================
-async def back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await q.edit_message_text("Main menu:", reply_markup=main_menu())
-
 # ================= ADMIN PANEL =================
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -255,7 +252,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("🛠 *ADMIN PANEL*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
-# ================= RUN APP =================
+# ================= APP =================
 app = ApplicationBuilder().token(TOKEN).build()
 
 # --- Handlers ---
@@ -268,11 +265,11 @@ app.add_handler(CallbackQueryHandler(product_select, pattern="^prod_"))
 app.add_handler(CallbackQueryHandler(quantity_select, pattern="^qty_"))
 app.add_handler(CallbackQueryHandler(user_paid, pattern="^paid_"))
 app.add_handler(CallbackQueryHandler(prompt_review, pattern="^review_"))
-app.add_handler(CallbackQueryHandler(view_reviews, pattern="view_reviews"))
-app.add_handler(CallbackQueryHandler(contact_support, pattern="contact_support"))
+app.add_handler(CallbackQueryHandler(view_reviews, pattern="^view_reviews$"))
+app.add_handler(CallbackQueryHandler(contact_support, pattern="^contact_support$"))
 app.add_handler(CallbackQueryHandler(back, pattern="^back$"))
 
-# Admin callbacks (fixed)
+# Admin callbacks (safe patterns)
 app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
 app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(add_|edit_|del_|price_|editphoto_|admin_manage_products)$"))
 
