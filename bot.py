@@ -1,225 +1,311 @@
-import os
-import random
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+import logging
+import uuid
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+)
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters
 )
 
-# ================= CONFIG =================
-TOKEN = os.environ.get("TOKEN")
-CHANNEL_ID = -1003833257976  # Admin notifications
-CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
+# =======================
+# 🔧 CONFIG – EDIT THESE
+# =======================
+BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
 
-ADMINS = set()
-orders = {}
-sessions = {}
-user_baskets = {}
-user_contact_history = {}
+ADMIN_IDS = {
+    1003833257976,   # main admin
+    # add more admin IDs here
+}
 
-# ===== PRODUCTS AND PRICES =====
+LTC_ADDRESS = "ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
+
+# =======================
+logging.basicConfig(level=logging.INFO)
+
+# In‑memory storage (phase‑1 stable)
+USERS = {}
+ORDERS = {}
+REVIEWS = []
 PRODUCTS = {
-    "lcg": {"name": "Lemon Cherry Gelato", "photo": None},
-    "dawg": {"name": "Dawg", "photo": None},
-    "cherry": {"name": "Cherry Punch", "photo": None},
+    "lemon_cherry_gelato": {
+        "name": "Lemon Cherry Gelato",
+        "desc": "Premium herbal flower – calming, aromatic, wellness focused.",
+        "prices": {3.5: 30, 7: 50, 14: 80, 28: 150, 56: 270},
+        "photo": None
+    },
+    "dawg": {
+        "name": "Dawg",
+        "desc": "Earthy herbal blend used traditionally for relaxation.",
+        "prices": {3.5: 30, 7: 50, 14: 80},
+        "photo": None
+    },
+    "cherry_punch": {
+        "name": "Cherry Punch",
+        "desc": "Sweet botanical infusion with spiritual grounding effects.",
+        "prices": {3.5: 30, 7: 50, 14: 80},
+        "photo": None
+    }
 }
 
-PRICES = {
-    "lcg": {"3.5": 30, "7": 50, "14": 80, "28": 150, "56": 270},
-    "dawg": {"3.5": 30, "7": 50, "14": 80, "28": 150, "56": 270},
-    "cherry": {"3.5": 30, "7": 50, "14": 80, "28": 150, "56": 270},
-}
-
-# ================== MAIN MENU ==================
-def main_menu_keyboard():
-    buttons = [[InlineKeyboardButton(p["name"], callback_data=f"prod_{key}")]
-               for key, p in PRODUCTS.items()]
-    buttons.append([InlineKeyboardButton("🛒 Basket", callback_data="view_basket")])
-    buttons.append([InlineKeyboardButton("💬 Contact Donny", callback_data="contact_admin")])
-    return InlineKeyboardMarkup(buttons)
-
+# =======================
+# 🏁 START / MAIN MENU
+# =======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome to Donny’s Shop!\n\n"
-        "Here for all your spiritual chest cheat codes and healing tools.\n\n"
-        "Select a product or contact Donny:",
-        reply_markup=main_menu_keyboard()
+    uid = update.effective_user.id
+    USERS.setdefault(uid, {"basket": {}, "state": None})
+
+    text = (
+        "🌿 **Welcome to Donny’s Herbal Wellness Store** 🌿\n\n"
+        "We specialise in ethically sourced herbal teas, botanical supplements "
+        "and spiritual wellness essentials.\n\n"
+        "✨ Natural • Discreet • Trusted ✨"
     )
 
-# ================== BASKET ==================
-def basket_text(user_id):
-    basket = user_baskets.get(user_id, {})
-    if not basket:
-        return "🛒 Your basket is empty."
-    text = "🛒 Your Basket:\n"
-    total = 0
-    for key, item in basket.items():
-        text += f"{PRODUCTS[key]['name']} – {item['qty']}g – £{item['price']}\n"
-        total += item['price']
-    text += f"\n💰 Total: £{total}"
-    return text
+    keyboard = [
+        [InlineKeyboardButton("🛍 Browse Products", callback_data="browse")],
+        [InlineKeyboardButton("🧺 Basket", callback_data="basket")],
+        [InlineKeyboardButton("⭐ Reviews", callback_data="reviews")],
+        [InlineKeyboardButton("📞 Contact Support", callback_data="contact")]
+    ]
 
-def basket_buttons(user_id):
-    basket = user_baskets.get(user_id, {})
-    buttons = [[InlineKeyboardButton(f"Remove {PRODUCTS[key]['name']}", callback_data=f"remove_{key}")]
-               for key in basket]
-    if basket:
-        buttons.append([InlineKeyboardButton("✅ Checkout", callback_data="checkout")])
-    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
-    return InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(
+        text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+    )
 
-async def view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =======================
+# 🛍 PRODUCTS
+# =======================
+async def browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(basket_text(q.from_user.id), reply_markup=basket_buttons(q.from_user.id))
 
-# ================== PRODUCT SELECTION ==================
-async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buttons = [
+        [InlineKeyboardButton(p["name"], callback_data=f"product:{k}")]
+        for k, p in PRODUCTS.items()
+    ]
+    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="main")])
+
+    await q.edit_message_text(
+        "🛍 **Our Herbal Products**",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown"
+    )
+
+async def product_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    key = q.data.replace("prod_", "")
-    if key not in PRODUCTS:
-        await q.edit_message_text("❌ Product not found.")
-        return
-    # Quantity buttons
-    buttons = [[InlineKeyboardButton(f"{g}g (£{PRICES[key][g]})", callback_data=f"add_{key}_{g}")]
-               for g in PRICES[key]]
-    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
-    # Show photo if exists
-    if PRODUCTS[key]["photo"]:
-        await q.edit_message_media(
-            media=InputMediaPhoto(PRODUCTS[key]["photo"], caption=f"🛒 {PRODUCTS[key]['name']} – choose quantity:"),
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-    else:
-        await q.edit_message_text(f"🛒 {PRODUCTS[key]['name']} – choose quantity:", reply_markup=InlineKeyboardMarkup(buttons))
+    pid = q.data.split(":")[1]
+    p = PRODUCTS[pid]
 
+    text = f"*{p['name']}*\n\n{p['desc']}\n\nSelect weight:"
+
+    buttons = [
+        [InlineKeyboardButton(f"{w}g – £{price}", callback_data=f"add:{pid}:{w}")]
+        for w, price in p["prices"].items()
+    ]
+    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="browse")])
+
+    await q.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown"
+    )
+
+# =======================
+# 🧺 BASKET
+# =======================
 async def add_to_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    _, key, qty = q.data.split("_")
-    price = PRICES[key][qty]
-    user_id = q.from_user.id
-    if user_id not in user_baskets:
-        user_baskets[user_id] = {}
-    user_baskets[user_id][key] = {"qty": qty, "price": price}
-    await q.edit_message_text(f"✅ Added {PRODUCTS[key]['name']} {qty}g (£{price}) to your basket.", reply_markup=main_menu_keyboard())
+    uid = q.from_user.id
+    _, pid, weight = q.data.split(":")
+    weight = float(weight)
 
-# ================== REMOVE ITEM ==================
-async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    key = q.data.replace("remove_", "")
-    user_baskets.get(q.from_user.id, {}).pop(key, None)
-    await view_basket(update, context)
+    basket = USERS[uid]["basket"]
+    basket.setdefault((pid, weight), 0)
+    basket[(pid, weight)] += 1
 
-# ================== CHECKOUT ==================
-async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    user_id = q.from_user.id
-    basket = user_baskets.get(user_id, {})
-    if not basket:
-        await q.edit_message_text("🛒 Your basket is empty.", reply_markup=main_menu_keyboard())
-        return
-    sessions[user_id] = {"step": "checkout_name", "basket": basket}
-    await q.edit_message_text("✍️ Send your FULL NAME for checkout:")
+    await q.edit_message_text("✅ Added to basket.", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧺 View Basket", callback_data="basket")],
+        [InlineKeyboardButton("⬅ Back", callback_data="browse")]
+    ]))
 
-async def checkout_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.from_user.id
-    s = sessions.get(uid)
-    if not s or "basket" not in s:
-        return
-    if s["step"] == "checkout_name":
-        s["name"] = update.message.text
-        s["step"] = "checkout_address"
-        await update.message.reply_text("📍 Send your FULL ADDRESS:")
-        return
-    if s["step"] == "checkout_address":
-        s["address"] = update.message.text
-        # Create order
-        order_id = random.randint(100000, 999999)
-        total = sum([i['price'] for i in s['basket'].values()])
-        orders[order_id] = {
-            "user_id": uid,
-            "status": "Pending payment",
-            "name": s["name"],
-            "address": s["address"],
-            "basket": s["basket"],
-            "total": total
-        }
-        # User summary
-        summary = f"✅ *ORDER SUMMARY*\nOrder #: {order_id}\n"
-        for k, v in s['basket'].items():
-            summary += f"{PRODUCTS[k]['name']} – {v['qty']}g – £{v['price']}\n"
-        summary += f"\n💰 Total: £{total}\n💳 *LTC ONLY*\n`{CRYPTO_WALLET}`"
-        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I HAVE PAID", callback_data=f"paid_{order_id}")]])
-        await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=buttons)
-        # Admin notification
-        admin_msg = f"🆕 *NEW ORDER #{order_id}*\n👤 {s['name']}\n📍 {s['address']}\n"
-        for k,v in s['basket'].items():
-            admin_msg += f"{PRODUCTS[k]['name']} – {v['qty']}g – £{v['price']}\n"
-        admin_msg += f"\n💰 Total: £{total}"
-        await context.bot.send_message(CHANNEL_ID, admin_msg, parse_mode="Markdown")
-        user_baskets[uid] = {}  # clear basket
-        sessions.pop(uid)
-
-# ================== USER PAID ==================
-async def user_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    order_id = int(q.data.replace("paid_", ""))
-    o = orders[order_id]
-    o["status"] = "Paid – awaiting dispatch"
-    text = f"✅ *PAYMENT MARKED*\nOrder #: {order_id}\nStatus: *{o['status']}*\n💰 Total: £{o['total']}\n💳 LTC Address:\n`{CRYPTO_WALLET}`"
-    await q.edit_message_text(text, parse_mode="Markdown")
-
-# ================== CONTACT ADMIN ==================
-async def contact_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    sessions[uid] = {"step": "contact"}
-    await q.edit_message_text("💬 Send your message to Donny:")
+    basket = USERS[uid]["basket"]
 
-async def contact_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.from_user.id
-    s = sessions.get(uid)
-    if s and s.get("step") == "contact":
-        user_contact_history.setdefault(uid, []).append(update.message.text)
-        await context.bot.send_message(CHANNEL_ID, f"💬 Message from {update.message.from_user.username or uid}:\n{update.message.text}")
-        await update.message.reply_text("✅ Message sent to Donny.", reply_markup=main_menu_keyboard())
-        sessions.pop(uid)
+    if not basket:
+        await q.edit_message_text("🧺 Your basket is empty.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="main")]]))
+        return
 
-# ================== BACK ==================
-async def back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total = 0
+    lines = []
+    for (pid, w), qty in basket.items():
+        price = PRODUCTS[pid]["prices"][w] * qty
+        total += price
+        lines.append(f"{PRODUCTS[pid]['name']} {w}g × {qty} = £{price}")
+
+    text = "🧺 **Your Basket**\n\n" + "\n".join(lines) + f"\n\n**Total: £{total}**"
+
+    await q.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Checkout", callback_data="checkout")],
+            [InlineKeyboardButton("⬅ Back", callback_data="main")]
+        ])
+    )
+
+# =======================
+# 💳 CHECKOUT
+# =======================
+async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text("Main Menu:", reply_markup=main_menu_keyboard())
+    USERS[q.from_user.id]["state"] = "name"
+    await q.edit_message_text("Please enter your **full name**:")
 
-# ================== APP ==================
-app = ApplicationBuilder().token(TOKEN).build()
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    state = USERS.get(uid, {}).get("state")
 
-# Commands
+    if state == "name":
+        USERS[uid]["name"] = update.message.text
+        USERS[uid]["state"] = "address"
+        await update.message.reply_text("Enter your **delivery address**:")
+        return
+
+    if state == "address":
+        USERS[uid]["address"] = update.message.text
+        USERS[uid]["state"] = None
+        await create_order(update, context)
+
+async def create_order(update, context):
+    uid = update.effective_user.id
+    order_id = str(uuid.uuid4())[:8]
+    basket = USERS[uid]["basket"]
+
+    total = sum(PRODUCTS[p]["prices"][w] * q for (p, w), q in basket.items())
+
+    ORDERS[order_id] = {
+        "user": uid,
+        "name": USERS[uid]["name"],
+        "address": USERS[uid]["address"],
+        "basket": basket.copy(),
+        "total": total,
+        "status": "Pending"
+    }
+
+    USERS[uid]["basket"] = {}
+
+    text = (
+        f"🧾 **Order #{order_id}**\n\n"
+        f"Amount to pay: **£{total}**\n\n"
+        f"💳 **LTC ONLY**\n"
+        f"`{LTC_ADDRESS}`\n\n"
+        "⏳ Processing time: ~3 hours\n\n"
+        "After payment, wait for admin confirmation."
+    )
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+    # Notify admins
+    for admin in ADMIN_IDS:
+        await context.bot.send_message(
+            admin,
+            f"🆕 New Order #{order_id}\nName: {ORDERS[order_id]['name']}\n"
+            f"Address: {ORDERS[order_id]['address']}\nTotal: £{total}"
+        )
+
+# =======================
+# 🛠 ADMIN PANEL
+# =======================
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        return
+
+    buttons = [
+        [InlineKeyboardButton("📦 View Orders", callback_data="admin_orders")],
+    ]
+
+    await update.message.reply_text(
+        "🛠 **Admin Panel**",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown"
+    )
+
+async def admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    buttons = [
+        [InlineKeyboardButton(
+            f"{oid} – {o['status']}",
+            callback_data=f"admin_order:{oid}"
+        )] for oid, o in ORDERS.items()
+    ]
+
+    await q.edit_message_text(
+        "📦 Orders",
+        reply_markup=InlineKeyboardMarkup(buttons or [[InlineKeyboardButton("No orders", callback_data="noop")]])
+    )
+
+async def admin_order_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    oid = q.data.split(":")[1]
+    o = ORDERS[oid]
+
+    text = (
+        f"🧾 Order #{oid}\n\n"
+        f"Name: {o['name']}\n"
+        f"Address: {o['address']}\n"
+        f"Total: £{o['total']}\n"
+        f"Status: {o['status']}"
+    )
+
+    await q.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Mark Paid", callback_data=f"paid:{oid}")],
+            [InlineKeyboardButton("📦 Mark Dispatched", callback_data=f"sent:{oid}")]
+        ])
+    )
+
+async def set_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    action, oid = q.data.split(":")
+    o = ORDERS[oid]
+
+    if action == "paid":
+        o["status"] = "Paid"
+        await context.bot.send_message(o["user"], f"✅ Order #{oid} marked as PAID.")
+    else:
+        o["status"] = "Dispatched"
+        await context.bot.send_message(o["user"], f"📦 Order #{oid} has been DISPATCHED.")
+
+    await admin_orders(update, context)
+
+# =======================
+# 🚀 RUN
+# =======================
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("admin", admin))
+app.add_handler(CallbackQueryHandler(browse, pattern="^browse$"))
+app.add_handler(CallbackQueryHandler(product_view, pattern="^product:"))
+app.add_handler(CallbackQueryHandler(add_to_basket, pattern="^add:"))
+app.add_handler(CallbackQueryHandler(basket, pattern="^basket$"))
+app.add_handler(CallbackQueryHandler(checkout, pattern="^checkout$"))
+app.add_handler(CallbackQueryHandler(admin_orders, pattern="^admin_orders$"))
+app.add_handler(CallbackQueryHandler(admin_order_view, pattern="^admin_order:"))
+app.add_handler(CallbackQueryHandler(set_status, pattern="^(paid|sent):"))
+app.add_handler(CallbackQueryHandler(start, pattern="^main$"))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-# CallbackQuery Handlers
-app.add_handler(CallbackQueryHandler(product_select, pattern="^prod_"))
-app.add_handler(CallbackQueryHandler(add_to_basket, pattern="^add_"))
-app.add_handler(CallbackQueryHandler(view_basket, pattern="view_basket"))
-app.add_handler(CallbackQueryHandler(remove_item, pattern="^remove_"))
-app.add_handler(CallbackQueryHandler(checkout, pattern="checkout"))
-app.add_handler(CallbackQueryHandler(user_paid, pattern="^paid_"))
-app.add_handler(CallbackQueryHandler(contact_admin, pattern="contact_admin"))
-app.add_handler(CallbackQueryHandler(back, pattern="^back$"))
-
-# Messages
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_text))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, contact_text))
-
-print("✅ BOT RUNNING")
 app.run_polling()
