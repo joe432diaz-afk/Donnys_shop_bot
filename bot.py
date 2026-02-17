@@ -19,6 +19,7 @@ ADMINS = set()
 orders = {}
 sessions = {}
 
+# ===== PRODUCTS AND PRICES =====
 PRODUCTS = {
     "lcg": "Lemon Cherry Gelato",
     "dawg": "Dawg",
@@ -26,20 +27,18 @@ PRODUCTS = {
 }
 
 PRICES = {
-    "3.5": 30,
-    "7": 50,
-    "14": 80,
-    "28": 150,
-    "56": 270,
+    "lcg": {"3.5": 30, "7": 50, "14": 80, "28": 150, "56": 270},
+    "dawg": {"3.5": 30, "7": 50, "14": 80, "28": 150, "56": 270},
+    "cherry": {"3.5": 30, "7": 50, "14": 80, "28": 150, "56": 270},
 }
 
 # ============== MENUS =================
 def main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🍋 Lemon Cherry Gelato", callback_data="prod_lcg")],
-        [InlineKeyboardButton("🐕 Dawg", callback_data="prod_dawg")],
-        [InlineKeyboardButton("🍒 Cherry Punch", callback_data="prod_cherry")],
-    ])
+    buttons = [
+        [InlineKeyboardButton(f"{name}", callback_data=f"prod_{key}")]
+        for key, name in PRODUCTS.items()
+    ]
+    return InlineKeyboardMarkup(buttons)
 
 # ============== START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -48,7 +47,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu()
     )
 
-# ============== CANCEL (SAFETY) =================
+# ============== CANCEL =================
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sessions.pop(update.effective_user.id, None)
     await update.message.reply_text(
@@ -56,19 +55,26 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu()
     )
 
-# ============== PRODUCT =================
+# ============== PRODUCT FLOW =================
 async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
     key = q.data.replace("prod_", "")
+    if key not in PRODUCTS:
+        await q.edit_message_text("❌ Product not found.")
+        return
+
     sessions[q.from_user.id] = {
+        "product_key": key,
         "product": PRODUCTS[key],
         "step": "qty"
     }
 
-    buttons = [[InlineKeyboardButton(f"{g}g (£{PRICES[g]})", callback_data=f"qty_{g}")]
-               for g in PRICES]
+    buttons = [
+        [InlineKeyboardButton(f"{g}g (£{PRICES[key][g]})", callback_data=f"qty_{g}")]
+        for g in PRICES[key]
+    ]
     buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
 
     await q.edit_message_text(
@@ -83,16 +89,20 @@ async def quantity_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     qty = q.data.replace("qty_", "")
     s = sessions[q.from_user.id]
     s["qty"] = qty
-    s["price"] = PRICES[qty]
+    s["price"] = PRICES[s["product_key"]][qty]
     s["step"] = "name"
 
     await q.edit_message_text("✍️ Send your FULL NAME:")
 
-# ============== TEXT FLOW =================
+# ============== TEXT INPUT =================
 async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     s = sessions.get(uid)
     if not s:
+        # Check if admin is in editing name/prices
+        admin_session = sessions.get(uid)
+        if admin_session:
+            await handle_admin_text(update, context, admin_session)
         return
 
     if s["step"] == "name":
@@ -107,11 +117,9 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         orders[order_id] = {
             "user_id": uid,
-            "status": "Pending",
+            "status": "Pending payment",
             **s
         }
-
-        print("ORDER CREATED:", order_id)
 
         summary = (
             f"✅ *ORDER SUMMARY*\n\n"
@@ -120,8 +128,7 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Qty: {s['qty']}g\n"
             f"Name: {s['name']}\n"
             f"Address: {s['address']}\n\n"
-            f"💰 Amount: £{s['price']}\n"
-            f"⏳ Pay within 3 hours\n\n"
+            f"💰 Amount to pay: *£{s['price']}*\n"
             f"💳 *LTC ONLY*\n`{CRYPTO_WALLET}`"
         )
 
@@ -130,11 +137,25 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅ Back to Menu", callback_data="back")]
         ])
 
-        await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=buttons)
+        await update.message.reply_text(
+            summary,
+            parse_mode="Markdown",
+            reply_markup=buttons
+        )
+
+        # Admin notification with full info
+        admin_msg = (
+            f"🆕 *NEW ORDER #{order_id}*\n\n"
+            f"{s['product']} – {s['qty']}g\n"
+            f"£{s['price']}\n\n"
+            f"👤 {s['name']}\n"
+            f"📍 {s['address']}"
+        )
 
         await context.bot.send_message(
             CHANNEL_ID,
-            f"🆕 NEW ORDER #{order_id}\n{s['product']} {s['qty']}g\n£{s['price']}"
+            admin_msg,
+            parse_mode="Markdown"
         )
 
         sessions.pop(uid)
@@ -145,21 +166,28 @@ async def user_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     oid = int(q.data.replace("paid_", ""))
-    orders[oid]["status"] = "Paid – awaiting dispatch"
+    o = orders[oid]
+    o["status"] = "Paid – awaiting dispatch"
 
-    await q.edit_message_text(
-        "✅ Payment noted.\nStatus: *Paid – awaiting dispatch*",
-        parse_mode="Markdown"
+    text = (
+        f"✅ *PAYMENT MARKED*\n\n"
+        f"Order #: {oid}\n"
+        f"{o['product']} – {o['qty']}g\n\n"
+        f"💰 Amount: *£{o['price']}*\n"
+        f"💳 LTC Address:\n`{CRYPTO_WALLET}`\n\n"
+        f"Status: *{o['status']}*"
     )
 
-# ============== ADMIN =================
+    await q.edit_message_text(text, parse_mode="Markdown")
+
+# ============== ADMIN PANEL =================
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
     if not ADMINS:
         ADMINS.add(uid)
         await update.message.reply_text(
-            f"✅ You are now the main admin.\nYour ID: `{uid}`",
+            f"✅ You are now the main admin.\nID: `{uid}`",
             parse_mode="Markdown"
         )
 
@@ -167,12 +195,11 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Not authorised.")
         return
 
-    if not orders:
-        await update.message.reply_text("🛠 Admin Panel\n\nNo orders yet.")
-        return
-
-    buttons = [[InlineKeyboardButton(f"#{oid} – {o['status']}", callback_data=f"admin_{oid}")]
-               for oid, o in orders.items()]
+    # Admin options
+    buttons = [
+        [InlineKeyboardButton("📦 View Orders", callback_data="admin_view_orders")],
+        [InlineKeyboardButton("🛠 Manage Products", callback_data="admin_manage_products")]
+    ]
 
     await update.message.reply_text(
         "🛠 *ADMIN PANEL*",
@@ -180,54 +207,114 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
-async def admin_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ============== ADMIN CALLBACKS =================
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    data = q.data
+    uid = q.from_user.id
 
-    oid = int(q.data.replace("admin_", ""))
-    o = orders[oid]
+    # --- Manage Products Menu ---
+    if data == "admin_manage_products":
+        buttons = [[InlineKeyboardButton("➕ Add Product", callback_data="add_product")]]
+        for key, name in PRODUCTS.items():
+            buttons.append([InlineKeyboardButton(f"✏️ Edit {name}", callback_data=f"edit_{key}")])
+            buttons.append([InlineKeyboardButton(f"💲 Edit Prices", callback_data=f"price_{key}")])
+            buttons.append([InlineKeyboardButton(f"❌ Delete {name}", callback_data=f"del_{key}")])
+        buttons.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
+        await q.edit_message_text(
+            "🛠 *PRODUCT MANAGEMENT*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
 
-    text = (
-        f"📦 *ORDER #{oid}*\n\n"
-        f"{o['product']} {o['qty']}g\n"
-        f"£{o['price']}\n\n"
-        f"{o['name']}\n{o['address']}\n\n"
-        f"Status: {o['status']}"
-    )
+    # --- Add Product ---
+    if data == "add_product":
+        sessions[uid] = {"step": "add_name"}
+        await q.edit_message_text("✍️ Send the NAME of the new product:")
+        return
 
-    buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Mark Paid", callback_data=f"mark_paid_{oid}")],
-        [InlineKeyboardButton("🚚 Mark Dispatched", callback_data=f"mark_sent_{oid}")]
-    ])
+    # --- Edit Product Name ---
+    if data.startswith("edit_"):
+        key = data.replace("edit_", "")
+        sessions[uid] = {"step": "edit_name", "key": key}
+        await q.edit_message_text(f"✍️ Send the NEW NAME for {PRODUCTS[key]}:")
+        return
 
-    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=buttons)
+    # --- Edit Product Prices ---
+    if data.startswith("price_"):
+        key = data.replace("price_", "")
+        sessions[uid] = {"step": "edit_prices", "key": key}
+        current = "\n".join([f"{g}:{p}" for g, p in PRICES[key].items()])
+        await q.edit_message_text(f"✍️ Send new price tiers for {PRODUCTS[key]} in this format:\n`{current}`\nExample:\n3.5:30\n7:50\n14:80", parse_mode="Markdown")
+        return
 
-async def admin_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+    # --- Delete Product ---
+    if data.startswith("del_"):
+        key = data.replace("del_", "")
+        del PRODUCTS[key]
+        del PRICES[key]
+        await q.edit_message_text("✅ Product deleted.", reply_markup=main_menu())
+        return
 
-    action, oid = q.data.rsplit("_", 1)
-    oid = int(oid)
+    # --- Back ---
+    if data == "back":
+        await q.edit_message_text("🛠 Back to Admin Panel", reply_markup=None)
+        await admin(update, context)
+        return
 
-    if action == "mark_paid":
-        orders[oid]["status"] = "Paid"
-    elif action == "mark_sent":
-        orders[oid]["status"] = "Dispatched"
+# ============== ADMIN TEXT HANDLER =================
+async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, session):
+    uid = update.message.from_user.id
+    step = session["step"]
 
-    print("ADMIN UPDATE:", action, oid)
+    # Add Product
+    if step == "add_name":
+        name = update.message.text
+        key = name.lower().replace(" ", "_")
+        PRODUCTS[key] = name
+        PRICES[key] = {}
+        sessions[uid] = {"step": "add_prices", "key": key}
+        await update.message.reply_text(f"Send price tiers for {name} in format:\n3.5:30\n7:50\n14:80")
+        return
 
-    await context.bot.send_message(
-        orders[oid]["user_id"],
-        f"📦 Order #{oid} status update:\n*{orders[oid]['status']}*",
-        parse_mode="Markdown"
-    )
+    if step == "add_prices":
+        key = session["key"]
+        new_prices = {}
+        try:
+            for line in update.message.text.splitlines():
+                g, p = line.strip().split(":")
+                new_prices[g] = int(p)
+            PRICES[key] = new_prices
+            sessions.pop(uid)
+            await update.message.reply_text(f"✅ Product {PRODUCTS[key]} added with prices {PRICES[key]}", reply_markup=main_menu())
+        except Exception as e:
+            await update.message.reply_text("❌ Invalid format. Use g:p per line, e.g., 3.5:30")
+        return
 
-    await context.bot.send_message(
-        CHANNEL_ID,
-        f"✅ Order #{oid} marked as {orders[oid]['status']}"
-    )
+    # Edit Product Name
+    if step == "edit_name":
+        key = session["key"]
+        PRODUCTS[key] = update.message.text
+        sessions.pop(uid)
+        await update.message.reply_text(f"✅ Product name updated to {PRODUCTS[key]}", reply_markup=main_menu())
+        return
 
-    await q.edit_message_text("✅ Status updated.")
+    # Edit Prices
+    if step == "edit_prices":
+        key = session["key"]
+        new_prices = {}
+        try:
+            for line in update.message.text.splitlines():
+                g, p = line.strip().split(":")
+                new_prices[g] = int(p)
+            PRICES[key] = new_prices
+            sessions.pop(uid)
+            await update.message.reply_text(f"✅ Prices updated for {PRODUCTS[key]}: {PRICES[key]}", reply_markup=main_menu())
+        except:
+            await update.message.reply_text("❌ Invalid format. Use g:p per line, e.g., 3.5:30")
+        return
 
 # ============== BACK =================
 async def back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -242,13 +329,17 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("admin", admin))
 app.add_handler(CommandHandler("cancel", cancel))
 
+# User product flow
 app.add_handler(CallbackQueryHandler(product_select, pattern="^prod_"))
 app.add_handler(CallbackQueryHandler(quantity_select, pattern="^qty_"))
 app.add_handler(CallbackQueryHandler(user_paid, pattern="^paid_"))
-app.add_handler(CallbackQueryHandler(admin_order, pattern="^admin_"))
-app.add_handler(CallbackQueryHandler(admin_update, pattern="^mark_"))
 app.add_handler(CallbackQueryHandler(back, pattern="^back$"))
 
+# Admin product management
+app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
+app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(add_|edit_|del_|price_|admin_manage_products)$"))
+
+# Messages
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input))
 
 print("✅ BOT RUNNING")
