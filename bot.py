@@ -1,7 +1,6 @@
 import os
 import json
 import sqlite3
-from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -49,23 +48,6 @@ CREATE TABLE IF NOT EXISTS orders (
     address TEXT
 )
 """)
-cur.execute("""
-CREATE TABLE IF NOT EXISTS reviews (
-    order_id INTEGER PRIMARY KEY,
-    user_id INTEGER,
-    stars INTEGER,
-    text TEXT
-)
-""")
-cur.execute("""
-CREATE TABLE IF NOT EXISTS chats (
-    chat_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id INTEGER,
-    sender TEXT,
-    message TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-)
-""")
 db.commit()
 
 # ================= HELPERS =================
@@ -90,216 +72,233 @@ def build_basket_text(basket):
     text += f"\n💰 Total: £{total}"
     return text, total
 
-def build_order_buttons(order_id):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Contact Vendor", callback_data=f"chat_{order_id}")],
-        [InlineKeyboardButton("✍️ Leave/Edit Review", callback_data=f"review_{order_id}")],
-        [InlineKeyboardButton("👀 View Review", callback_data=f"viewreview_{order_id}")],
-        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")]
-    ])
-
-def build_chat_buttons(order_id):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📩 Send Message", callback_data=f"sendmsg_{order_id}")],
-        [InlineKeyboardButton("❌ Close Chat", callback_data=f"closechat_{order_id}")]
-    ])
-
-def get_order_by_id(order_id, user_id=None):
-    if user_id:
-        cur.execute("SELECT * FROM orders WHERE order_id=? AND user_id=?", (order_id, user_id))
-    else:
-        cur.execute("SELECT * FROM orders WHERE order_id=?", (order_id,))
-    return cur.fetchone()
-
 # ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.reply_text("🌿 Welcome to the shop!\nSelect a product:", reply_markup=main_menu())
-    except Exception as e:
-        print(f"Error in start: {e}")
+    await update.message.reply_text("🌿 Welcome to the shop!\nSelect a product:", reply_markup=main_menu())
 
 # ================= ADMIN =================
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        uid = update.effective_user.id
-        ADMINS.add(uid)
-        buttons = [
-            [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
-            [InlineKeyboardButton("📦 View Orders", callback_data="admin_orders")]
-        ]
-        await update.message.reply_text("🛠 ADMIN PANEL", reply_markup=InlineKeyboardMarkup(buttons))
-    except Exception as e:
-        print(f"Error in admin: {e}")
+    uid = update.effective_user.id
+    ADMINS.add(uid)
+    buttons = [
+        [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
+        [InlineKeyboardButton("📦 View Orders", callback_data="admin_orders")]
+    ]
+    await update.message.reply_text("🛠 ADMIN PANEL", reply_markup=InlineKeyboardMarkup(buttons))
 
 # ================= PRODUCT SELECTION =================
 async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        q = update.callback_query
-        await q.answer()
-        pid = q.data.replace("prod_", "")
-        cur.execute("SELECT * FROM products WHERE id=?", (pid,))
-        p = cur.fetchone()
-        if not p:
-            await q.edit_message_text("❌ Product not found.", reply_markup=main_menu())
-            return
+    q = update.callback_query
+    await q.answer()
+    pid = q.data.replace("prod_", "")
+    cur.execute("SELECT * FROM products WHERE id=?", (pid,))
+    p = cur.fetchone()
+    if not p:
+        await q.edit_message_text("❌ Product not found.", reply_markup=main_menu())
+        return
 
-        USER_SESSIONS[q.from_user.id] = {
-            "step": "weight_select",
-            "current_product": {
-                "id": p[0],
-                "name": p[1],
-                "description": p[2],
-                "photo_file_id": p[3],
-                "prices": {
-                    "3.5": p[4],
-                    "7": p[5],
-                    "14": p[6],
-                    "28": p[7],
-                    "56": p[8]
-                }
+    USER_SESSIONS[q.from_user.id] = {
+        "step": "weight_select",
+        "current_product": {
+            "id": p[0],
+            "name": p[1],
+            "description": p[2],
+            "photo_file_id": p[3],
+            "prices": {
+                "3.5": p[4],
+                "7": p[5],
+                "14": p[6],
+                "28": p[7],
+                "56": p[8]
             }
         }
+    }
 
-        buttons = [[InlineKeyboardButton(f"{w}g (£{price})", callback_data=f"weight_{w}")] for w, price in USER_SESSIONS[q.from_user.id]["current_product"]["prices"].items()]
+    buttons = [[InlineKeyboardButton(f"{w}g (£{price})", callback_data=f"weight_{w}")] for w, price in USER_SESSIONS[q.from_user.id]["current_product"]["prices"].items()]
 
-        await context.bot.send_photo(
-            chat_id=q.from_user.id,
-            photo=p[3],
-            caption=f"📦 {p[1]}\n{p[2]}\n\nChoose weight:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-        await q.delete_message()
-    except Exception as e:
-        print(f"Error in product_select: {e}")
+    await context.bot.send_photo(
+        chat_id=q.from_user.id,
+        photo=p[3],
+        caption=f"📦 {p[1]}\n{p[2]}\n\nChoose weight:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    await q.delete_message()
 
 # ================= WEIGHT SELECTION =================
 async def weight_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        q = update.callback_query
-        await q.answer()
-        uid = q.from_user.id
-        session = USER_SESSIONS.get(uid)
-        if not session or session.get("step") != "weight_select":
-            await q.edit_message_text("❌ No product selected.")
-            return
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    session = USER_SESSIONS.get(uid)
+    if not session or session.get("step") != "weight_select":
+        await q.edit_message_text("❌ No product selected.")
+        return
 
-        weight = q.data.replace("weight_", "")
-        prod = session["current_product"]
-        price = prod["prices"][weight]
-        basket_item = {"product_id": prod["id"], "name": prod["name"], "weight": weight, "quantity": 1, "price": price}
+    weight = q.data.replace("weight_", "")
+    prod = session["current_product"]
+    price = prod["prices"][weight]
+    basket_item = {"product_id": prod["id"], "name": prod["name"], "weight": weight, "quantity": 1, "price": price}
 
-        basket = session.get("basket", [])
-        basket.append(basket_item)
-        session["basket"] = basket
-        session["step"] = "basket"
+    basket = session.get("basket", [])
+    basket.append(basket_item)
+    session["basket"] = basket
+    session["step"] = "basket"
 
-        await show_basket(q, context)
-    except Exception as e:
-        print(f"Error in weight_select: {e}")
+    await show_basket(q, context)
 
 # ================= SHOW BASKET =================
 async def show_basket(q, context):
-    try:
-        uid = q.from_user.id
-        basket = USER_SESSIONS[uid]["basket"]
-        text, total = build_basket_text(basket)
+    uid = q.from_user.id
+    basket = USER_SESSIONS[uid]["basket"]
+    text, total = build_basket_text(basket)
 
-        buttons = []
-        for idx, item in enumerate(basket):
-            buttons.append([
-                InlineKeyboardButton(f"➕ {item['name']} x{item['quantity']}", callback_data=f"add_{idx}"),
-                InlineKeyboardButton(f"➖ {item['name']} x{item['quantity']}", callback_data=f"remove_{idx}")
-            ])
-        buttons.append([InlineKeyboardButton("✅ Checkout", callback_data="checkout")])
-        await context.bot.send_message(chat_id=uid, text=text, reply_markup=InlineKeyboardMarkup(buttons))
-    except Exception as e:
-        print(f"Error in show_basket: {e}")
+    buttons = []
+    for idx, item in enumerate(basket):
+        buttons.append([
+            InlineKeyboardButton(f"➕ {item['name']} x{item['quantity']}", callback_data=f"add_{idx}"),
+            InlineKeyboardButton(f"➖ {item['name']} x{item['quantity']}", callback_data=f"remove_{idx}")
+        ])
+    buttons.append([InlineKeyboardButton("✅ Checkout", callback_data="checkout")])
+    await context.bot.send_message(chat_id=uid, text=text, reply_markup=InlineKeyboardMarkup(buttons))
 
 # ================= BASKET ACTIONS =================
 async def basket_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        q = update.callback_query
-        await q.answer()
-        uid = q.from_user.id
-        session = USER_SESSIONS.get(uid)
-        if not session or session.get("step") != "basket":
-            await q.edit_message_text("❌ No basket active.")
-            return
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    session = USER_SESSIONS.get(uid)
+    if not session or session.get("step") != "basket":
+        await q.edit_message_text("❌ No basket active.")
+        return
 
-        data = q.data
-        basket = session["basket"]
+    data = q.data
+    basket = session["basket"]
 
-        if data.startswith("add_"):
-            idx = int(data.replace("add_", ""))
-            basket[idx]["quantity"] += 1
-            await show_basket(q, context)
+    if data.startswith("add_"):
+        idx = int(data.replace("add_", ""))
+        basket[idx]["quantity"] += 1
+        await show_basket(q, context)
+        return
+    elif data.startswith("remove_"):
+        idx = int(data.replace("remove_", ""))
+        basket[idx]["quantity"] -= 1
+        if basket[idx]["quantity"] <= 0:
+            basket.pop(idx)
+        if not basket:
+            session["step"] = None
+            await q.edit_message_text("🛒 Basket empty.", reply_markup=main_menu())
             return
-        elif data.startswith("remove_"):
-            idx = int(data.replace("remove_", ""))
-            basket[idx]["quantity"] -= 1
-            if basket[idx]["quantity"] <= 0:
-                basket.pop(idx)
-            if not basket:
-                session["step"] = None
-                await q.edit_message_text("🛒 Basket empty.", reply_markup=main_menu())
-                return
-            await show_basket(q, context)
-            return
-        elif data == "checkout":
-            session["step"] = "checkout_name"
-            await q.edit_message_text("✍️ Send your FULL NAME for checkout:")
-    except Exception as e:
-        print(f"Error in basket_actions: {e}")
+        await show_basket(q, context)
+        return
+    elif data == "checkout":
+        session["step"] = "checkout_name"
+        await q.edit_message_text("✍️ Send your FULL NAME for checkout:")
 
 # ================= CHECKOUT =================
 async def checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        uid = update.message.from_user.id
-        session = USER_SESSIONS.get(uid)
-        if not session or not session.get("step"):
-            return
+    uid = update.message.from_user.id
+    session = USER_SESSIONS.get(uid)
+    if not session or not session.get("step"):
+        return
 
-        step = session["step"]
-        if step == "checkout_name":
-            session["name"] = update.message.text
-            session["step"] = "checkout_address"
-            await update.message.reply_text("📍 Send your FULL ADDRESS:")
-            return
-        elif step == "checkout_address":
-            session["address"] = update.message.text
-            total = sum([item["price"]*item["quantity"] for item in session["basket"]])
-            session["total"] = total
-            session["step"] = "checkout_confirm"
-            text = build_basket_text(session["basket"])[0] + f"\n\n💳 Pay to LTC Wallet: {CRYPTO_WALLET}\nTotal: £{total}\n\nPress ✅ to confirm order."
-            buttons = [[InlineKeyboardButton("✅ Confirm Order", callback_data="confirm_order")]]
-            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-    except Exception as e:
-        print(f"Error in checkout_handler: {e}")
+    step = session["step"]
+    if step == "checkout_name":
+        session["name"] = update.message.text
+        session["step"] = "checkout_address"
+        await update.message.reply_text("📍 Send your FULL ADDRESS:")
+        return
+    elif step == "checkout_address":
+        session["address"] = update.message.text
+        total = sum([item["price"]*item["quantity"] for item in session["basket"]])
+        session["total"] = total
+        session["step"] = "checkout_confirm"
+        text = build_basket_text(session["basket"])[0] + f"\n\n💳 Pay to LTC Wallet: {CRYPTO_WALLET}\nTotal: £{total}\n\nPress ✅ to confirm order."
+        buttons = [[InlineKeyboardButton("✅ Confirm Order", callback_data="confirm_order")]]
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 # ================= CONFIRM ORDER =================
 async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        q = update.callback_query
-        await q.answer()
-        uid = q.from_user.id
-        session = USER_SESSIONS.get(uid)
-        if not session or session.get("step") != "checkout_confirm":
-            await q.edit_message_text("❌ No order to confirm.")
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    session = USER_SESSIONS.get(uid)
+    if not session or session.get("step") != "checkout_confirm":
+        await q.edit_message_text("❌ No order to confirm.")
+        return
+
+    items_json = json.dumps(session["basket"])
+    cur.execute("""
+    INSERT INTO orders (user_id, items, total, status, name, address)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """, (uid, items_json, session["total"], "Pending payment", session["name"], session["address"]))
+    db.commit()
+    order_id = cur.lastrowid
+
+    await q.edit_message_text(f"✅ Order #{order_id} placed!\n💳 Pay to LTC Wallet: {CRYPTO_WALLET}\nTotal: £{session['total']}")
+    await context.bot.send_message(CHANNEL_ID, f"🆕 ORDER #{order_id}\nUser: {session['name']}\nAddress: {session['address']}\nTotal: £{session['total']}")
+    USER_SESSIONS.pop(uid)
+
+# ================= ADMIN CALLBACK =================
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    if uid not in ADMINS:
+        await q.edit_message_text("❌ Not authorised.")
+        return
+
+    data = q.data
+
+    # Add Product flow
+    if data == "admin_add_product":
+        ADMIN_SESSIONS[uid] = {"step": "name"}
+        await q.edit_message_text("➕ Send product NAME:")
+        return
+
+# ================= MESSAGE HANDLER =================
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.message.from_user.id
+    # Admin Add Product Flow
+    if uid in ADMIN_SESSIONS:
+        admin = ADMIN_SESSIONS[uid]
+        step = admin.get("step")
+        if step == "name":
+            admin["name"] = update.message.text
+            admin["step"] = "description"
+            await update.message.reply_text("📝 Send product DESCRIPTION:")
+            return
+        if step == "description":
+            admin["description"] = update.message.text
+            admin["step"] = "photo"
+            await update.message.reply_text("📷 Send product PHOTO (as image, not URL):")
+            return
+        if step == "photo":
+            if update.message.photo:
+                admin["photo_file_id"] = update.message.photo[-1].file_id
+                admin["step"] = "prices"
+                await update.message.reply_text("💰 Send prices for 3.5,7,14,28,56 (comma-separated):")
+                return
+            else:
+                await update.message.reply_text("❌ Send a photo!")
+                return
+        if step == "prices":
+            try:
+                prices = list(map(float, update.message.text.split(",")))
+                if len(prices) !=5: raise ValueError
+            except:
+                await update.message.reply_text("❌ Invalid format")
+                return
+            pid = admin["name"].lower().replace(" ","_")
+            cur.execute("""
+            INSERT OR REPLACE INTO products VALUES (?,?,?,?,?,?,?,?,?)
+            """, (pid, admin["name"], admin["description"], admin["photo_file_id"], *prices))
+            db.commit()
+            ADMIN_SESSIONS.pop(uid)
+            await update.message.reply_text("✅ Product added!", reply_markup=main_menu())
             return
 
-        items_json = json.dumps(session["basket"])
-        cur.execute("""
-        INSERT INTO orders (user_id, items, total, status, name, address)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """, (uid, items_json, session["total"], "Pending payment", session["name"], session["address"]))
-        db.commit()
-        order_id = cur.lastrowid
-
-        await q.edit_message_text(f"✅ Order #{order_id} placed!\n💳 Pay to LTC Wallet: {CRYPTO_WALLET}\nTotal: £{session['total']}")
-        await context.bot.send_message(CHANNEL_ID, f"🆕 ORDER #{order_id}\nUser: {session['name']}\nAddress: {session['address']}\nTotal: £{session['total']}")
-        USER_SESSIONS.pop(uid)
-    except Exception as e:
-        print(f"Error in confirm_order: {e}")
+    # Handle user checkout flow
+    await checkout_handler(update, context)
 
 # ================= APP =================
 app = ApplicationBuilder().token(TOKEN).build()
@@ -313,9 +312,11 @@ app.add_handler(CallbackQueryHandler(product_select, pattern="^prod_"))
 app.add_handler(CallbackQueryHandler(weight_select, pattern="^weight_"))
 app.add_handler(CallbackQueryHandler(basket_actions, pattern="^(add_|remove_|checkout)"))
 app.add_handler(CallbackQueryHandler(confirm_order, pattern="^confirm_order$"))
+app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
 
 # Message handlers
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_handler))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+app.add_handler(MessageHandler(filters.PHOTO, message_handler))
 
 print("✅ BOT RUNNING")
 app.run_polling()
