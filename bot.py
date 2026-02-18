@@ -136,44 +136,48 @@ async def callback_router(update, context):
         weight = data.replace("weight_", "")
         products = get_products()
         page = USER_PRODUCT_PAGE.get(uid, 0)
+        if page >= len(products): page = len(products) - 1
         p = products[page]
         prices = {"3.5": p[4], "7": p[5], "14": p[6], "28": p[7], "56": p[8]}
 
-        # Create or update session basket
         session = USER_SESSIONS.get(uid, {"step": "basket", "basket": []})
-        # Check if same product & weight exists
         for item in session["basket"]:
             if item["name"] == p[1] and item["weight"] == weight:
                 item["quantity"] += 1
                 break
         else:
-            session["basket"].append({
-                "name": p[1],
-                "weight": weight,
-                "price": prices[weight],
-                "quantity": 1
-            })
+            if weight in prices:
+                session["basket"].append({
+                    "name": p[1],
+                    "weight": weight,
+                    "price": prices[weight],
+                    "quantity": 1
+                })
         USER_SESSIONS[uid] = session
         await show_basket(update, context, uid)
         return
 
     if data.startswith("qty_"):
-        idx, action = data.replace("qty_", "").split("_")
-        idx = int(idx)
-        session = USER_SESSIONS[uid]
-        if action == "plus":
-            session["basket"][idx]["quantity"] += 1
-        elif action == "minus" and session["basket"][idx]["quantity"] > 1:
-            session["basket"][idx]["quantity"] -= 1
-        USER_SESSIONS[uid] = session
-        await show_basket(update, context, uid)
+        try:
+            idx, action = data.replace("qty_", "").split("_")
+            idx = int(idx)
+            session = USER_SESSIONS[uid]
+            if action == "plus":
+                session["basket"][idx]["quantity"] += 1
+            elif action == "minus" and session["basket"][idx]["quantity"] > 1:
+                session["basket"][idx]["quantity"] -= 1
+            USER_SESSIONS[uid] = session
+            await show_basket(update, context, uid)
+        except Exception as e:
+            await q.edit_message_text(f"❌ Error: {e}", reply_markup=home_menu())
         return
 
     if data == "checkout":
-        session = USER_SESSIONS[uid]
-        session["step"] = "name"
-        USER_SESSIONS[uid] = session
-        await q.edit_message_text("💳 Send FULL NAME to checkout:")
+        session = USER_SESSIONS.get(uid)
+        if session:
+            session["step"] = "name"
+            USER_SESSIONS[uid] = session
+            await q.edit_message_text("💳 Send FULL NAME to checkout:")
         return
 
     if data == "back":
@@ -194,21 +198,30 @@ async def callback_router(update, context):
         await show_admin_orders(update, context, uid, page)
         return
     if data.startswith("paid_"):
-        oid = int(data.replace("paid_", ""))
-        cur.execute("UPDATE orders SET status='Paid' WHERE order_id=?", (oid,))
-        db.commit()
-        await q.edit_message_text(f"✅ Order {oid} marked PAID")
+        try:
+            oid = int(data.replace("paid_", ""))
+            cur.execute("UPDATE orders SET status='Paid' WHERE order_id=?", (oid,))
+            db.commit()
+            await q.edit_message_text(f"✅ Order {oid} marked PAID")
+        except Exception as e:
+            await q.edit_message_text(f"❌ Error: {e}")
         return
     if data.startswith("dispatch_"):
-        oid = int(data.replace("dispatch_", ""))
-        cur.execute("UPDATE orders SET status='Dispatched' WHERE order_id=?", (oid,))
-        db.commit()
-        await q.edit_message_text(f"📦 Order {oid} DISPATCHED")
+        try:
+            oid = int(data.replace("dispatch_", ""))
+            cur.execute("UPDATE orders SET status='Dispatched' WHERE order_id=?", (oid,))
+            db.commit()
+            await q.edit_message_text(f"📦 Order {oid} DISPATCHED")
+        except Exception as e:
+            await q.edit_message_text(f"❌ Error: {e}")
         return
 
 # ================= SHOW BASKET =================
 async def show_basket(update, context, uid):
-    session = USER_SESSIONS[uid]
+    session = USER_SESSIONS.get(uid)
+    if not session or not session.get("basket"):
+        await update.callback_query.edit_message_text("🛒 Basket is empty.", reply_markup=home_menu())
+        return
     items, total = basket_text(session["basket"])
     buttons = []
     for i, item in enumerate(session["basket"]):
@@ -234,8 +247,9 @@ async def show_product_page(update, context, uid, page):
     USER_PRODUCT_PAGE[uid] = page
     p = products[page]
     rating = product_rating(p[1])
-    buttons = [[InlineKeyboardButton(f"{w}g £{price}", callback_data=f"weight_{w}")]
-               for w, price in {"3.5": p[4], "7": p[5], "14": p[6], "28": p[7], "56": p[8]}.items()]
+    weights = {"3.5": p[4], "7": p[5], "14": p[6], "28": p[7], "56": p[8]}
+    buttons = [[InlineKeyboardButton(f"{w}g £{price}", callback_data=f"weight_{w}")] for w, price in weights.items()]
+
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"prod_page_{page-1}"))
@@ -247,17 +261,23 @@ async def show_product_page(update, context, uid, page):
     markup = InlineKeyboardMarkup(buttons)
 
     if p[3]:
-        await update.callback_query.edit_message_media(
-            media=InputMediaPhoto(media=p[3], caption=f"📦 {p[1]}\n{rating}\n\n{p[2]}\n\nChoose weight:"),
-            reply_markup=markup
-        )
+        try:
+            await update.callback_query.edit_message_media(
+                media=InputMediaPhoto(media=p[3], caption=f"📦 {p[1]}\n{rating}\n\n{p[2]}\n\nChoose weight:"),
+                reply_markup=markup
+            )
+        except:
+            await update.callback_query.edit_message_text(
+                f"📦 {p[1]}\n{rating}\n\n{p[2]}\n\nChoose weight:",
+                reply_markup=markup
+            )
     else:
         await update.callback_query.edit_message_text(
             f"📦 {p[1]}\n{rating}\n\n{p[2]}\n\nChoose weight:",
             reply_markup=markup
         )
 
-# ================= OTHER FUNCTIONS =================
+# ================= ORDERS & REVIEWS =================
 async def show_user_order(update, context, uid, page):
     cur.execute("SELECT * FROM orders WHERE user_id=? ORDER BY order_id DESC", (uid,))
     orders = cur.fetchall()
@@ -268,8 +288,8 @@ async def show_user_order(update, context, uid, page):
     if page >= len(orders): page = len(orders)-1
     USER_ORDER_PAGE[uid] = page
     o = orders[page]
-    oid, _, items, total, status, name, address = o
-    items = json.loads(items)
+    oid, _, items_json, total, status, name, address = o
+    items = json.loads(items_json)
     items_text = "\n".join([f"- {i['name']} {i['weight']}g x{i['quantity']}" for i in items])
     buttons = []
     if status in ("Paid", "Dispatched"):
@@ -313,8 +333,8 @@ async def show_admin_orders(update, context, uid, page):
     if page >= len(orders): page = len(orders)-1
     ADMIN_ORDER_PAGE[uid] = page
     o = orders[page]
-    oid, user_id, items, total, status, name, address = o
-    items = json.loads(items)
+    oid, user_id, items_json, total, status, name, address = o
+    items = json.loads(items_json)
     items_text = "\n".join([f"- {i['name']} {i['weight']}g x{i['quantity']}" for i in items])
     buttons = []
     if status != "Paid":
@@ -336,13 +356,15 @@ async def show_admin_orders(update, context, uid, page):
 
 # ================= MESSAGE HANDLER =================
 async def message_handler(update, context):
+    if not update.message or not update.message.text:
+        return
     uid = update.message.from_user.id
     text = update.message.text
 
     # Admin Add Product / Announcement
     if uid in ADMIN_SESSIONS:
         admin = ADMIN_SESSIONS[uid]
-        step = admin["step"]
+        step = admin.get("step")
         if step == "name":
             admin["name"] = text
             admin["step"] = "desc"
@@ -358,10 +380,9 @@ async def message_handler(update, context):
                 admin["photo_file_id"] = update.message.photo[-1].file_id
                 admin["step"] = "prices"
                 await update.message.reply_text("💰 Prices 3.5,7,14,28,56 (comma separated):")
-                return
             else:
                 await update.message.reply_text("❌ Send a photo!")
-                return
+            return
         if step == "prices":
             try:
                 prices = list(map(float, text.split(",")))
@@ -372,7 +393,7 @@ async def message_handler(update, context):
                 return
             pid = admin["name"].lower().replace(" ", "_")
             cur.execute("INSERT OR REPLACE INTO products VALUES (?,?,?,?,?,?,?,?,?)",
-                        (pid, admin["name"], admin["desc"], admin["photo_file_id"], *prices))
+                        (pid, admin["name"], admin["desc"], admin.get("photo_file_id"), *prices))
             db.commit()
             ADMIN_SESSIONS.pop(uid)
             await update.message.reply_text("✅ Product added!", reply_markup=home_menu())
@@ -420,16 +441,4 @@ async def message_handler(update, context):
             )
             db.commit()
             USER_SESSIONS.pop(uid)
-            await update.message.reply_text("✅ Review saved! ⭐", reply_markup=home_menu())
-            return
-
-# ================= ADMIN COMMAND =================
-async def admin_cmd(update, context):
-    uid = update.effective_user.id
-    ADMINS.add(uid)
-    await update.message.reply_text(
-        "🛠 ADMIN PANEL",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
-            [InlineKeyboardButton("📢 Add Announcement", callback_data="admin_add_announcement")],
-            [InlineKeyboardButton("📦 View Orders", callback_data="
+            await update.message.reply_text
