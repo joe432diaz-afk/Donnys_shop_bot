@@ -1,7 +1,7 @@
 import os
 import json
 import sqlite3
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
@@ -10,7 +10,7 @@ from telegram.ext import (
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN") or "PUT_YOUR_TOKEN_HERE"
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
-CONTACT_INFO = "Contact us at: your_email@example.com"
+CONTACT_CHANNEL_ID = "@YourChannelOrPM"  # <- Where contact messages go
 
 ADMINS = set()
 USER_SESSIONS = {}
@@ -92,7 +92,7 @@ def home_menu():
         [InlineKeyboardButton("🛒 Products", callback_data="home_products")],
         [InlineKeyboardButton("📦 My Orders", callback_data="home_my_orders")],
         [InlineKeyboardButton("⭐ View Reviews", callback_data="home_reviews")],
-        [InlineKeyboardButton("📞 Contact", callback_data="home_contact")]
+        [InlineKeyboardButton("📞 Contact Vendor", callback_data="home_contact")]
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -119,7 +119,12 @@ async def callback_router(update, context):
         await show_all_reviews(update)
         return
     if data == "home_contact":
-        await q.edit_message_text(CONTACT_INFO, reply_markup=home_menu())
+        # Send user message to vendor channel/PM
+        await context.bot.send_message(
+            CONTACT_CHANNEL_ID,
+            f"📩 Contact from user {q.from_user.full_name} (@{q.from_user.username}):\nSend your message here."
+        )
+        await q.edit_message_text("✅ Your message has been sent to the vendor.", reply_markup=home_menu())
         return
 
     # ===== Product navigation =====
@@ -167,6 +172,10 @@ async def callback_router(update, context):
         ADMIN_SESSIONS[uid] = {"step": "name"}
         await q.message.reply_text("🆕 Send product NAME:")
         return
+    if data == "admin_add_announcement":
+        ADMIN_SESSIONS[uid] = {"step": "announcement"}
+        await q.message.reply_text("📝 Send announcement text:")
+        return
     if data.startswith("admin_orders_"):
         page = int(data.split("_")[-1])
         await show_admin_orders(update, context, uid, page)
@@ -208,10 +217,17 @@ async def show_product_page(update, context, uid, page):
         buttons.append(nav_buttons)
     buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
 
-    await update.callback_query.edit_message_text(
-        f"📦 {p[1]}{rating}\n\n{p[2]}\n\nChoose weight:",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    # Show product photo if available
+    if p[3]:
+        await update.callback_query.edit_message_media(
+            media=InputMediaPhoto(media=p[3], caption=f"📦 {p[1]}{rating}\n\n{p[2]}\n\nChoose weight:"),
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    else:
+        await update.callback_query.edit_message_text(
+            f"📦 {p[1]}{rating}\n\n{p[2]}\n\nChoose weight:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
 
 # ================= USER ORDERS =================
 async def show_user_order(update, context, uid, page):
@@ -250,8 +266,9 @@ async def show_user_order(update, context, uid, page):
 # ================= ALL REVIEWS =================
 async def show_all_reviews(update):
     cur.execute("""
-        SELECT r.stars, r.text, o.user_id 
-        FROM reviews r JOIN orders o ON r.order_id=o.order_id
+        SELECT r.stars, r.text 
+        FROM reviews r 
+        JOIN orders o ON r.order_id=o.order_id
         ORDER BY r.order_id DESC
     """)
     reviews = cur.fetchall()
@@ -259,8 +276,8 @@ async def show_all_reviews(update):
         await update.callback_query.edit_message_text("No reviews yet.", reply_markup=home_menu())
         return
     text = ""
-    for s, t, uid in reviews:
-        text += f"⭐ {s} by User {uid}\n{t}\n\n"
+    for s, t in reviews:
+        text += f"⭐ {s} ⭐\n{t}\n\n"
     await update.callback_query.edit_message_text(text, reply_markup=home_menu())
 
 # ================= ADMIN ORDERS =================
@@ -282,8 +299,8 @@ async def show_admin_orders(update, context, uid, page):
     buttons = []
     if status != "Paid":
         buttons.append([InlineKeyboardButton("💰 Mark Paid", callback_data=f"paid_{oid}")])
-    elif status == "Paid":
-        buttons.append([InlineKeyboardButton("📦 Dispatch", callback_data=f"dispatch_{oid}")])
+    if status == "Paid":
+        buttons.append([InlineKeyboardButton("📦 Mark Dispatched", callback_data=f"dispatch_{oid}")])
 
     nav_buttons = []
     if page > 0:
@@ -304,7 +321,7 @@ async def message_handler(update, context):
     uid = update.message.from_user.id
     text = update.message.text
 
-    # Admin Add Product
+    # Admin Add Product / Announcement
     if uid in ADMIN_SESSIONS:
         admin = ADMIN_SESSIONS[uid]
         step = admin["step"]
@@ -342,6 +359,12 @@ async def message_handler(update, context):
             db.commit()
             ADMIN_SESSIONS.pop(uid)
             await update.message.reply_text("✅ Product added!", reply_markup=home_menu())
+            return
+        if step == "announcement":
+            # Send announcement to all users or channel
+            await context.bot.send_message(CONTACT_CHANNEL_ID, f"📢 Announcement:\n{text}")
+            ADMIN_SESSIONS.pop(uid)
+            await update.message.reply_text("✅ Announcement sent!", reply_markup=home_menu())
             return
 
     # Checkout / Review
@@ -392,6 +415,7 @@ async def admin_cmd(update, context):
         "🛠 ADMIN PANEL",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
+            [InlineKeyboardButton("📢 Add Announcement", callback_data="admin_add_announcement")],
             [InlineKeyboardButton("📦 View Orders", callback_data="admin_orders_0")]
         ])
     )
