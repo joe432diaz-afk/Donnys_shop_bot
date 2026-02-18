@@ -10,6 +10,7 @@ from telegram.ext import (
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN") or "PUT_YOUR_TOKEN_HERE"
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
+CONTACT_INFO = "Contact us at: your_email@example.com"
 
 ADMINS = set()
 USER_SESSIONS = {}
@@ -85,71 +86,43 @@ def product_rating(product_name):
         return f"\n⭐ {round(avg,1)}/5 ({count} reviews)"
     return "\n⭐ No reviews yet"
 
-def main_menu(uid):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("📦 My Orders", callback_data="my_orders_0")]])
+# ================= MAIN MENU =================
+def home_menu():
+    buttons = [
+        [InlineKeyboardButton("🛒 Products", callback_data="home_products")],
+        [InlineKeyboardButton("📦 My Orders", callback_data="home_my_orders")],
+        [InlineKeyboardButton("⭐ View Reviews", callback_data="home_reviews")],
+        [InlineKeyboardButton("📞 Contact", callback_data="home_contact")]
+    ]
+    return InlineKeyboardMarkup(buttons)
 
 # ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    USER_PRODUCT_PAGE[uid] = 0
-    await show_product_page(update, context, uid, 0)
-
-# ================= SHOW PRODUCT PAGE =================
-async def show_product_page(update, context, uid, page):
-    products = get_products()
-    if not products:
-        await update.message.reply_text("No products available.")
-        return
-    if page < 0: page = 0
-    if page >= len(products): page = len(products)-1
-    USER_PRODUCT_PAGE[uid] = page
-    p = products[page]
-
-    rating = product_rating(p[1])
-    buttons = [[InlineKeyboardButton(f"{w}g £{price}", callback_data=f"weight_{w}")]
-               for w, price in {"3.5": p[4], "7": p[5], "14": p[6], "28": p[7], "56": p[8]}.items()]
-
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"prod_page_{page-1}"))
-    if page < len(products)-1:
-        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"prod_page_{page+1}"))
-    if nav_buttons:
-        buttons.append(nav_buttons)
-    buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
-
-    if hasattr(update, 'message') and update.message:
-        await update.message.reply_text(
-            f"📦 {p[1]}{rating}\n\n{p[2]}\n\nChoose weight:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-    else:
-        await update.callback_query.edit_message_text(
-            f"📦 {p[1]}{rating}\n\n{p[2]}\n\nChoose weight:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
-# ================= ADMIN PANEL =================
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ADMINS.add(uid)
-    ADMIN_ORDER_PAGE[uid] = 0
-    await update.message.reply_text(
-        "🛠 ADMIN PANEL",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
-            [InlineKeyboardButton("📦 View Orders", callback_data="admin_orders_0")]
-        ])
-    )
+    await update.message.reply_text("🏠 Welcome! Choose an option:", reply_markup=home_menu())
 
 # ================= CALLBACK ROUTER =================
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback_router(update, context):
     q = update.callback_query
     data = q.data
     uid = q.from_user.id
     await q.answer()
 
-    # Product navigation
+    # ===== Home menu =====
+    if data == "home_products":
+        USER_PRODUCT_PAGE[uid] = 0
+        await show_product_page(update, context, uid, 0)
+        return
+    if data == "home_my_orders":
+        await show_user_order(update, context, uid, 0)
+        return
+    if data == "home_reviews":
+        await show_all_reviews(update)
+        return
+    if data == "home_contact":
+        await q.edit_message_text(CONTACT_INFO, reply_markup=home_menu())
+        return
+
+    # ===== Product navigation =====
     if data.startswith("prod_page_"):
         page = int(data.replace("prod_page_", ""))
         await show_product_page(update, context, uid, page)
@@ -171,51 +144,124 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["step"] = "name"
         USER_SESSIONS[uid] = session
         text, total = basket_text(session["basket"])
-        await q.edit_message_text(
-            f"🛒 Basket:\n{text}\n💰 £{total}\n\nSend FULL NAME to checkout:"
-        )
+        await q.edit_message_text(f"🛒 Basket:\n{text}\n💰 £{total}\n\nSend FULL NAME to checkout:")
         return
 
-    # User orders
     if data.startswith("my_orders_"):
         page = int(data.split("_")[-1])
         await show_user_order(update, context, uid, page)
         return
 
-    # Review
     if data.startswith("review_"):
         oid = int(data.replace("review_", ""))
         USER_SESSIONS[uid] = {"step": "review", "order_id": oid}
         await q.message.reply_text("✍️ Send review as:\n`5 Amazing product`")
         return
 
-    # Admin: Add Product
+    if data == "back":
+        await q.edit_message_text("🏠 Main Menu", reply_markup=home_menu())
+        return
+
+    # ===== Admin buttons =====
     if data == "admin_add_product":
         ADMIN_SESSIONS[uid] = {"step": "name"}
         await q.message.reply_text("🆕 Send product NAME:")
         return
-
-    # Admin: View Orders
     if data.startswith("admin_orders_"):
         page = int(data.split("_")[-1])
         await show_admin_orders(update, context, uid, page)
         return
-
-    # Admin: Mark Paid
     if data.startswith("paid_"):
         oid = int(data.replace("paid_", ""))
         cur.execute("UPDATE orders SET status='Paid' WHERE order_id=?", (oid,))
         db.commit()
         await q.edit_message_text(f"✅ Order {oid} marked PAID")
         return
-
-    # Admin: Dispatch
     if data.startswith("dispatch_"):
         oid = int(data.replace("dispatch_", ""))
         cur.execute("UPDATE orders SET status='Dispatched' WHERE order_id=?", (oid,))
         db.commit()
         await q.edit_message_text(f"📦 Order {oid} DISPATCHED")
         return
+
+# ================= PRODUCTS =================
+async def show_product_page(update, context, uid, page):
+    products = get_products()
+    if not products:
+        await update.callback_query.edit_message_text("No products available.", reply_markup=home_menu())
+        return
+    if page < 0: page = 0
+    if page >= len(products): page = len(products)-1
+    USER_PRODUCT_PAGE[uid] = page
+    p = products[page]
+    rating = product_rating(p[1])
+
+    buttons = [[InlineKeyboardButton(f"{w}g £{price}", callback_data=f"weight_{w}")]
+               for w, price in {"3.5": p[4], "7": p[5], "14": p[6], "28": p[7], "56": p[8]}.items()]
+
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"prod_page_{page-1}"))
+    if page < len(products)-1:
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"prod_page_{page+1}"))
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
+
+    await update.callback_query.edit_message_text(
+        f"📦 {p[1]}{rating}\n\n{p[2]}\n\nChoose weight:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+# ================= USER ORDERS =================
+async def show_user_order(update, context, uid, page):
+    cur.execute("SELECT * FROM orders WHERE user_id=? ORDER BY order_id DESC", (uid,))
+    orders = cur.fetchall()
+    if not orders:
+        await update.callback_query.edit_message_text("📦 No orders yet.", reply_markup=home_menu())
+        return
+    if page < 0: page = 0
+    if page >= len(orders): page = len(orders)-1
+    USER_ORDER_PAGE[uid] = page
+
+    o = orders[page]
+    oid, _, items, total, status, name, address = o
+    items = json.loads(items)
+    items_text = "\n".join([f"- {i['name']} {i['weight']}g x{i['quantity']}" for i in items])
+
+    buttons = []
+    if status in ("Paid", "Dispatched"):
+        buttons.append([InlineKeyboardButton("⭐ Leave / Edit Review", callback_data=f"review_{oid}")])
+
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"my_orders_{page-1}"))
+    if page < len(orders)-1:
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"my_orders_{page+1}"))
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
+
+    await update.callback_query.edit_message_text(
+        f"🧾 Order #{oid}\n{name}\n{address}\n{items_text}\n💰 £{total}\n📌 {status}",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+# ================= ALL REVIEWS =================
+async def show_all_reviews(update):
+    cur.execute("""
+        SELECT r.stars, r.text, o.user_id 
+        FROM reviews r JOIN orders o ON r.order_id=o.order_id
+        ORDER BY r.order_id DESC
+    """)
+    reviews = cur.fetchall()
+    if not reviews:
+        await update.callback_query.edit_message_text("No reviews yet.", reply_markup=home_menu())
+        return
+    text = ""
+    for s, t, uid in reviews:
+        text += f"⭐ {s} by User {uid}\n{t}\n\n"
+    await update.callback_query.edit_message_text(text, reply_markup=home_menu())
 
 # ================= ADMIN ORDERS =================
 async def show_admin_orders(update, context, uid, page):
@@ -224,7 +270,6 @@ async def show_admin_orders(update, context, uid, page):
     if not orders:
         await update.callback_query.edit_message_text("No orders found.")
         return
-
     if page < 0: page = 0
     if page >= len(orders): page = len(orders)-1
     ADMIN_ORDER_PAGE[uid] = page
@@ -254,43 +299,8 @@ async def show_admin_orders(update, context, uid, page):
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
-# ================= USER ORDERS =================
-async def show_user_order(update, context, uid, page):
-    cur.execute("SELECT * FROM orders WHERE user_id=? ORDER BY order_id DESC", (uid,))
-    orders = cur.fetchall()
-    if not orders:
-        await update.callback_query.edit_message_text("📦 No orders yet.", reply_markup=main_menu(uid))
-        return
-
-    if page < 0: page = 0
-    if page >= len(orders): page = len(orders)-1
-    USER_ORDER_PAGE[uid] = page
-
-    o = orders[page]
-    oid, _, items, total, status, name, address = o
-    items = json.loads(items)
-    items_text = "\n".join([f"- {i['name']} {i['weight']}g x{i['quantity']}" for i in items])
-
-    buttons = []
-    if status in ("Paid", "Dispatched"):
-        buttons.append([InlineKeyboardButton("⭐ Leave / Edit Review", callback_data=f"review_{oid}")])
-
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"my_orders_{page-1}"))
-    if page < len(orders)-1:
-        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"my_orders_{page+1}"))
-    if nav_buttons:
-        buttons.append(nav_buttons)
-    buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
-
-    await update.callback_query.edit_message_text(
-        f"🧾 Order #{oid}\n{name}\n{address}\n{items_text}\n💰 £{total}\n📌 {status}",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
 # ================= MESSAGE HANDLER =================
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def message_handler(update, context):
     uid = update.message.from_user.id
     text = update.message.text
 
@@ -331,7 +341,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         (pid, admin["name"], admin["desc"], admin["photo_file_id"], *prices))
             db.commit()
             ADMIN_SESSIONS.pop(uid)
-            await update.message.reply_text("✅ Product added!", reply_markup=main_menu(uid))
+            await update.message.reply_text("✅ Product added!", reply_markup=home_menu())
             return
 
     # Checkout / Review
@@ -352,7 +362,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.commit()
             USER_SESSIONS.pop(uid)
             await update.message.reply_text(
-                f"✅ Order placed\n\n{items}\n💰 £{total}\n💳 Pay to:\n{CRYPTO_WALLET}"
+                f"✅ Order placed\n\n{items}\n💰 £{total}\n💳 Pay to:\n{CRYPTO_WALLET}",
+                reply_markup=home_menu()
             )
             return
         if session.get("step") == "review":
@@ -370,13 +381,25 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             db.commit()
             USER_SESSIONS.pop(uid)
-            await update.message.reply_text("✅ Review saved! ⭐")
+            await update.message.reply_text("✅ Review saved! ⭐", reply_markup=home_menu())
             return
+
+# ================= ADMIN COMMAND =================
+async def admin_cmd(update, context):
+    uid = update.effective_user.id
+    ADMINS.add(uid)
+    await update.message.reply_text(
+        "🛠 ADMIN PANEL",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
+            [InlineKeyboardButton("📦 View Orders", callback_data="admin_orders_0")]
+        ])
+    )
 
 # ================= APP =================
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("admin", admin))
+app.add_handler(CommandHandler("admin", admin_cmd))
 app.add_handler(CallbackQueryHandler(callback_router))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 app.add_handler(MessageHandler(filters.PHOTO, message_handler))
