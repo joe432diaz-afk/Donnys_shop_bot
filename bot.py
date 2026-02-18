@@ -10,7 +10,7 @@ from telegram.ext import (
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN") or "PUT_YOUR_TOKEN_HERE"
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
-CONTACT_CHANNEL_ID = "@YourChannelOrPM"  # <- Where contact messages go
+CONTACT_CHANNEL_ID = "@YourChannelOrPM"  # Where messages go
 
 ADMINS = set()
 USER_SESSIONS = {}
@@ -83,8 +83,8 @@ def product_rating(product_name):
     """, (f'%"{product_name}"%',))
     avg, count = cur.fetchone()
     if count:
-        return f"\n⭐ {round(avg,1)}/5 ({count} reviews)"
-    return "\n⭐ No reviews yet"
+        return "⭐" * round(avg)
+    return "No reviews yet"
 
 # ================= MAIN MENU =================
 def home_menu():
@@ -119,10 +119,9 @@ async def callback_router(update, context):
         await show_all_reviews(update)
         return
     if data == "home_contact":
-        # Send user message to vendor channel/PM
         await context.bot.send_message(
             CONTACT_CHANNEL_ID,
-            f"📩 Contact from user {q.from_user.full_name} (@{q.from_user.username}):\nSend your message here."
+            f"📩 Contact from user {q.from_user.full_name} (@{q.from_user.username}): Send your message here."
         )
         await q.edit_message_text("✅ Your message has been sent to the vendor.", reply_markup=home_menu())
         return
@@ -203,6 +202,7 @@ async def show_product_page(update, context, uid, page):
     if page >= len(products): page = len(products)-1
     USER_PRODUCT_PAGE[uid] = page
     p = products[page]
+
     rating = product_rating(p[1])
 
     buttons = [[InlineKeyboardButton(f"{w}g £{price}", callback_data=f"weight_{w}")]
@@ -215,18 +215,19 @@ async def show_product_page(update, context, uid, page):
         nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"prod_page_{page+1}"))
     if nav_buttons:
         buttons.append(nav_buttons)
-    buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
 
-    # Show product photo if available
+    buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
+    markup = InlineKeyboardMarkup(buttons)
+
     if p[3]:
         await update.callback_query.edit_message_media(
-            media=InputMediaPhoto(media=p[3], caption=f"📦 {p[1]}{rating}\n\n{p[2]}\n\nChoose weight:"),
-            reply_markup=InlineKeyboardMarkup(buttons)
+            media=InputMediaPhoto(media=p[3], caption=f"📦 {p[1]}\n{rating}\n\n{p[2]}\n\nChoose weight:"),
+            reply_markup=markup
         )
     else:
         await update.callback_query.edit_message_text(
-            f"📦 {p[1]}{rating}\n\n{p[2]}\n\nChoose weight:",
-            reply_markup=InlineKeyboardMarkup(buttons)
+            f"📦 {p[1]}\n{rating}\n\n{p[2]}\n\nChoose weight:",
+            reply_markup=markup
         )
 
 # ================= USER ORDERS =================
@@ -277,7 +278,7 @@ async def show_all_reviews(update):
         return
     text = ""
     for s, t in reviews:
-        text += f"⭐ {s} ⭐\n{t}\n\n"
+        text += f"⭐" * s + f"\n{t}\n\n"
     await update.callback_query.edit_message_text(text, reply_markup=home_menu())
 
 # ================= ADMIN ORDERS =================
@@ -361,7 +362,6 @@ async def message_handler(update, context):
             await update.message.reply_text("✅ Product added!", reply_markup=home_menu())
             return
         if step == "announcement":
-            # Send announcement to all users or channel
             await context.bot.send_message(CONTACT_CHANNEL_ID, f"📢 Announcement:\n{text}")
             ADMIN_SESSIONS.pop(uid)
             await update.message.reply_text("✅ Announcement sent!", reply_markup=home_menu())
