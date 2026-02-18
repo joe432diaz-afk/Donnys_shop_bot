@@ -106,12 +106,11 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     )
 
-# ================= PRODUCT =================
+# ================= PRODUCT SELECTION =================
 async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     pid = q.data.replace("prod_", "")
-
     cur.execute("SELECT * FROM products WHERE id=?", (pid,))
     p = cur.fetchone()
     if not p:
@@ -140,6 +139,7 @@ async def product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
+# ================= WEIGHT SELECTION =================
 async def weight_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -157,18 +157,60 @@ async def weight_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
 
     text, total = basket_text(session["basket"])
-
     await q.edit_message_text(
         f"🛒 Basket:\n{text}\n💰 £{total}\n\nSend FULL NAME to checkout:"
     )
     session["step"] = "name"
 
-# ================= CHECKOUT & REVIEWS =================
+# ================= MESSAGE HANDLER =================
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     text = update.message.text
 
-    # ===== REVIEW FLOW =====
+    # ===== ADMIN ADD PRODUCT FLOW =====
+    if uid in ADMIN_SESSIONS:
+        admin = ADMIN_SESSIONS[uid]
+        step = admin["step"]
+
+        if step == "name":
+            admin["name"] = text
+            admin["step"] = "desc"
+            await update.message.reply_text("📝 Description:")
+            return
+
+        if step == "desc":
+            admin["desc"] = text
+            admin["step"] = "photo"
+            await update.message.reply_text("📷 Send product PHOTO (as image, not URL):")
+            return
+
+        if step == "photo":
+            if update.message.photo:
+                admin["photo_file_id"] = update.message.photo[-1].file_id
+                admin["step"] = "prices"
+                await update.message.reply_text("💰 Prices 3.5,7,14,28,56 (comma separated):")
+                return
+            else:
+                await update.message.reply_text("❌ Send a photo!")
+                return
+
+        if step == "prices":
+            try:
+                prices = list(map(float, text.split(",")))
+                if len(prices) != 5:
+                    raise ValueError
+            except:
+                await update.message.reply_text("❌ Invalid format")
+                return
+            pid = admin["name"].lower().replace(" ", "_")
+            cur.execute("INSERT OR REPLACE INTO products VALUES (?,?,?,?,?,?,?,?,?)",
+                        (pid, admin["name"], admin["desc"], admin["photo_file_id"], *prices))
+            db.commit()
+            ADMIN_SESSIONS.pop(uid)
+            await update.message.reply_text("✅ Product added!", reply_markup=main_menu())
+            return
+
+    # ===== REVIEW WRITING =====
     if uid in USER_SESSIONS and USER_SESSIONS[uid].get("step") == "review":
         s = USER_SESSIONS[uid]
         try:
@@ -191,31 +233,26 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ===== CHECKOUT FLOW =====
-    if uid not in USER_SESSIONS:
-        return
-
-    session = USER_SESSIONS[uid]
-
-    if session["step"] == "name":
-        session["name"] = text
-        session["step"] = "address"
-        await update.message.reply_text("📍 Address:")
-        return
-
-    if session["step"] == "address":
-        session["address"] = text
-        items, total = basket_text(session["basket"])
-
-        cur.execute(
-            "INSERT INTO orders VALUES (NULL,?,?,?,?,?,?)",
-            (uid, json.dumps(session["basket"]), total, "Pending", session["name"], session["address"])
-        )
-        db.commit()
-
-        USER_SESSIONS.pop(uid)
-        await update.message.reply_text(
-            f"✅ Order placed\n\n{items}\n💰 £{total}\n💳 Pay to:\n{CRYPTO_WALLET}"
-        )
+    if uid in USER_SESSIONS:
+        session = USER_SESSIONS[uid]
+        if session["step"] == "name":
+            session["name"] = text
+            session["step"] = "address"
+            await update.message.reply_text("📍 Address:")
+            return
+        if session["step"] == "address":
+            session["address"] = text
+            items, total = basket_text(session["basket"])
+            cur.execute(
+                "INSERT INTO orders VALUES (NULL,?,?,?,?,?,?)",
+                (uid, json.dumps(session["basket"]), total, "Pending", session["name"], session["address"])
+            )
+            db.commit()
+            USER_SESSIONS.pop(uid)
+            await update.message.reply_text(
+                f"✅ Order placed\n\n{items}\n💰 £{total}\n💳 Pay to:\n{CRYPTO_WALLET}"
+            )
+            return
 
 # ================= MY ORDERS =================
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -245,7 +282,7 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
-# ================= CALLBACKS =================
+# ================= REVIEW CALLBACK =================
 async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -268,6 +305,11 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid not in ADMINS:
         return
 
+    if q.data == "admin_add_product":
+        ADMIN_SESSIONS[uid] = {"step": "name"}
+        await q.edit_message_text("🆕 Send product NAME:")
+        return
+
     if q.data == "admin_orders":
         cur.execute("SELECT * FROM orders ORDER BY order_id DESC")
         for o in cur.fetchall():
@@ -283,13 +325,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
 
-    elif q.data.startswith("paid_"):
+    if q.data.startswith("paid_"):
         oid = int(q.data[5:])
         cur.execute("UPDATE orders SET status='Paid' WHERE order_id=?", (oid,))
         db.commit()
         await q.edit_message_text(f"✅ Order {oid} PAID")
 
-    elif q.data.startswith("dispatch_"):
+    if q.data.startswith("dispatch_"):
         oid = int(q.data[9:])
         cur.execute("UPDATE orders SET status='Dispatched' WHERE order_id=?", (oid,))
         db.commit()
@@ -301,13 +343,14 @@ app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("admin", admin))
 
-app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(admin_|paid_|dispatch_)"))
+app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(admin_|paid_|dispatch_|admin_orders)$"))
 app.add_handler(CallbackQueryHandler(product_select, pattern="^prod_"))
 app.add_handler(CallbackQueryHandler(weight_select, pattern="^weight_"))
 app.add_handler(CallbackQueryHandler(my_orders, pattern="^my_orders$"))
 app.add_handler(CallbackQueryHandler(review_callback, pattern="^(review_|back)$"))
 
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+app.add_handler(MessageHandler(filters.PHOTO, message_handler))
 
 print("✅ BOT RUNNING")
 app.run_polling()
