@@ -10,7 +10,7 @@ from telegram.ext import (
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN") or "PUT_YOUR_TOKEN_HERE"
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
-CONTACT_CHANNEL_ID = "@YourChannelOrPM"  # Where messages go
+CONTACT_CHANNEL_ID = "@YourChannelOrPM"
 
 ADMINS = set()
 USER_SESSIONS = {}
@@ -133,33 +133,47 @@ async def callback_router(update, context):
         return
 
     if data.startswith("weight_"):
+        weight = data.replace("weight_", "")
         products = get_products()
         page = USER_PRODUCT_PAGE.get(uid, 0)
         p = products[page]
-        session = USER_SESSIONS.get(uid, {"step": "weight", "basket": []})
-        weight = data.replace("weight_", "")
         prices = {"3.5": p[4], "7": p[5], "14": p[6], "28": p[7], "56": p[8]}
-        session["basket"].append({
-            "name": p[1],
-            "weight": weight,
-            "price": prices[weight],
-            "quantity": 1
-        })
+
+        # Create or update session basket
+        session = USER_SESSIONS.get(uid, {"step": "basket", "basket": []})
+        # Check if same product & weight exists
+        for item in session["basket"]:
+            if item["name"] == p[1] and item["weight"] == weight:
+                item["quantity"] += 1
+                break
+        else:
+            session["basket"].append({
+                "name": p[1],
+                "weight": weight,
+                "price": prices[weight],
+                "quantity": 1
+            })
+        USER_SESSIONS[uid] = session
+        await show_basket(update, context, uid)
+        return
+
+    if data.startswith("qty_"):
+        idx, action = data.replace("qty_", "").split("_")
+        idx = int(idx)
+        session = USER_SESSIONS[uid]
+        if action == "plus":
+            session["basket"][idx]["quantity"] += 1
+        elif action == "minus" and session["basket"][idx]["quantity"] > 1:
+            session["basket"][idx]["quantity"] -= 1
+        USER_SESSIONS[uid] = session
+        await show_basket(update, context, uid)
+        return
+
+    if data == "checkout":
+        session = USER_SESSIONS[uid]
         session["step"] = "name"
         USER_SESSIONS[uid] = session
-        text, total = basket_text(session["basket"])
-        await q.edit_message_text(f"🛒 Basket:\n{text}\n💰 £{total}\n\nSend FULL NAME to checkout:")
-        return
-
-    if data.startswith("my_orders_"):
-        page = int(data.split("_")[-1])
-        await show_user_order(update, context, uid, page)
-        return
-
-    if data.startswith("review_"):
-        oid = int(data.replace("review_", ""))
-        USER_SESSIONS[uid] = {"step": "review", "order_id": oid}
-        await q.message.reply_text("✍️ Send review as:\n`5 Amazing product`")
+        await q.edit_message_text("💳 Send FULL NAME to checkout:")
         return
 
     if data == "back":
@@ -192,6 +206,23 @@ async def callback_router(update, context):
         await q.edit_message_text(f"📦 Order {oid} DISPATCHED")
         return
 
+# ================= SHOW BASKET =================
+async def show_basket(update, context, uid):
+    session = USER_SESSIONS[uid]
+    items, total = basket_text(session["basket"])
+    buttons = []
+    for i, item in enumerate(session["basket"]):
+        buttons.append([
+            InlineKeyboardButton(f"-1 {item['name']} {item['weight']}g", callback_data=f"qty_{i}_minus"),
+            InlineKeyboardButton(f"+1 {item['name']} {item['weight']}g", callback_data=f"qty_{i}_plus"),
+        ])
+    buttons.append([InlineKeyboardButton("✅ Checkout", callback_data="checkout")])
+    buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
+    await update.callback_query.edit_message_text(
+        f"🛒 Basket:\n{items}\n💰 Total: £{total}",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
 # ================= PRODUCTS =================
 async def show_product_page(update, context, uid, page):
     products = get_products()
@@ -202,12 +233,9 @@ async def show_product_page(update, context, uid, page):
     if page >= len(products): page = len(products)-1
     USER_PRODUCT_PAGE[uid] = page
     p = products[page]
-
     rating = product_rating(p[1])
-
     buttons = [[InlineKeyboardButton(f"{w}g £{price}", callback_data=f"weight_{w}")]
                for w, price in {"3.5": p[4], "7": p[5], "14": p[6], "28": p[7], "56": p[8]}.items()]
-
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"prod_page_{page-1}"))
@@ -215,7 +243,6 @@ async def show_product_page(update, context, uid, page):
         nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"prod_page_{page+1}"))
     if nav_buttons:
         buttons.append(nav_buttons)
-
     buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
     markup = InlineKeyboardMarkup(buttons)
 
@@ -230,7 +257,7 @@ async def show_product_page(update, context, uid, page):
             reply_markup=markup
         )
 
-# ================= USER ORDERS =================
+# ================= OTHER FUNCTIONS =================
 async def show_user_order(update, context, uid, page):
     cur.execute("SELECT * FROM orders WHERE user_id=? ORDER BY order_id DESC", (uid,))
     orders = cur.fetchall()
@@ -240,16 +267,13 @@ async def show_user_order(update, context, uid, page):
     if page < 0: page = 0
     if page >= len(orders): page = len(orders)-1
     USER_ORDER_PAGE[uid] = page
-
     o = orders[page]
     oid, _, items, total, status, name, address = o
     items = json.loads(items)
     items_text = "\n".join([f"- {i['name']} {i['weight']}g x{i['quantity']}" for i in items])
-
     buttons = []
     if status in ("Paid", "Dispatched"):
         buttons.append([InlineKeyboardButton("⭐ Leave / Edit Review", callback_data=f"review_{oid}")])
-
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"my_orders_{page-1}"))
@@ -258,13 +282,11 @@ async def show_user_order(update, context, uid, page):
     if nav_buttons:
         buttons.append(nav_buttons)
     buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
-
     await update.callback_query.edit_message_text(
         f"🧾 Order #{oid}\n{name}\n{address}\n{items_text}\n💰 £{total}\n📌 {status}",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
-# ================= ALL REVIEWS =================
 async def show_all_reviews(update):
     cur.execute("""
         SELECT r.stars, r.text 
@@ -281,7 +303,6 @@ async def show_all_reviews(update):
         text += f"⭐" * s + f"\n{t}\n\n"
     await update.callback_query.edit_message_text(text, reply_markup=home_menu())
 
-# ================= ADMIN ORDERS =================
 async def show_admin_orders(update, context, uid, page):
     cur.execute("SELECT * FROM orders ORDER BY order_id DESC")
     orders = cur.fetchall()
@@ -291,18 +312,15 @@ async def show_admin_orders(update, context, uid, page):
     if page < 0: page = 0
     if page >= len(orders): page = len(orders)-1
     ADMIN_ORDER_PAGE[uid] = page
-
     o = orders[page]
     oid, user_id, items, total, status, name, address = o
     items = json.loads(items)
     items_text = "\n".join([f"- {i['name']} {i['weight']}g x{i['quantity']}" for i in items])
-
     buttons = []
     if status != "Paid":
         buttons.append([InlineKeyboardButton("💰 Mark Paid", callback_data=f"paid_{oid}")])
     if status == "Paid":
         buttons.append([InlineKeyboardButton("📦 Mark Dispatched", callback_data=f"dispatch_{oid}")])
-
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admin_orders_{page-1}"))
@@ -311,7 +329,6 @@ async def show_admin_orders(update, context, uid, page):
     if nav_buttons:
         buttons.append(nav_buttons)
     buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
-
     await update.callback_query.edit_message_text(
         f"🧾 Order #{oid}\n{name}\n{address}\n{items_text}\n💰 £{total}\n📌 {status}",
         reply_markup=InlineKeyboardMarkup(buttons)
@@ -326,7 +343,6 @@ async def message_handler(update, context):
     if uid in ADMIN_SESSIONS:
         admin = ADMIN_SESSIONS[uid]
         step = admin["step"]
-
         if step == "name":
             admin["name"] = text
             admin["step"] = "desc"
@@ -416,17 +432,4 @@ async def admin_cmd(update, context):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
             [InlineKeyboardButton("📢 Add Announcement", callback_data="admin_add_announcement")],
-            [InlineKeyboardButton("📦 View Orders", callback_data="admin_orders_0")]
-        ])
-    )
-
-# ================= APP =================
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("admin", admin_cmd))
-app.add_handler(CallbackQueryHandler(callback_router))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-app.add_handler(MessageHandler(filters.PHOTO, message_handler))
-
-print("✅ BOT RUNNING")
-app.run_polling()
+            [InlineKeyboardButton("📦 View Orders", callback_data="
