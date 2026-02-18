@@ -9,7 +9,6 @@ from telegram.ext import (
 
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN") or "PUT_YOUR_TOKEN_HERE"
-CHANNEL_ID = -1003833257976
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 
 ADMINS = set()
@@ -58,7 +57,6 @@ CREATE TABLE IF NOT EXISTS reviews (
     PRIMARY KEY (order_id, user_id)
 )
 """)
-
 db.commit()
 
 # ================= HELPERS =================
@@ -140,7 +138,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛠 ADMIN PANEL",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
-            [InlineKeyboardButton("📦 View Orders", callback_data="admin_orders_0")],
+            [InlineKeyboardButton("📦 View Orders", callback_data="admin_orders_0")]
         ])
     )
 
@@ -157,7 +155,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_product_page(update, context, uid, page)
         return
 
-    # Weight selection
     if data.startswith("weight_"):
         products = get_products()
         page = USER_PRODUCT_PAGE.get(uid, 0)
@@ -192,15 +189,70 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("✍️ Send review as:\n`5 Amazing product`")
         return
 
-    # Back
-    if data == "back":
-        await show_product_page(update, context, uid, USER_PRODUCT_PAGE.get(uid,0))
+    # Admin: Add Product
+    if data == "admin_add_product":
+        ADMIN_SESSIONS[uid] = {"step": "name"}
+        await q.message.reply_text("🆕 Send product NAME:")
         return
 
-    # Admin callbacks
-    if data in ("admin_add_product", "admin_menu") or data.startswith(("admin_orders_", "paid_", "dispatch_")):
-        await admin_callback(update, context)
+    # Admin: View Orders
+    if data.startswith("admin_orders_"):
+        page = int(data.split("_")[-1])
+        await show_admin_orders(update, context, uid, page)
         return
+
+    # Admin: Mark Paid
+    if data.startswith("paid_"):
+        oid = int(data.replace("paid_", ""))
+        cur.execute("UPDATE orders SET status='Paid' WHERE order_id=?", (oid,))
+        db.commit()
+        await q.edit_message_text(f"✅ Order {oid} marked PAID")
+        return
+
+    # Admin: Dispatch
+    if data.startswith("dispatch_"):
+        oid = int(data.replace("dispatch_", ""))
+        cur.execute("UPDATE orders SET status='Dispatched' WHERE order_id=?", (oid,))
+        db.commit()
+        await q.edit_message_text(f"📦 Order {oid} DISPATCHED")
+        return
+
+# ================= ADMIN ORDERS =================
+async def show_admin_orders(update, context, uid, page):
+    cur.execute("SELECT * FROM orders ORDER BY order_id DESC")
+    orders = cur.fetchall()
+    if not orders:
+        await update.callback_query.edit_message_text("No orders found.")
+        return
+
+    if page < 0: page = 0
+    if page >= len(orders): page = len(orders)-1
+    ADMIN_ORDER_PAGE[uid] = page
+
+    o = orders[page]
+    oid, user_id, items, total, status, name, address = o
+    items = json.loads(items)
+    items_text = "\n".join([f"- {i['name']} {i['weight']}g x{i['quantity']}" for i in items])
+
+    buttons = []
+    if status != "Paid":
+        buttons.append([InlineKeyboardButton("💰 Mark Paid", callback_data=f"paid_{oid}")])
+    elif status == "Paid":
+        buttons.append([InlineKeyboardButton("📦 Dispatch", callback_data=f"dispatch_{oid}")])
+
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admin_orders_{page-1}"))
+    if page < len(orders)-1:
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_orders_{page+1}"))
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
+
+    await update.callback_query.edit_message_text(
+        f"🧾 Order #{oid}\n{name}\n{address}\n{items_text}\n💰 £{total}\n📌 {status}",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
 # ================= USER ORDERS =================
 async def show_user_order(update, context, uid, page):
@@ -209,6 +261,7 @@ async def show_user_order(update, context, uid, page):
     if not orders:
         await update.callback_query.edit_message_text("📦 No orders yet.", reply_markup=main_menu(uid))
         return
+
     if page < 0: page = 0
     if page >= len(orders): page = len(orders)-1
     USER_ORDER_PAGE[uid] = page
@@ -221,6 +274,7 @@ async def show_user_order(update, context, uid, page):
     buttons = []
     if status in ("Paid", "Dispatched"):
         buttons.append([InlineKeyboardButton("⭐ Leave / Edit Review", callback_data=f"review_{oid}")])
+
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"my_orders_{page-1}"))
@@ -240,7 +294,47 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     text = update.message.text
 
-    # Checkout & review
+    # Admin Add Product
+    if uid in ADMIN_SESSIONS:
+        admin = ADMIN_SESSIONS[uid]
+        step = admin["step"]
+
+        if step == "name":
+            admin["name"] = text
+            admin["step"] = "desc"
+            await update.message.reply_text("📝 Description:")
+            return
+        if step == "desc":
+            admin["desc"] = text
+            admin["step"] = "photo"
+            await update.message.reply_text("📷 Send product PHOTO (as image, not URL):")
+            return
+        if step == "photo":
+            if update.message.photo:
+                admin["photo_file_id"] = update.message.photo[-1].file_id
+                admin["step"] = "prices"
+                await update.message.reply_text("💰 Prices 3.5,7,14,28,56 (comma separated):")
+                return
+            else:
+                await update.message.reply_text("❌ Send a photo!")
+                return
+        if step == "prices":
+            try:
+                prices = list(map(float, text.split(",")))
+                if len(prices) != 5:
+                    raise ValueError
+            except:
+                await update.message.reply_text("❌ Invalid format")
+                return
+            pid = admin["name"].lower().replace(" ", "_")
+            cur.execute("INSERT OR REPLACE INTO products VALUES (?,?,?,?,?,?,?,?,?)",
+                        (pid, admin["name"], admin["desc"], admin["photo_file_id"], *prices))
+            db.commit()
+            ADMIN_SESSIONS.pop(uid)
+            await update.message.reply_text("✅ Product added!", reply_markup=main_menu(uid))
+            return
+
+    # Checkout / Review
     if uid in USER_SESSIONS:
         session = USER_SESSIONS[uid]
         if session.get("step") == "name":
