@@ -15,9 +15,9 @@ CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 ADMINS = set()
 USER_SESSIONS = {}
 ADMIN_SESSIONS = {}
-ADMIN_ORDER_PAGE = {}
-USER_ORDER_PAGE = {}
 USER_PRODUCT_PAGE = {}
+USER_ORDER_PAGE = {}
+ADMIN_ORDER_PAGE = {}
 
 # ================= DATABASE =================
 db = sqlite3.connect("shop.db", check_same_thread=False)
@@ -88,7 +88,6 @@ def product_rating(product_name):
     return "\n⭐ No reviews yet"
 
 def main_menu(uid):
-    USER_PRODUCT_PAGE[uid] = 0
     return InlineKeyboardMarkup([[InlineKeyboardButton("📦 My Orders", callback_data="my_orders_0")]])
 
 # ================= START =================
@@ -103,7 +102,6 @@ async def show_product_page(update, context, uid, page):
     if not products:
         await update.message.reply_text("No products available.")
         return
-
     if page < 0: page = 0
     if page >= len(products): page = len(products)-1
     USER_PRODUCT_PAGE[uid] = page
@@ -133,6 +131,19 @@ async def show_product_page(update, context, uid, page):
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
+# ================= ADMIN PANEL =================
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ADMINS.add(uid)
+    ADMIN_ORDER_PAGE[uid] = 0
+    await update.message.reply_text(
+        "🛠 ADMIN PANEL",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
+            [InlineKeyboardButton("📦 View Orders", callback_data="admin_orders_0")],
+        ])
+    )
+
 # ================= CALLBACK ROUTER =================
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -140,12 +151,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     await q.answer()
 
-    # ================= PRODUCT NAVIGATION =================
+    # Product navigation
     if data.startswith("prod_page_"):
         page = int(data.replace("prod_page_", ""))
         await show_product_page(update, context, uid, page)
         return
 
+    # Weight selection
     if data.startswith("weight_"):
         products = get_products()
         page = USER_PRODUCT_PAGE.get(uid, 0)
@@ -167,38 +179,36 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ================= USER ORDERS =================
+    # User orders
     if data.startswith("my_orders_"):
         page = int(data.split("_")[-1])
         await show_user_order(update, context, uid, page)
         return
 
-    # ================= REVIEW =================
+    # Review
     if data.startswith("review_"):
         oid = int(data.replace("review_", ""))
         USER_SESSIONS[uid] = {"step": "review", "order_id": oid}
         await q.message.reply_text("✍️ Send review as:\n`5 Amazing product`")
         return
 
-    # ================= BACK TO MENU =================
+    # Back
     if data == "back":
         await show_product_page(update, context, uid, USER_PRODUCT_PAGE.get(uid,0))
         return
 
-    # ================= ADMIN PANEL =================
-    if data.startswith("admin_orders_") or data in ("admin_add_product", "admin_menu", "paid_", "dispatch_"):
-        from admin_module import admin_callback  # use your previous admin_callback implementation
+    # Admin callbacks
+    if data in ("admin_add_product", "admin_menu") or data.startswith(("admin_orders_", "paid_", "dispatch_")):
         await admin_callback(update, context)
         return
 
-# ================= USER ORDER DISPLAY =================
+# ================= USER ORDERS =================
 async def show_user_order(update, context, uid, page):
     cur.execute("SELECT * FROM orders WHERE user_id=? ORDER BY order_id DESC", (uid,))
     orders = cur.fetchall()
     if not orders:
         await update.callback_query.edit_message_text("📦 No orders yet.", reply_markup=main_menu(uid))
         return
-
     if page < 0: page = 0
     if page >= len(orders): page = len(orders)-1
     USER_ORDER_PAGE[uid] = page
@@ -230,7 +240,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     text = update.message.text
 
-    # Checkout flow
+    # Checkout & review
     if uid in USER_SESSIONS:
         session = USER_SESSIONS[uid]
         if session.get("step") == "name":
@@ -271,8 +281,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= APP =================
 app = ApplicationBuilder().token(TOKEN).build()
-
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("admin", admin))
 app.add_handler(CallbackQueryHandler(callback_router))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 app.add_handler(MessageHandler(filters.PHOTO, message_handler))
