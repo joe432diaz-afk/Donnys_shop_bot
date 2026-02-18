@@ -15,6 +15,7 @@ CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 ADMINS = set()
 USER_SESSIONS = {}
 ADMIN_SESSIONS = {}
+ADMIN_ORDER_PAGE = {}  # track which order is being viewed
 
 # ================= DATABASE =================
 db = sqlite3.connect("shop.db", check_same_thread=False)
@@ -102,7 +103,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛠 ADMIN PANEL",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
-            [InlineKeyboardButton("📦 View Orders", callback_data="admin_orders")]
+            [InlineKeyboardButton("📦 View Orders", callback_data="admin_orders_0")]
         ])
     )
 
@@ -267,20 +268,19 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("📦 No orders yet.", reply_markup=main_menu())
         return
 
+    # Show all orders with a back button
+    text = ""
+    buttons = []
     for o in orders:
         oid, _, items, total, status, _, _ = o
         items = json.loads(items)
         items_text = "\n".join([f"- {i['name']} {i['weight']}g x{i['quantity']}" for i in items])
-
-        buttons = []
+        text += f"🧾 Order #{oid}\n{items_text}\n💰 £{total}\n📌 {status}\n\n"
         if status in ("Paid", "Dispatched"):
-            buttons.append([InlineKeyboardButton("⭐ Leave / Edit Review", callback_data=f"review_{oid}")])
-        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="back")])
+            buttons.append([InlineKeyboardButton(f"⭐ Review #{oid}", callback_data=f"review_{oid}")])
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="back")])
 
-        await q.message.reply_text(
-            f"🧾 Order #{oid}\n{items_text}\n\n💰 £{total}\n📌 {status}",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+    await q.edit_message_text(text.strip(), reply_markup=InlineKeyboardMarkup(buttons))
 
 # ================= REVIEW CALLBACK =================
 async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -305,37 +305,84 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid not in ADMINS:
         return
 
+    # ===== ADD PRODUCT =====
     if q.data == "admin_add_product":
         ADMIN_SESSIONS[uid] = {"step": "name"}
         await q.edit_message_text("🆕 Send product NAME:")
         return
 
-    if q.data == "admin_orders":
+    # ===== VIEW ORDERS =====
+    if q.data.startswith("admin_orders_"):
+        page = int(q.data.split("_")[-1])
         cur.execute("SELECT * FROM orders ORDER BY order_id DESC")
-        for o in cur.fetchall():
-            oid, user_id, _, total, status, name, address = o
-            buttons = []
-            if status != "Paid":
-                buttons.append([InlineKeyboardButton("💰 Mark Paid", callback_data=f"paid_{oid}")])
-            if status == "Paid":
-                buttons.append([InlineKeyboardButton("📦 Dispatch", callback_data=f"dispatch_{oid}")])
+        orders = cur.fetchall()
+        if not orders:
+            await q.edit_message_text("📦 No orders yet.")
+            return
 
-            await q.message.reply_text(
-                f"🧾 #{oid}\n{name}\n{address}\n£{total}\nStatus: {status}",
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
+        # Make sure page is valid
+        if page < 0: page = 0
+        if page >= len(orders): page = len(orders)-1
+        ADMIN_ORDER_PAGE[uid] = page
 
+        o = orders[page]
+        oid, user_id, items, total, status, name, address = o
+        items = json.loads(items)
+        items_text = "\n".join([f"- {i['name']} {i['weight']}g x{i['quantity']}" for i in items])
+
+        buttons = []
+        if status != "Paid":
+            buttons.append([InlineKeyboardButton("💰 Mark Paid", callback_data=f"paid_{oid}")])
+        if status == "Paid":
+            buttons.append([InlineKeyboardButton("📦 Dispatch", callback_data=f"dispatch_{oid}")])
+        # navigation
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admin_orders_{page-1}"))
+        if page < len(orders)-1:
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_orders_{page+1}"))
+        if nav_buttons:
+            buttons.append(nav_buttons)
+        buttons.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="admin_menu")])
+
+        await q.edit_message_text(
+            f"🧾 Order #{oid}\n{name}\n{address}\n{items_text}\n£{total}\nStatus: {status}",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # ===== NAVIGATE BACK TO ADMIN MENU =====
+    if q.data == "admin_menu":
+        await q.edit_message_text(
+            "🛠 ADMIN PANEL",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
+                [InlineKeyboardButton("📦 View Orders", callback_data="admin_orders_0")]
+            ])
+        )
+        return
+
+    # ===== MARK PAID =====
     if q.data.startswith("paid_"):
-        oid = int(q.data[5:])
+        oid = int(q.data.replace("paid_", ""))
         cur.execute("UPDATE orders SET status='Paid' WHERE order_id=?", (oid,))
         db.commit()
-        await q.edit_message_text(f"✅ Order {oid} PAID")
+        await q.answer("✅ Marked Paid", show_alert=True)
+        # Refresh order page
+        page = ADMIN_ORDER_PAGE.get(uid, 0)
+        await admin_callback(update, context)
+        return
 
+    # ===== DISPATCH =====
     if q.data.startswith("dispatch_"):
-        oid = int(q.data[9:])
+        oid = int(q.data.replace("dispatch_", ""))
         cur.execute("UPDATE orders SET status='Dispatched' WHERE order_id=?", (oid,))
         db.commit()
-        await q.edit_message_text(f"📦 Order {oid} DISPATCHED")
+        await q.answer("📦 Dispatched", show_alert=True)
+        # Refresh order page
+        page = ADMIN_ORDER_PAGE.get(uid, 0)
+        await admin_callback(update, context)
+        return
 
 # ================= APP =================
 app = ApplicationBuilder().token(TOKEN).build()
@@ -343,7 +390,7 @@ app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("admin", admin))
 
-app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(admin_|paid_|dispatch_|admin_orders)$"))
+app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(admin_|paid_|dispatch_).*"))
 app.add_handler(CallbackQueryHandler(product_select, pattern="^prod_"))
 app.add_handler(CallbackQueryHandler(weight_select, pattern="^weight_"))
 app.add_handler(CallbackQueryHandler(my_orders, pattern="^my_orders$"))
