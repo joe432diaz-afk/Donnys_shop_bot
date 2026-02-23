@@ -1,12 +1,7 @@
-# ================================
-# COMMERCIAL TELEGRAM SHOP BOT
-# ================================
-
-import asyncio
-import aiosqlite
-import random
-import string
-import json
+import os
+import sqlite3
+import logging
+from uuid import uuid4
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -17,360 +12,293 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    filters,
     ContextTypes,
-    filters
+    ConversationHandler
 )
 
 # ================= CONFIG =================
 
-TOKEN = "8383232415:AAGDzTvKSird6CCg4NyXHnwpim4KN6q24WQ"
-CHANNEL_ID = -1000000000000
-ADMIN_IDS = {7773622161}
+TOKEN = os.getenv("TOKEN")
+ADMIN_ID = 123456789  # CHANGE
+CHANNEL_ID = -1001234567890  # CHANGE
 
-DB = "shop.db"
-LTC_RATE = 0.01
+DB_NAME = "shop.db"
 
-# ================= UTILITIES =================
+logging.basicConfig(level=logging.INFO)
 
-def generate_order_id():
-    return "ORD-" + "".join(
-        random.choices(string.ascii_uppercase + string.digits, k=10)
-    )
+# =============== DATABASE =================
 
-def is_admin(uid):
-    return uid in ADMIN_IDS
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
 
-# ================= DATABASE =================
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY
+    )""")
 
-async def init_db():
-    async with aiosqlite.connect(DB) as db:
+    c.execute("""CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        price REAL,
+        description TEXT
+    )""")
 
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS products(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            description TEXT,
-            price REAL,
-            photo BLOB
-        )
-        """)
+    c.execute("""CREATE TABLE IF NOT EXISTS orders (
+        id TEXT PRIMARY KEY,
+        user_id INTEGER,
+        name TEXT,
+        address TEXT,
+        total REAL,
+        status TEXT
+    )""")
 
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS basket(
-            user_id INTEGER,
-            product_id INTEGER,
-            quantity INTEGER
-        )
-        """)
+    c.execute("""CREATE TABLE IF NOT EXISTS reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        text TEXT
+    )""")
 
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS orders(
-            order_id TEXT,
-            user_id INTEGER,
-            name TEXT,
-            address TEXT,
-            items TEXT,
-            total REAL,
-            status TEXT
-        )
-        """)
+    conn.commit()
+    conn.close()
 
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS reviews(
-            user_id INTEGER,
-            text TEXT
-        )
-        """)
+# =============== SAMPLE PRODUCTS ===============
 
-        await db.commit()
+def seed_products():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM products")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO products (name, price, description) VALUES (?, ?, ?)",
+                  ("Product A", 10.0, "Description A"))
+        c.execute("INSERT INTO products (name, price, description) VALUES (?, ?, ?)",
+                  ("Product B", 20.0, "Description B"))
+    conn.commit()
+    conn.close()
 
-async def db_fetch(query, params=()):
-    async with aiosqlite.connect(DB) as db:
-        cursor = await db.execute(query, params)
-        return await cursor.fetchall()
+# =============== STATES ===============
 
-async def db_fetchone(query, params=()):
-    async with aiosqlite.connect(DB) as db:
-        cursor = await db.execute(query, params)
-        return await cursor.fetchone()
+ASK_NAME, ASK_ADDRESS, REVIEW_TEXT = range(3)
 
-async def db_execute(query, params=()):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute(query, params)
-        await db.commit()
-
-# ================= KEYBOARDS =================
+# =============== MAIN MENU ===============
 
 def main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛒 Products", "products")],
-        [InlineKeyboardButton("🧺 Basket", "basket")],
-        [InlineKeyboardButton("⭐ Reviews", "reviews")],
-        [InlineKeyboardButton("🔧 Admin", "admin")]
-    ])
+    keyboard = [
+        [InlineKeyboardButton("🛍 Products", callback_data="products")],
+        [InlineKeyboardButton("🧺 Basket", callback_data="basket")],
+        [InlineKeyboardButton("⭐ Reviews", callback_data="reviews")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-def back(target):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅ Back", target)]
-    ])
-
-# ================= START =================
+# =============== START ===============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users VALUES (?)", (user.id,))
+    conn.commit()
+    conn.close()
+
     await update.message.reply_text(
-        "🛍 Commercial Shop Bot",
+        "Welcome to the Shop!",
         reply_markup=main_menu()
     )
 
-# ================= ROUTER =================
+# =============== PRODUCTS ===============
+
+async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT * FROM products")
+    products = c.fetchall()
+    conn.close()
+
+    keyboard = []
+    for p in products:
+        keyboard.append([InlineKeyboardButton(
+            f"{p[1]} - ${p[2]}",
+            callback_data=f"add_{p[0]}"
+        )])
+
+    keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="menu")])
+
+    await query.edit_message_text(
+        "Available Products:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# =============== BASKET ===============
+
+async def add_to_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    product_id = int(query.data.split("_")[1])
+
+    if "basket" not in context.user_data:
+        context.user_data["basket"] = []
+
+    context.user_data["basket"].append(product_id)
+
+    await query.edit_message_text(
+        "Added to basket.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧺 View Basket", callback_data="basket")],
+            [InlineKeyboardButton("⬅ Back", callback_data="products")]
+        ])
+    )
+
+async def view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    basket = context.user_data.get("basket", [])
+    if not basket:
+        await query.edit_message_text(
+            "Basket is empty.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅ Back", callback_data="menu")]
+            ])
+        )
+        return
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    total = 0
+    text = "Your Basket:\n\n"
+
+    for pid in basket:
+        c.execute("SELECT name, price FROM products WHERE id=?", (pid,))
+        p = c.fetchone()
+        if p:
+            text += f"{p[0]} - ${p[1]}\n"
+            total += p[1]
+
+    conn.close()
+
+    text += f"\nTotal: ${total}"
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Checkout", callback_data="checkout")],
+            [InlineKeyboardButton("⬅ Back", callback_data="menu")]
+        ])
+    )
+
+# =============== CHECKOUT ===============
+
+async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Enter your name:")
+    return ASK_NAME
+
+async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["name"] = update.message.text
+    await update.message.reply_text("Enter your address:")
+    return ASK_ADDRESS
+
+async def get_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    address = update.message.text
+    name = context.user_data["name"]
+    basket = context.user_data.get("basket", [])
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    total = 0
+    for pid in basket:
+        c.execute("SELECT price FROM products WHERE id=?", (pid,))
+        p = c.fetchone()
+        if p:
+            total += p[0]
+
+    order_id = str(uuid4())[:8]
+
+    c.execute("INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?)",
+              (order_id, update.effective_user.id, name, address, total, "Pending"))
+
+    conn.commit()
+    conn.close()
+
+    context.user_data["basket"] = []
+
+    await update.message.reply_text(
+        f"Order Created!\nOrder ID: {order_id}\nTotal LTC: {total}",
+        reply_markup=main_menu()
+    )
+
+    await context.bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=f"New Order\nID: {order_id}\nName: {name}\nAddress: {address}\nTotal: {total}"
+    )
+
+    return ConversationHandler.END
+
+# =============== ADMIN PANEL ===============
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("📦 Orders", callback_data="admin_orders")]
+    ]
+
+    await update.message.reply_text(
+        "Admin Panel",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# =============== ROUTER ===============
 
 async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data
 
-    query = update.callback_query
-    if not query:
-        return
-
-    try:
-        await query.answer()
-    except:
-        pass
-
-    uid = query.from_user.id
-    data = query.data
-
-    # MAIN
-    if data == "main":
-        await query.edit_message_text("Main Menu", reply_markup=main_menu())
-        return
-
-    # PRODUCTS
-    if data == "products":
-        products = await db_fetch("SELECT id,name,price FROM products")
-
-        if not products:
-            await query.edit_message_text(
-                "No products available",
-                reply_markup=back("main")
-            )
-            return
-
-        buttons = []
-        for p in products:
-            buttons.append([
-                InlineKeyboardButton(
-                    f"{p[1]} - ${p[2]}",
-                    callback_data=f"product:{p[0]}"
-                )
-            ])
-        buttons.append([InlineKeyboardButton("⬅ Back", "main")])
-
-        await query.edit_message_text(
-            "Products:",
-            reply_markup=InlineKeyboardMarkup(buttons)
+    if data == "menu":
+        await update.callback_query.edit_message_text(
+            "Main Menu",
+            reply_markup=main_menu()
         )
-        return
+    elif data == "products":
+        await show_products(update, context)
+    elif data.startswith("add_"):
+        await add_to_basket(update, context)
+    elif data == "basket":
+        await view_basket(update, context)
+    elif data == "checkout":
+        return await checkout(update, context)
 
-    # PRODUCT DETAIL
-    if data.startswith("product:"):
-        pid = int(data.split(":")[1])
-        context.user_data["product_id"] = pid
+# =============== MAIN ===============
 
-        product = await db_fetchone(
-            "SELECT name,description,price FROM products WHERE id=?",
-            (pid,)
-        )
-
-        if not product:
-            return
-
-        name, desc, price = product
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add", "addbasket")],
-            [InlineKeyboardButton("⬅ Back", "products")]
-        ])
-
-        await query.edit_message_text(
-            f"{name}\n\n{desc}\nPrice: ${price}",
-            reply_markup=kb
-        )
-        return
-
-    # ADD TO BASKET
-    if data == "addbasket":
-        pid = context.user_data.get("product_id")
-        if not pid:
-            return
-
-        await db_execute("""
-        INSERT INTO basket(user_id,product_id,quantity)
-        VALUES(?,?,1)
-        """,(uid,pid))
-
-        await query.answer("Added to basket", show_alert=True)
-        return
-
-    # BASKET
-    if data == "basket":
-        rows = await db_fetch(
-            "SELECT product_id,quantity FROM basket WHERE user_id=?",
-            (uid,)
-        )
-
-        if not rows:
-            await query.edit_message_text(
-                "Basket empty",
-                reply_markup=back("main")
-            )
-            return
-
-        total = 0
-        text = "🧺 Basket\n\n"
-
-        for pid, qty in rows:
-            prod = await db_fetchone(
-                "SELECT name,price FROM products WHERE id=?",
-                (pid,)
-            )
-            if prod:
-                name, price = prod
-                subtotal = price * qty
-                total += subtotal
-                text += f"{name} x{qty} = ${subtotal}\n"
-
-        ltc = total * LTC_RATE
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 Checkout", "checkout")],
-            [InlineKeyboardButton("⬅ Back", "main")]
-        ])
-
-        await query.edit_message_text(
-            text + f"\nTotal: ${total}\nLTC ≈ {ltc:.6f}",
-            reply_markup=kb
-        )
-        return
-
-    # CHECKOUT
-    if data == "checkout":
-        context.user_data["checkout_state"] = "name"
-        await query.edit_message_text(
-            "Enter your full name:",
-            reply_markup=back("basket")
-        )
-        return
-
-    # REVIEWS
-    if data == "reviews":
-        reviews = await db_fetch("SELECT text FROM reviews LIMIT 10")
-        text = "⭐ Reviews\n\n"
-        for r in reviews:
-            text += f"• {r[0]}\n"
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Add Review", "add_review")],
-            [InlineKeyboardButton("⬅ Back", "main")]
-        ])
-
-        await query.edit_message_text(text, reply_markup=kb)
-        return
-
-    # ADMIN
-    if data == "admin":
-        if not is_admin(uid):
-            await query.answer("Admin only", show_alert=True)
-            return
-
-        await query.edit_message_text(
-            "Admin Panel",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("View Orders", "admin_orders")],
-                [InlineKeyboardButton("⬅ Back", "main")]
-            ])
-        )
-        return
-
-# ================= TEXT HANDLER =================
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    uid = update.message.from_user.id
-    text = update.message.text
-
-    state = context.user_data.get("checkout_state")
-
-    if state == "name":
-        context.user_data["name"] = text
-        context.user_data["checkout_state"] = "address"
-        await update.message.reply_text("Enter your address:")
-        return
-
-    if state == "address":
-        context.user_data["address"] = text
-
-        basket = await db_fetch(
-            "SELECT product_id,quantity FROM basket WHERE user_id=?",
-            (uid,)
-        )
-
-        total = 0
-        items = []
-
-        for pid, qty in basket:
-            prod = await db_fetchone(
-                "SELECT name,price FROM products WHERE id=?",
-                (pid,)
-            )
-            if prod:
-                name, price = prod
-                total += price * qty
-                items.append({"name": name, "qty": qty})
-
-        order_id = generate_order_id()
-
-        await db_execute("""
-        INSERT INTO orders(order_id,user_id,name,address,items,total,status)
-        VALUES(?,?,?,?,?,?,?)
-        """,(
-            order_id,
-            uid,
-            context.user_data["name"],
-            context.user_data["address"],
-            json.dumps(items),
-            total,
-            "pending"
-        ))
-
-        await db_execute("DELETE FROM basket WHERE user_id=?", (uid,))
-
-        ltc = total * LTC_RATE
-
-        await update.message.reply_text(
-            f"Order Created!\n\nOrder ID: {order_id}\n"
-            f"Total: ${total}\n"
-            f"Pay LTC ≈ {ltc:.6f}"
-        )
-
-        await update.message.bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=f"New Order\nID: {order_id}\nUser: {uid}\nTotal: ${total}"
-        )
-
-        context.user_data.clear()
-
-# ================= MAIN =================
-
-async def main():
-    await init_db()
+def main():
+    init_db()
+    seed_products()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(router))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(checkout, pattern="^checkout$")],
+        states={
+            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
+            ASK_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_address)]
+        },
+        fallbacks=[]
+    )
 
-    print("Commercial bot running...")
-    await app.run_polling()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(router))
+
+    print("Bot running...")
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
