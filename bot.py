@@ -1,250 +1,351 @@
 import os
 import sqlite3
 import logging
+import requests
+from uuid import uuid4
 
 from telegram import *
 from telegram.ext import *
 
-# ================= CONFIG =================
+================= CONFIG =================
 
 TOKEN = os.getenv("TOKEN")
+
 ADMIN_ID = 7773622161
+CHANNEL_ID = -1001234567890
+LTC_ADDRESS = "YOUR_LTC_ADDRESS"
 
 DB_NAME = "shop.db"
 
 logging.basicConfig(level=logging.INFO)
 
-# ================= STATES =================
+✅ STEP 1 PATCHED STATES
 
-ADMIN_ADD_PHOTO, ADMIN_ADD_NAME, ADMIN_ADD_PRICE, ADMIN_ADD_DESC = range(4)
+ASK_NAME, ASK_ADDRESS, WRITE_REVIEW, ADMIN_ADD_PHOTO, ADMIN_ADD_NAME, ADMIN_ADD_PRICE, ADMIN_ADD_DESC, ADMIN_DELETE_ID = range(8)
 
-# ================= DATABASE =================
+================= DATABASE =================
 
 def db():
-    return sqlite3.connect(DB_NAME)
+return sqlite3.connect(DB_NAME)
 
 def init_db():
+conn = db()
+c = conn.cursor()
 
-    conn = db()
-    c = conn.cursor()
+c.execute("""  
+CREATE TABLE IF NOT EXISTS products(  
+    id INTEGER PRIMARY KEY AUTOINCREMENT,  
+    name TEXT,  
+    price REAL,  
+    description TEXT,  
+    photo TEXT  
+)  
+""")  
 
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS products(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        price REAL,
-        description TEXT,
-        photo TEXT
-    )
-    """)
+c.execute("""  
+CREATE TABLE IF NOT EXISTS cart(  
+    user_id INTEGER,  
+    product_id INTEGER  
+)  
+""")  
 
-    conn.commit()
-    conn.close()
+c.execute("""  
+CREATE TABLE IF NOT EXISTS orders(  
+    id TEXT PRIMARY KEY,  
+    user_id INTEGER,  
+    name TEXT,  
+    address TEXT,  
+    total_usd REAL,  
+    total_ltc REAL,  
+    status TEXT  
+)  
+""")  
 
-# ================= MENUS =================
+c.execute("""  
+CREATE TABLE IF NOT EXISTS reviews(  
+    order_id TEXT PRIMARY KEY,  
+    user_id INTEGER,  
+    text TEXT  
+)  
+""")  
+
+conn.commit()  
+conn.close()
+
+================= LTC PRICE =================
+
+def get_ltc_price():
+try:
+r = requests.get(
+"https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd",
+timeout=10
+)
+return r.json()["litecoin"]["usd"]
+except:
+return 70
+
+================= MAIN MENU =================
 
 def main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛍 Products", callback_data="products")],
-        [InlineKeyboardButton("🔧 Admin", callback_data="admin_panel")]
-    ])
+return InlineKeyboardMarkup([
+[InlineKeyboardButton("🛍 Products", callback_data="products")],
+[InlineKeyboardButton("🧺 Basket", callback_data="basket")],
+[InlineKeyboardButton("📦 Orders", callback_data="orders")],
+[InlineKeyboardButton("⭐ Reviews", callback_data="public_reviews")]
+])
 
-def admin_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
-        [InlineKeyboardButton("📦 View Products", callback_data="admin_view_products")],
-        [InlineKeyboardButton("⬅ Close", callback_data="menu")]
-    ])
-
-# ================= START =================
+================= START =================
 
 async def start(update: Update, context):
+await update.message.reply_text(
+"Welcome to Shop Bot",
+reply_markup=main_menu()
+)
 
-    await update.message.reply_text(
-        "Welcome Shop Bot",
-        reply_markup=main_menu()
+================= PRODUCTS =================
+
+async def show_products(update, context):
+
+query = update.callback_query  
+await query.answer()  
+
+conn = db()  
+c = conn.cursor()  
+
+c.execute("SELECT * FROM products")  
+products = c.fetchall()  
+conn.close()  
+
+if not products:  
+    await query.edit_message_text("No products.")  
+    return  
+
+for p in products:  
+
+    keyboard = InlineKeyboardMarkup([  
+        [InlineKeyboardButton("Add Cart", callback_data=f"add_{p[0]}")],  
+        [InlineKeyboardButton("⬅ Back", callback_data="menu")]  
+    ])  
+
+    await context.bot.send_photo(  
+        query.message.chat_id,  
+        p[4],  
+        caption=f"{p[1]}\n${p[2]}\n\n{p[3]}",  
+        reply_markup=keyboard  
     )
 
-# ================= ADMIN PANEL =================
+================= CART =================
 
-async def admin_panel(update: Update, context):
+async def add_cart(update, context):
 
-    if update.effective_user.id != ADMIN_ID:
-        return
+query = update.callback_query  
+await query.answer()  
 
-    query = update.callback_query
+pid = int(query.data.split("_")[1])  
 
-    if query:
-        await query.answer()
-        await query.edit_message_text(
-            "🔧 Admin Panel",
-            reply_markup=admin_menu()
-        )
-    else:
-        await update.message.reply_text(
-            "🔧 Admin Panel",
-            reply_markup=admin_menu()
-        )
+conn = db()  
+c = conn.cursor()  
 
-# ================= ADD PRODUCT FLOW =================
+c.execute("INSERT INTO cart VALUES (?,?)",  
+          (query.from_user.id, pid))  
 
-async def start_add_product(update: Update, context):
+conn.commit()  
+conn.close()  
 
-    if update.effective_user.id != ADMIN_ID:
-        return ConversationHandler.END
+await query.answer("Added to cart")
 
-    query = update.callback_query
-    await query.answer()
+async def view_cart(update, context):
 
-    await query.edit_message_text("📷 Send product photo:")
+query = update.callback_query  
+await query.answer()  
 
-    return ADMIN_ADD_PHOTO
+conn = db()  
+c = conn.cursor()  
 
-async def admin_add_product_photo(update: Update, context):
+c.execute("""  
+SELECT products.name,products.price  
+FROM cart  
+JOIN products ON cart.product_id=products.id  
+WHERE cart.user_id=?  
+""", (query.from_user.id,))  
 
-    if update.effective_user.id != ADMIN_ID:
-        return ConversationHandler.END
+items = c.fetchall()  
+conn.close()  
 
-    context.user_data["photo"] = update.message.photo[-1].file_id
+if not items:  
+    await query.edit_message_text("Cart empty", reply_markup=main_menu())  
+    return  
 
-    await update.message.reply_text("✏ Product name:")
-    return ADMIN_ADD_NAME
+total = sum([i[1] for i in items])  
 
-async def admin_add_product_name(update: Update, context):
+text = "Your Cart:\n\n"  
+for i in items:  
+    text += f"{i[0]} - ${i[1]}\n"  
 
-    context.user_data["name"] = update.message.text
+text += f"\nTotal USD: ${total}"  
 
-    await update.message.reply_text("💰 Product price:")
-    return ADMIN_ADD_PRICE
+await query.edit_message_text(  
+    text,  
+    reply_markup=InlineKeyboardMarkup([  
+        [InlineKeyboardButton("💳 Checkout", callback_data="checkout")],  
+        [InlineKeyboardButton("⬅ Back", callback_data="menu")]  
+    ])  
+)
 
-async def admin_add_product_price(update: Update, context):
+================= ADMIN PANEL =================
 
-    try:
-        context.user_data["price"] = float(update.message.text)
-    except:
-        await update.message.reply_text("Send numeric price.")
-        return ADMIN_ADD_PRICE
+async def admin_panel(update, context):
 
-    await update.message.reply_text("📝 Product description:")
-    return ADMIN_ADD_DESC
+if update.effective_user.id != ADMIN_ID:  
+    return  
 
-async def admin_add_product_desc(update: Update, context):
+conn = db()  
+c = conn.cursor()  
 
-    data = context.user_data
+c.execute("SELECT id,status FROM orders")  
+orders = c.fetchall()  
+conn.close()  
 
-    conn = db()
-    c = conn.cursor()
+keyboard = []  
 
-    c.execute("""
-    INSERT INTO products(name,price,description,photo)
-    VALUES (?,?,?,?)
-    """, (
-        data.get("name"),
-        data.get("price"),
-        update.message.text,
-        data.get("photo")
-    ))
+for order_id, status in orders:  
 
-    conn.commit()
-    conn.close()
+    if status == "Awaiting Payment":  
 
-    await update.message.reply_text("✅ Product added!")
-    return ConversationHandler.END
+        keyboard.append([  
+            InlineKeyboardButton(  
+                f"Confirm Payment {order_id}",  
+                callback_data=f"admin_confirm_{order_id}"  
+            )  
+        ])  
 
-# ================= SHOW PRODUCTS =================
+        keyboard.append([  
+            InlineKeyboardButton(  
+                f"Reject {order_id}",  
+                callback_data=f"admin_reject_{order_id}"  
+            )  
+        ])  
 
-async def show_products(update: Update, context):
+    elif status == "Paid":  
 
-    query = update.callback_query
-    await query.answer()
+        keyboard.append([  
+            InlineKeyboardButton(  
+                f"Dispatch {order_id}",  
+                callback_data=f"admin_dispatch_{order_id}"  
+            )  
+        ])  
 
-    conn = db()
-    c = conn.cursor()
+keyboard.append([  
+    InlineKeyboardButton("⬅ Close", callback_data="menu")  
+])  
 
-    c.execute("SELECT * FROM products")
-    products = c.fetchall()
-    conn.close()
+await update.message.reply_text(  
+    "🔧 Product Manager",  
+    reply_markup=InlineKeyboardMarkup(keyboard)  
+)
 
-    if not products:
-        await query.edit_message_text("No products")
-        return
+================= ROUTER =================
 
-    for p in products:
+async def router(update, context):
 
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Add Cart", callback_data=f"add_{p[0]}")]
-        ])
+elif data == "admin_product_manager":
+await admin_product_manager_trigger(update, context)
 
-        await context.bot.send_photo(
-            query.message.chat_id,
-            p[4],
-            caption=f"{p[1]}\n${p[2]}\n\n{p[3]}",
-            reply_markup=keyboard
-        )
+elif data == "admin_add_product":  
+    await update.callback_query.edit_message_text(  
+        "Send product photo:"  
+    )  
 
-# ================= ROUTER =================
+elif data == "admin_delete_product":  
+    await update.callback_query.edit_message_text(  
+        "Send Product ID to delete:"  
+    )  
 
-async def router(update: Update, context):
+elif data == "admin_view_products":  
 
-    query = update.callback_query
-    if not query:
-        return
+    conn = db()  
+    c = conn.cursor()  
 
-    data = query.data
-    await query.answer()
+    c.execute("SELECT id,name,price FROM products")  
+    products = c.fetchall()  
+    conn.close()  
 
-    if data == "menu":
-        await query.edit_message_text(
-            "Main Menu",
-            reply_markup=main_menu()
-        )
+    text = "Products List:\n\n"  
 
-    elif data == "products":
-        await show_products(update, context)
+    for p in products:  
+        text += f"ID:{p[0]} | {p[1]} | ${p[2]}\n"  
 
-    elif data == "admin_panel":
-        await admin_panel(update, context)
+    await update.callback_query.edit_message_text(  
+        text,  
+        reply_markup=main_menu()  
+    )  
+data = update.callback_query.data  
 
-# ================= MAIN =================
+if data == "menu":  
+    await update.callback_query.edit_message_text(  
+        "Main Menu",  
+        reply_markup=main_menu()  
+    )  
+
+elif data == "products":  
+    await show_products(update, context)  
+
+elif data.startswith("add_"):  
+    await add_cart(update, context)  
+
+elif data == "basket":  
+    await view_cart(update, context)  
+
+elif data == "paid_":  
+    await update.callback_query.answer()
+
+================= MAIN =================
 
 def main():
 
-    init_db()
+init_db()  
 
-    app = ApplicationBuilder().token(TOKEN).build()
+app = ApplicationBuilder().token(TOKEN).build()  
 
-    conv = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(
-                start_add_product,
-                pattern="^admin_add_product$"
-            )
-        ],
-        states={
-            ADMIN_ADD_PHOTO: [
-                MessageHandler(filters.PHOTO, admin_add_product_photo)
-            ],
-            ADMIN_ADD_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_product_name)
-            ],
-            ADMIN_ADD_PRICE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_product_price)
-            ],
-            ADMIN_ADD_DESC: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_product_desc)
-            ],
-        },
-        fallbacks=[]
+conv = ConversationHandler(  
+    entry_points=[CallbackQueryHandler(lambda u,c: None, pattern="^checkout$")],  
+    states={},  
+    fallbacks=[]  
+)  
+
+app.add_handler(CommandHandler("start", start))  
+app.add_handler(CommandHandler("admin", admin_panel))  
+app.add_handler(conv)  
+app.add_handler(CallbackQueryHandler(router))  
+
+print("Bot Running")  
+app.run_polling()
+
+================= ADMIN PRODUCT MANAGER MENU (STEP 2) =================
+
+async def admin_product_manager_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+if update.effective_user.id != ADMIN_ID:  
+    return  
+
+keyboard = InlineKeyboardMarkup([  
+    [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],  
+    [InlineKeyboardButton("❌ Delete Product", callback_data="admin_delete_product")],  
+    [InlineKeyboardButton("📦 View Products", callback_data="admin_view_products")],  
+    [InlineKeyboardButton("⬅ Close", callback_data="menu")]  
+])  
+
+if update.message:  
+    await update.message.reply_text(  
+        "🔧 Product Manager",  
+        reply_markup=keyboard  
+    )  
+
+elif update.callback_query:  
+    await update.callback_query.edit_message_text(  
+        "🔧 Product Manager",  
+        reply_markup=keyboard  
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_panel))
-
-    app.add_handler(CallbackQueryHandler(router))
-    app.add_handler(conv)
-
-    print("Bot Running...")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+if name == "main":
+main()
