@@ -1,29 +1,31 @@
 import logging
 import sqlite3
-import json
 import requests
+import os
 from telegram import (
-    InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove,
-    KeyboardButton, Update, InputMediaPhoto
+    InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup,
+    KeyboardButton, Update
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, filters, ContextTypes
 )
 
-# Enable logging
+# Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Config - Replace LTC_ADDRESS with your real wallet
-TOKEN = 'TOKEN'
-ADMIN_IDS = [7773622161]  # Your admin ID
-CHANNEL_ID = -1001234567890  # ← CHANGE THIS to your real channel ID
+# ────────────────────────────────────────────────
+# CONFIG ──────────────────────────────────────────
+TOKEN = 'TOKEN'                     # ← put your real token here or use env var
+ADMIN_IDS = [7773622161]
+CHANNEL_ID = -1001234567890         # ← CHANGE THIS to your real channel ID
 LTC_ADDRESS = 'YOUR_FIXED_LITECOIN_ADDRESS'  # ← CHANGE THIS
 
-# Database file
 DB_FILE = 'bot.db'
 
+# ────────────────────────────────────────────────
+# DATABASE SETUP
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -45,7 +47,7 @@ def init_db():
                   address TEXT,
                   total REAL NOT NULL,
                   ltc_amount REAL NOT NULL,
-                  status TEXT DEFAULT 'pending')''')  # pending, paid, dispatched
+                  status TEXT DEFAULT 'pending')''')
     c.execute('''CREATE TABLE IF NOT EXISTS order_items
                  (order_id INTEGER,
                   product_id INTEGER,
@@ -63,15 +65,17 @@ init_db()
 
 # States
 ADMIN_NAME, ADMIN_DESC, ADMIN_PRICE, ADMIN_PHOTO = range(4)
-CHECKOUT_NAME, CHECKOUT_ADDRESS, CHECKOUT_CONFIRM = range(3)
-REVIEW_TEXT = range(1)
+CHECKOUT_NAME, CHECKOUT_ADDRESS = range(2)
+REVIEW_TEXT = 0
 
+# ────────────────────────────────────────────────
+# HELPERS
 def get_ltc_price():
     try:
-        response = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd')
-        return response.json()['litecoin']['usd']
+        r = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd')
+        return r.json()['litecoin']['usd']
     except:
-        return 0  # fallback
+        return 0
 
 def calculate_ltc_amount(total_usd):
     price = get_ltc_price()
@@ -86,17 +90,19 @@ def get_public_reviews(limit=5):
     return [r[0] for r in rows]
 
 def main_menu_keyboard(is_admin=False):
-    keyboard = [
+    kb = [
         [KeyboardButton("Products"), KeyboardButton("Basket")],
         [KeyboardButton("Reviews")]
     ]
     if is_admin:
-        keyboard.append([KeyboardButton("Admin Panel")])
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        kb.append([KeyboardButton("Admin Panel")])
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    is_admin = user_id in ADMIN_IDS
+# ────────────────────────────────────────────────
+# START
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    is_admin = uid in ADMIN_IDS
     reviews = get_public_reviews()
     review_text = "\n\nPublic Reviews:\n" + "\n".join(f"• {r}" for r in reviews) if reviews else ""
     await update.message.reply_text(
@@ -104,7 +110,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=main_menu_keyboard(is_admin)
     )
 
-async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ────────────────────────────────────────────────
+# PRODUCTS
+async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('SELECT id, name, price FROM products')
@@ -117,14 +125,14 @@ async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     for pid, name, price in products:
         kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Add to Basket", callback_data=f"add_{pid}"),
-                InlineKeyboardButton("View", callback_data=f"view_{pid}")
-            ],
+            [InlineKeyboardButton("Add to Basket", callback_data=f"add_{pid}"),
+             InlineKeyboardButton("View", callback_data=f"view_{pid}")],
             [InlineKeyboardButton("Back", callback_data="back_main")]
         ])
         await update.message.reply_text(f"• {name} — ${price:.2f}", reply_markup=kb)
 
+# ────────────────────────────────────────────────
+# CALLBACK HANDLER
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -233,13 +241,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Total: ${total:.2f}\n\n"
             "Items:\n" + "\n".join(f"• {n} × {q}" for n, q in items)
         )
-        await context.bot.send_message(CHANNEL_ID, msg)
+        try:
+            await context.bot.send_message(CHANNEL_ID, msg)
+        except Exception as e:
+            logger.error(f"Channel notify failed: {e}")
         await query.answer("Marked DISPATCHED + notified channel")
         await show_admin_orders(update, context)
 
     return ConversationHandler.END
 
-async def show_basket(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ────────────────────────────────────────────────
+# BASKET
+async def show_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     source = update.message or update.callback_query.message
 
@@ -258,16 +271,11 @@ async def show_basket(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await source.reply_text("Your basket is empty.", reply_markup=main_menu_keyboard(uid in ADMIN_IDS))
         return
 
-    total = 0
-    lines = ["Your Basket:\n"]
-    buttons = []
-    for pid, name, price, qty in items:
-        subtotal = price * qty
-        total += subtotal
-        lines.append(f"• {name} × {qty}  —  ${subtotal:.2f}")
-        buttons.append([InlineKeyboardButton(f"Remove {name}", callback_data=f"remove_{pid}")])
-
+    total = sum(price * qty for _, _, price, qty in items)
+    lines = ["Your Basket:\n"] + [f"• {name} × {qty}  —  ${price*qty:.2f}" for _, name, price, qty in items]
     lines.append(f"\nTotal: ${total:.2f}")
+
+    buttons = [[InlineKeyboardButton(f"Remove {name}", callback_data=f"remove_{pid}")] for pid, name, _, _ in items]
     buttons.extend([
         [InlineKeyboardButton("Proceed to Checkout", callback_data="checkout")],
         [InlineKeyboardButton("Back", callback_data="back_main")]
@@ -275,7 +283,9 @@ async def show_basket(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     await source.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
 
-async def show_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ────────────────────────────────────────────────
+# REVIEWS
+async def show_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reviews = get_public_reviews(10)
     text = "Recent Public Reviews:\n\n" + "\n".join(f"• {r}" for r in reviews) if reviews else "No reviews yet."
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="back_main")]])
@@ -289,7 +299,7 @@ async def add_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     pid = context.user_data.get("review_pid")
     if not pid:
-        await update.message.reply_text("Error. Try again.", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("Error. Try again.")
         return ConversationHandler.END
 
     uid = update.effective_user.id
@@ -302,6 +312,8 @@ async def add_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("Thank you! Review added.", reply_markup=main_menu_keyboard(uid in ADMIN_IDS))
     return ConversationHandler.END
 
+# ────────────────────────────────────────────────
+# CHECKOUT
 async def checkout_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
     if text in ("Cancel", "Back"):
@@ -328,7 +340,6 @@ async def checkout_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         (uid,)
     )
     total = c.fetchone()[0] or 0.0
-
     ltc_amount = calculate_ltc_amount(total)
 
     c.execute(
@@ -355,7 +366,9 @@ async def checkout_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
     return ConversationHandler.END
 
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ────────────────────────────────────────────────
+# ADMIN
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
         await update.message.reply_text("No access.")
@@ -420,12 +433,8 @@ async def admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     c = conn.cursor()
     c.execute(
         "INSERT INTO products (name, description, price, photo_id) VALUES (?, ?, ?, ?)",
-        (
-            context.user_data["prod_name"],
-            context.user_data["prod_desc"],
-            context.user_data["prod_price"],
-            photo_id
-        )
+        (context.user_data["prod_name"], context.user_data["prod_desc"],
+         context.user_data["prod_price"], photo_id)
     )
     conn.commit()
     conn.close()
@@ -433,7 +442,7 @@ async def admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     await update.message.reply_text("Product added successfully!", reply_markup=main_menu_keyboard(True))
     return ConversationHandler.END
 
-async def show_admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
         return
@@ -455,10 +464,12 @@ async def show_admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if status in ("pending", "paid"):
             buttons.append(InlineKeyboardButton("Mark DISPATCHED", callback_data=f"order_mark_dispatched_{oid}"))
 
-        kb = InlineKeyboardMarkup([buttons] if buttons else [], row_width=2)
+        kb = InlineKeyboardMarkup([buttons] if buttons else [])
         await update.message.reply_text(f"Order #{oid} — {status}", reply_markup=kb)
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ────────────────────────────────────────────────
+# MESSAGE HANDLER
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     uid = update.effective_user.id
     is_admin = uid in ADMIN_IDS
@@ -478,55 +489,51 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif text in ("Back", "Cancel"):
         await start(update, context)
 
+# ────────────────────────────────────────────────
+# MAIN
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    application = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, message_handler))
+    application.add_handler(CallbackQueryHandler(button_handler))
 
-    # Main menu buttons
-    app.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, message_handler))
-
-    # Callback buttons (add to basket, view, checkout, remove, etc.)
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    # Checkout flow
-    checkout_handler = ConversationHandler(
+    # Checkout conversation
+    application.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(button_handler)],
         states={
-            CHECKOUT_NAME:    [MessageHandler(filters.TEXT & \~filters.COMMAND, checkout_name)],
+            CHECKOUT_NAME: [MessageHandler(filters.TEXT & \~filters.COMMAND, checkout_name)],
             CHECKOUT_ADDRESS: [MessageHandler(filters.TEXT & \~filters.COMMAND, checkout_address)],
         },
         fallbacks=[],
         allow_reentry=True
-    )
-    app.add_handler(checkout_handler)
+    ))
 
-    # Review flow
-    review_handler = ConversationHandler(
+    # Review conversation
+    application.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(button_handler)],
         states={
             REVIEW_TEXT: [MessageHandler(filters.TEXT & \~filters.COMMAND, add_review_text)],
         },
         fallbacks=[],
         allow_reentry=True
-    )
-    app.add_handler(review_handler)
+    ))
 
-    # Admin add product flow
-    product_handler = ConversationHandler(
+    # Admin add product conversation
+    application.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & \~filters.COMMAND, message_handler)],
         states={
-            ADMIN_NAME:  [MessageHandler(filters.TEXT & \~filters.COMMAND, admin_name)],
-            ADMIN_DESC:  [MessageHandler(filters.TEXT & \~filters.COMMAND, admin_desc)],
+            ADMIN_NAME: [MessageHandler(filters.TEXT & \~filters.COMMAND, admin_name)],
+            ADMIN_DESC: [MessageHandler(filters.TEXT & \~filters.COMMAND, admin_desc)],
             ADMIN_PRICE: [MessageHandler(filters.TEXT & \~filters.COMMAND, admin_price)],
             ADMIN_PHOTO: [MessageHandler(filters.PHOTO | (filters.TEXT & \~filters.COMMAND), admin_photo)],
         },
         fallbacks=[],
         allow_reentry=True
-    )
-    app.add_handler(product_handler)
+    ))
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("Bot starting...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
