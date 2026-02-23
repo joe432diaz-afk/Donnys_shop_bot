@@ -345,6 +345,28 @@ async def admin_product_manager_trigger(update: Update, context: ContextTypes.DE
             "🔧 Product Manager",
             reply_markup=keyboard
         )
+# ----------------------------
+# STEP 3 FUNCTIONS GO HERE
+# ----------------------------
 
+async def admin_add_product_photo(...):
+    pass
+
+async def admin_add_product_name(...):
+    pass
+
+async def admin_add_product_price(...):
+    pass
+
+async def admin_add_product_desc(...):
+    pass
+
+
+# ----------------------------
+# MAIN FUNCTION (DO NOT PUT ABOVE)
+# ----------------------------
+
+def main():
+    init_db()
 if __name__ == "__main__":
     main()
