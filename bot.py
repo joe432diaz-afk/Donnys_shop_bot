@@ -343,11 +343,13 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(checkout_conv)
     app.add_handler(CallbackQueryHandler(router))
 
-    print("Advanced Shop Running...")
+    print("Bot running...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
