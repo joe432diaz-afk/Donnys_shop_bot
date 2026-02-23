@@ -1,115 +1,376 @@
-import logging
-import sqlite3
-import requests
-import os
+# ================================
+# COMMERCIAL TELEGRAM SHOP BOT
+# ================================
+
 import asyncio
+import aiosqlite
+import random
+import string
+import json
 from telegram import (
-    InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup,
-    KeyboardButton, Update
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
 )
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, filters, Application
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
 )
-from fastapi import FastAPI, Request, Response
-import uvicorn
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ================= CONFIG =================
 
-TOKEN = os.environ.get("TOKEN")
-if not TOKEN:
-    raise ValueError("TOKEN not set in Railway Variables!")
+TOKEN = "TOKEN"
+CHANNEL_ID = -1000000000000
+ADMIN_IDS = {7773622161}
 
-ADMIN_IDS = [7773622161]
-CHANNEL_ID = -1001234567890           # CHANGE TO REAL
-LTC_ADDRESS = 'YOUR_FIXED_LITECOIN_ADDRESS'  # CHANGE THIS
+DB = "shop.db"
+LTC_RATE = 0.01
 
-DB_FILE = 'bot.db'
+# ================= UTILITIES =================
 
-# (keep init_db(), get_ltc_price(), calculate_ltc_amount(), get_public_reviews(), main_menu_keyboard() exactly as before)
+def generate_order_id():
+    return "ORD-" + "".join(
+        random.choices(string.ascii_uppercase + string.digits, k=10)
+    )
 
-# (keep ALL your async def functions: start, show_products, button_handler, show_basket, show_reviews, add_review_text, checkout_name, checkout_address, admin_panel, admin_add_start, admin_name, admin_desc, admin_price, admin_photo, show_admin_orders, message_handler)
+def is_admin(uid):
+    return uid in ADMIN_IDS
 
-# They are the same as in previous versions — copy them from your file or my last message
+# ================= DATABASE =================
 
-async def main():
-    application = Application.builder().token(TOKEN).build()
+async def init_db():
+    async with aiosqlite.connect(DB) as db:
 
-    # Add all handlers (copy from your polling version)
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, message_handler))
-    application.add_handler(CallbackQueryHandler(button_handler))
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS products(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            description TEXT,
+            price REAL,
+            photo BLOB
+        )
+        """)
 
-    application.add_handler(ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler)],
-        states={
-            CHECKOUT_NAME: [MessageHandler(filters.TEXT & \~filters.COMMAND, checkout_name)],
-            CHECKOUT_ADDRESS: [MessageHandler(filters.TEXT & \~filters.COMMAND, checkout_address)],
-        },
-        fallbacks=[],
-        allow_reentry=True
-    ))
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS basket(
+            user_id INTEGER,
+            product_id INTEGER,
+            quantity INTEGER
+        )
+        """)
 
-    application.add_handler(ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler)],
-        states={
-            REVIEW_TEXT: [MessageHandler(filters.TEXT & \~filters.COMMAND, add_review_text)],
-        },
-        fallbacks=[],
-        allow_reentry=True
-    ))
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS orders(
+            order_id TEXT,
+            user_id INTEGER,
+            name TEXT,
+            address TEXT,
+            items TEXT,
+            total REAL,
+            status TEXT
+        )
+        """)
 
-    application.add_handler(ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & \~filters.COMMAND, message_handler)],
-        states={
-            ADMIN_NAME: [MessageHandler(filters.TEXT & \~filters.COMMAND, admin_name)],
-            ADMIN_DESC: [MessageHandler(filters.TEXT & \~filters.COMMAND, admin_desc)],
-            ADMIN_PRICE: [MessageHandler(filters.TEXT & \~filters.COMMAND, admin_price)],
-            ADMIN_PHOTO: [MessageHandler(filters.PHOTO | (filters.TEXT & \~filters.COMMAND), admin_photo)],
-        },
-        fallbacks=[],
-        allow_reentry=True
-    ))
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS reviews(
+            user_id INTEGER,
+            text TEXT
+        )
+        """)
 
-    await application.initialize()
-    await application.start()
+        await db.commit()
 
-    # Set webhook
-    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
-    if not domain:
-        logger.error("No RAILWAY_PUBLIC_DOMAIN — webhook can't be set")
+async def db_fetch(query, params=()):
+    async with aiosqlite.connect(DB) as db:
+        cursor = await db.execute(query, params)
+        return await cursor.fetchall()
+
+async def db_fetchone(query, params=()):
+    async with aiosqlite.connect(DB) as db:
+        cursor = await db.execute(query, params)
+        return await cursor.fetchone()
+
+async def db_execute(query, params=()):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(query, params)
+        await db.commit()
+
+# ================= KEYBOARDS =================
+
+def main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 Products", "products")],
+        [InlineKeyboardButton("🧺 Basket", "basket")],
+        [InlineKeyboardButton("⭐ Reviews", "reviews")],
+        [InlineKeyboardButton("🔧 Admin", "admin")]
+    ])
+
+def back(target):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅ Back", target)]
+    ])
+
+# ================= START =================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🛍 Commercial Shop Bot",
+        reply_markup=main_menu()
+    )
+
+# ================= ROUTER =================
+
+async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    query = update.callback_query
+    if not query:
         return
 
-    webhook_url = f"https://{domain}/{TOKEN}"
-    await application.bot.set_webhook(
-        url=webhook_url,
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
-    )
-    logger.info(f"Webhook set to {webhook_url}")
+    try:
+        await query.answer()
+    except:
+        pass
 
-    # FastAPI app
-    fastapi_app = FastAPI()
+    uid = query.from_user.id
+    data = query.data
 
-    @fastapi_app.post(f"/{TOKEN}")
-    async def webhook(request: Request):
-        try:
-            json_data = await request.json()
-            update = Update.de_json(json_data, application.bot)
-            if update:
-                await application.process_update(update)
-            return Response(status_code=200)
-        except Exception as e:
-            logger.error(f"Webhook error: {e}")
-            return Response(status_code=500)
+    # MAIN
+    if data == "main":
+        await query.edit_message_text("Main Menu", reply_markup=main_menu())
+        return
 
-    @fastapi_app.get("/")
-    async def health():
-        return {"status": "Bot webhook active"}
+    # PRODUCTS
+    if data == "products":
+        products = await db_fetch("SELECT id,name,price FROM products")
 
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run("bot:fastapi_app", host="0.0.0.0", port=port, log_level="info", factory=True)
+        if not products:
+            await query.edit_message_text(
+                "No products available",
+                reply_markup=back("main")
+            )
+            return
+
+        buttons = []
+        for p in products:
+            buttons.append([
+                InlineKeyboardButton(
+                    f"{p[1]} - ${p[2]}",
+                    callback_data=f"product:{p[0]}"
+                )
+            ])
+        buttons.append([InlineKeyboardButton("⬅ Back", "main")])
+
+        await query.edit_message_text(
+            "Products:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # PRODUCT DETAIL
+    if data.startswith("product:"):
+        pid = int(data.split(":")[1])
+        context.user_data["product_id"] = pid
+
+        product = await db_fetchone(
+            "SELECT name,description,price FROM products WHERE id=?",
+            (pid,)
+        )
+
+        if not product:
+            return
+
+        name, desc, price = product
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add", "addbasket")],
+            [InlineKeyboardButton("⬅ Back", "products")]
+        ])
+
+        await query.edit_message_text(
+            f"{name}\n\n{desc}\nPrice: ${price}",
+            reply_markup=kb
+        )
+        return
+
+    # ADD TO BASKET
+    if data == "addbasket":
+        pid = context.user_data.get("product_id")
+        if not pid:
+            return
+
+        await db_execute("""
+        INSERT INTO basket(user_id,product_id,quantity)
+        VALUES(?,?,1)
+        """,(uid,pid))
+
+        await query.answer("Added to basket", show_alert=True)
+        return
+
+    # BASKET
+    if data == "basket":
+        rows = await db_fetch(
+            "SELECT product_id,quantity FROM basket WHERE user_id=?",
+            (uid,)
+        )
+
+        if not rows:
+            await query.edit_message_text(
+                "Basket empty",
+                reply_markup=back("main")
+            )
+            return
+
+        total = 0
+        text = "🧺 Basket\n\n"
+
+        for pid, qty in rows:
+            prod = await db_fetchone(
+                "SELECT name,price FROM products WHERE id=?",
+                (pid,)
+            )
+            if prod:
+                name, price = prod
+                subtotal = price * qty
+                total += subtotal
+                text += f"{name} x{qty} = ${subtotal}\n"
+
+        ltc = total * LTC_RATE
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Checkout", "checkout")],
+            [InlineKeyboardButton("⬅ Back", "main")]
+        ])
+
+        await query.edit_message_text(
+            text + f"\nTotal: ${total}\nLTC ≈ {ltc:.6f}",
+            reply_markup=kb
+        )
+        return
+
+    # CHECKOUT
+    if data == "checkout":
+        context.user_data["checkout_state"] = "name"
+        await query.edit_message_text(
+            "Enter your full name:",
+            reply_markup=back("basket")
+        )
+        return
+
+    # REVIEWS
+    if data == "reviews":
+        reviews = await db_fetch("SELECT text FROM reviews LIMIT 10")
+        text = "⭐ Reviews\n\n"
+        for r in reviews:
+            text += f"• {r[0]}\n"
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Add Review", "add_review")],
+            [InlineKeyboardButton("⬅ Back", "main")]
+        ])
+
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    # ADMIN
+    if data == "admin":
+        if not is_admin(uid):
+            await query.answer("Admin only", show_alert=True)
+            return
+
+        await query.edit_message_text(
+            "Admin Panel",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("View Orders", "admin_orders")],
+                [InlineKeyboardButton("⬅ Back", "main")]
+            ])
+        )
+        return
+
+# ================= TEXT HANDLER =================
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    uid = update.message.from_user.id
+    text = update.message.text
+
+    state = context.user_data.get("checkout_state")
+
+    if state == "name":
+        context.user_data["name"] = text
+        context.user_data["checkout_state"] = "address"
+        await update.message.reply_text("Enter your address:")
+        return
+
+    if state == "address":
+        context.user_data["address"] = text
+
+        basket = await db_fetch(
+            "SELECT product_id,quantity FROM basket WHERE user_id=?",
+            (uid,)
+        )
+
+        total = 0
+        items = []
+
+        for pid, qty in basket:
+            prod = await db_fetchone(
+                "SELECT name,price FROM products WHERE id=?",
+                (pid,)
+            )
+            if prod:
+                name, price = prod
+                total += price * qty
+                items.append({"name": name, "qty": qty})
+
+        order_id = generate_order_id()
+
+        await db_execute("""
+        INSERT INTO orders(order_id,user_id,name,address,items,total,status)
+        VALUES(?,?,?,?,?,?,?)
+        """,(
+            order_id,
+            uid,
+            context.user_data["name"],
+            context.user_data["address"],
+            json.dumps(items),
+            total,
+            "pending"
+        ))
+
+        await db_execute("DELETE FROM basket WHERE user_id=?", (uid,))
+
+        ltc = total * LTC_RATE
+
+        await update.message.reply_text(
+            f"Order Created!\n\nOrder ID: {order_id}\n"
+            f"Total: ${total}\n"
+            f"Pay LTC ≈ {ltc:.6f}"
+        )
+
+        await update.message.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=f"New Order\nID: {order_id}\nUser: {uid}\nTotal: ${total}"
+        )
+
+        context.user_data.clear()
+
+# ================= MAIN =================
+
+async def main():
+    await init_db()
+
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(router))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    print("Commercial bot running...")
+    await app.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
