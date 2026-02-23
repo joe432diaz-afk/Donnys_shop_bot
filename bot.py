@@ -23,7 +23,7 @@ from telegram.ext import (
 
 # ================= CONFIG =================
 
-TOKEN = "TOKEN"
+TOKEN = "8383232415:AAGDzTvKSird6CCg4NyXHnwpim4KN6q24WQ"
 CHANNEL_ID = -1000000000000
 ADMIN_IDS = {7773622161}
 
