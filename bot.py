@@ -11,17 +11,16 @@ from telegram.ext import *
 # ================= CONFIG =================
 
 TOKEN = "TOKEN"
-CHANNEL_ID = "PUT_CHANNEL_ID"
+CHANNEL_ID = -1000000000000
 
 ADMIN_IDS = {7773622161}
 
 LTC_RATE = 0.01
-
-DB_FILE = "shop.db"
+DB = "shop.db"
 
 # ================= UTILITIES =================
 
-def generate_order_id():
+def generate_order():
     return "ORD-" + "".join(
         random.choices(string.ascii_uppercase + string.digits, k=10)
     )
@@ -32,7 +31,7 @@ def is_admin(uid):
 # ================= DATABASE =================
 
 async def init_db():
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB) as db:
 
         await db.execute("""
         CREATE TABLE IF NOT EXISTS products(
@@ -88,17 +87,18 @@ def back_btn(target="main"):
         [InlineKeyboardButton("⬅ Back", callback_data=target)]
     ])
 
-# ================= COMMAND START =================
+# ================= START =================
 
 async def start(update: Update, context):
     await update.message.reply_text(
-        "🛍 Elite Shop Bot",
+        "🛍 Shop Bot Ready",
         reply_markup=main_menu()
     )
 
-# ================= MENU ROUTER =================
+# ================= ROUTER =================
 
-async def callback_router(update: Update, context):
+async def router(update: Update, context):
+
     query = update.callback_query
     await query.answer()
 
@@ -115,21 +115,33 @@ async def callback_router(update: Update, context):
     # ---------- PRODUCTS ----------
     elif data == "products":
 
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB) as db:
+
             cursor = await db.execute(
                 "SELECT id,name,price FROM products"
             )
+
             products = await cursor.fetchall()
 
+        if not products:
+            await query.edit_message_text(
+                "No products available",
+                reply_markup=back_btn()
+            )
+            return
+
         buttons = [
-            [InlineKeyboardButton(f"{p[1]} - ${p[2]}", callback_data=f"product:{p[0]}")]
+            [InlineKeyboardButton(
+                f"{p[1]} - ${p[2]}",
+                callback_data=f"product:{p[0]}"
+            )]
             for p in products
         ]
 
         buttons.append([InlineKeyboardButton("⬅ Back","main")])
 
         await query.edit_message_text(
-            "Products List",
+            "Products:",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
@@ -138,19 +150,21 @@ async def callback_router(update: Update, context):
 
         pid = int(data.split(":")[1])
 
-        async with aiosqlite.connect(DB_FILE) as db:
+        context.user_data["product_id"] = pid
+
+        async with aiosqlite.connect(DB) as db:
+
             cursor = await db.execute(
                 "SELECT name,description,price,photo FROM products WHERE id=?",
                 (pid,)
             )
+
             product = await cursor.fetchone()
 
         if not product:
             return
 
         name, desc, price, photo = product
-
-        context.user_data["product_id"] = pid
 
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add Basket","addbasket")],
@@ -168,7 +182,7 @@ async def callback_router(update: Update, context):
 
         uid = query.from_user.id
 
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB) as db:
 
             cursor = await db.execute(
                 "SELECT product_id,quantity FROM basket WHERE user_id=?",
@@ -177,24 +191,26 @@ async def callback_router(update: Update, context):
 
             rows = await cursor.fetchall()
 
-            if not rows:
-                await query.edit_message_text(
-                    "Basket empty",
-                    reply_markup=back_btn()
-                )
-                return
+        if not rows:
+            await query.edit_message_text(
+                "Basket empty",
+                reply_markup=back_btn()
+            )
+            return
 
-            total = 0
-            text = "🧺 Basket\n\n"
+        total = 0
+        text = "🧺 Basket\n\n"
+
+        async with aiosqlite.connect(DB) as db:
 
             for pid, qty in rows:
 
-                cursor2 = await db.execute(
+                cursor = await db.execute(
                     "SELECT name,price FROM products WHERE id=?",
                     (pid,)
                 )
 
-                prod = await cursor2.fetchone()
+                prod = await cursor.fetchone()
 
                 if prod:
                     name, price = prod
@@ -202,39 +218,39 @@ async def callback_router(update: Update, context):
                     total += subtotal
                     text += f"{name} x{qty} = ${subtotal}\n"
 
-            ltc = total * LTC_RATE
+        ltc = total * LTC_RATE
 
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Checkout","checkout")],
-                [InlineKeyboardButton("⬅ Back","main")]
-            ])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Checkout","checkout")],
+            [InlineKeyboardButton("⬅ Back","main")]
+        ])
 
-            await query.edit_message_text(
-                text + f"\nTotal: ${total}\nLTC ≈ {ltc:.6f}",
-                reply_markup=kb
-            )
+        await query.edit_message_text(
+            text + f"\nTotal: ${total}\nLTC ≈ {ltc:.6f}",
+            reply_markup=kb
+        )
 
     # ---------- ADMIN ----------
     elif data == "admin":
 
-        if not is_admin(query.from_user.id):
+        if not is_admin(uid):
             await query.answer("Admin only", show_alert=True)
             return
 
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Create Product","admin_create")],
             [InlineKeyboardButton("📦 Orders","admin_orders")],
             [InlineKeyboardButton("⬅ Back","main")]
         ])
 
         await query.edit_message_text(
-            "Admin Dashboard",
+            "Admin Panel",
             reply_markup=kb
         )
 
-# ================= BASKET ACTION =================
+# ================= BASKET ADD =================
 
 async def add_basket(update: Update, context):
+
     query = update.callback_query
     await query.answer()
 
@@ -244,7 +260,7 @@ async def add_basket(update: Update, context):
     if not pid:
         return
 
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB) as db:
 
         await db.execute("""
         INSERT INTO basket(user_id,product_id,quantity)
@@ -253,9 +269,9 @@ async def add_basket(update: Update, context):
 
         await db.commit()
 
-    await query.answer("Added!", show_alert=True)
+    await query.answer("Added to basket", show_alert=True)
 
-# ================= BOT BUILD =================
+# ================= MAIN APP =================
 
 async def main():
 
@@ -265,10 +281,10 @@ async def main():
 
     app.add_handler(CommandHandler("start", start))
 
-    app.add_handler(CallbackQueryHandler(callback_router))
+    app.add_handler(CallbackQueryHandler(router))
     app.add_handler(CallbackQueryHandler(add_basket, pattern="addbasket"))
 
-    print("Production Shop Bot Running")
+    print("Bot running...")
     await app.run_polling()
 
 if __name__ == "__main__":
