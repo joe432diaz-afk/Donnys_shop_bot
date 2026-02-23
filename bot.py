@@ -22,16 +22,10 @@ from telegram.ext import (
 
 TOKEN = os.environ.get("TOKEN") or "PUT_YOUR_TOKEN_HERE"
 
-ADMINS = {7773622161}   # CHANGE THIS
+# ✅ YOUR ADMIN ID
+ADMINS = {7773622161}
 
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
-
-# ================= SESSION STORAGE =================
-
-USER_SESSIONS = {}
-ADMIN_SESSIONS = {}
-USER_PRODUCT_PAGE = {}
-USER_BASKET = {}
 
 # ================= DATABASE =================
 
@@ -53,6 +47,12 @@ price_56 REAL
 """)
 
 db.commit()
+
+# ================= SESSION STORAGE =================
+
+USER_BASKET = {}
+ADMIN_SESSIONS = {}
+USER_PRODUCT_PAGE = {}
 
 # ================= HELPERS =================
 
@@ -81,6 +81,13 @@ def home_menu():
         [InlineKeyboardButton("🧺 View Basket", callback_data="view_basket")]
     ])
 
+def admin_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
+        [InlineKeyboardButton("📦 View Products", callback_data="admin_view_products")],
+        [InlineKeyboardButton("⬅ Back", callback_data="admin_back")]
+    ])
+
 # ================= START =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -89,9 +96,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=home_menu()
     )
 
-# ================= PRODUCT PAGE =================
+# ================= ADMIN COMMAND =================
 
-async def show_products(update, context, uid, page=0):
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    uid = update.effective_user.id
+
+    if uid not in ADMINS:
+        await update.message.reply_text("❌ Not authorised.")
+        return
+
+    await update.message.reply_text(
+        "🛠 ADMIN PANEL",
+        reply_markup=admin_menu()
+    )
+
+# ================= PRODUCT DISPLAY =================
+
+async def show_products(update, uid, page=0):
 
     products = get_products()
 
@@ -118,16 +140,14 @@ async def show_products(update, context, uid, page=0):
 
     buttons = []
 
-    # Weight buttons
-    for w, price in weights.items():
+    for w in weights:
         buttons.append([
             InlineKeyboardButton(
-                f"{w}g £{price}",
+                f"{w}g £{weights[w]}",
                 callback_data=f"add_{p[0]}_{w}"
             )
         ])
 
-    # Navigation
     nav = []
 
     if page > 0:
@@ -170,7 +190,7 @@ async def show_products(update, context, uid, page=0):
 
 # ================= BASKET =================
 
-async def add_to_basket(update, context, uid, product_id, weight):
+async def add_to_basket(update, uid, product_id, weight):
 
     cur.execute("SELECT * FROM products WHERE id=?", (product_id,))
     product = cur.fetchone()
@@ -203,7 +223,7 @@ async def add_to_basket(update, context, uid, product_id, weight):
     text, total = basket_text(uid)
 
     await update.callback_query.edit_message_text(
-        f"🧺 Basket Updated\n\n{text}\n💰 Total £{total}",
+        f"🧺 Basket\n\n{text}\n💰 Total £{total}",
         reply_markup=home_menu()
     )
 
@@ -217,31 +237,27 @@ async def callback_router(update, context):
     data = q.data
     uid = q.from_user.id
 
-    # Home products
     if data == "home_products":
-        await show_products(update, context, uid, 0)
+        await show_products(update, uid, 0)
         return
 
-    # Basket view
     if data == "view_basket":
         text, total = basket_text(uid)
 
         await q.edit_message_text(
-            f"🧺 Your Basket\n\n{text}\n💰 Total £{total}",
+            f"🧺 Basket\n\n{text}\n💰 Total £{total}",
             reply_markup=home_menu()
         )
         return
 
-    # Pagination
     if data.startswith("prod_page_"):
         page = int(data.split("_")[-1])
-        await show_products(update, context, uid, page)
+        await show_products(update, uid, page)
         return
 
-    # Add product to basket
     if data.startswith("add_"):
         _, pid, weight = data.split("_")
-        await add_to_basket(update, context, uid, pid, weight)
+        await add_to_basket(update, uid, pid, weight)
         return
 
     if data == "back":
@@ -251,6 +267,100 @@ async def callback_router(update, context):
         )
         return
 
+    if data == "admin_back":
+        if uid in ADMINS:
+            await q.edit_message_text(
+                "🛠 ADMIN PANEL",
+                reply_markup=admin_menu()
+            )
+        return
+
+    if data.startswith("admin_") and uid not in ADMINS:
+        await q.answer("Not authorised", show_alert=True)
+        return
+
+    if data == "admin_add_product":
+        ADMIN_SESSIONS[uid] = {"step": "name"}
+        await q.message.reply_text("🆕 Send product NAME:")
+        return
+
+    if data == "admin_view_products":
+        await q.edit_message_text(
+            "Feature coming soon",
+            reply_markup=admin_menu()
+        )
+        return
+
+# ================= MESSAGE HANDLER =================
+
+async def message_handler(update, context):
+
+    uid = update.message.from_user.id
+    text = update.message.text
+
+    if uid in ADMIN_SESSIONS:
+
+        admin = ADMIN_SESSIONS[uid]
+        step = admin.get("step")
+
+        if step == "name":
+            admin["name"] = text
+            admin["step"] = "desc"
+
+            await update.message.reply_text("📝 Send description:")
+            return
+
+        if step == "desc":
+            admin["desc"] = text
+            admin["step"] = "photo"
+
+            await update.message.reply_text("📷 Send photo:")
+            return
+
+        if step == "photo":
+
+            if not update.message.photo:
+                await update.message.reply_text("❌ Send image photo.")
+                return
+
+            admin["photo_file_id"] = update.message.photo[-1].file_id
+            admin["step"] = "prices"
+
+            await update.message.reply_text("💰 Send prices:\n3.5,7,14,28,56")
+            return
+
+        if step == "prices":
+
+            try:
+                prices = list(map(float, text.split(",")))
+                if len(prices) != 5:
+                    raise ValueError
+
+            except:
+                await update.message.reply_text("❌ Format must be:\n3.5,7,14,28,56")
+                return
+
+            pid = admin["name"].lower().replace(" ", "_")
+
+            cur.execute("""
+            INSERT OR REPLACE INTO products VALUES (?,?,?,?,?,?,?,?,?)
+            """, (
+                pid,
+                admin["name"],
+                admin["desc"],
+                admin["photo_file_id"],
+                *prices
+            ))
+
+            db.commit()
+            ADMIN_SESSIONS.pop(uid, None)
+
+            await update.message.reply_text(
+                "✅ Product added!",
+                reply_markup=home_menu()
+            )
+            return
+
 # ================= APP =================
 
 def main():
@@ -258,7 +368,10 @@ def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+
     app.add_handler(CallbackQueryHandler(callback_router))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, message_handler))
 
     print("✅ BOT RUNNING")
     app.run_polling()
