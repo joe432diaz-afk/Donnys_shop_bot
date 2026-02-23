@@ -23,7 +23,7 @@ from telegram.ext import (
 TOKEN = os.environ.get("TOKEN") or "PUT_YOUR_TOKEN_HERE"
 
 # 🔒 CHANGE THIS TO YOUR TELEGRAM USER ID
-ADMINS = { }
+ADMINS = {7773622161}
 
 CRYPTO_WALLET = "LTC1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 CONTACT_CHANNEL_ID = "@YourChannelOrPM"
