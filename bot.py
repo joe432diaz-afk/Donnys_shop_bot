@@ -366,7 +366,47 @@ async def admin_add_product_desc(...):
 # MAIN FUNCTION (DO NOT PUT ABOVE)
 # ----------------------------
 
-def main():
+def main(app = ApplicationBuilder().token(TOKEN).build()
+admin_conv = ConversationHandler(
+    entry_points=[
+        CallbackQueryHandler(
+            admin_add_product_photo,
+            pattern="^admin_add_product$"
+        )
+    ],
+
+    states={
+        ADMIN_ADD_PHOTO: [
+            MessageHandler(filters.PHOTO, admin_add_product_photo)
+        ],
+
+        ADMIN_ADD_NAME: [
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                admin_add_product_name
+            )
+        ],
+
+        ADMIN_ADD_PRICE: [
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                admin_add_product_price
+            )
+        ],
+
+        ADMIN_ADD_DESC: [
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                admin_add_product_desc
+            )
+        ]
+    },
+
+    fallbacks=[]
+)
+
+app.add_handler(admin_conv)
+):
     init_db()
 if __name__ == "__main__":
     main()
