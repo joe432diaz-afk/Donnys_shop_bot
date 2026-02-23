@@ -2,7 +2,6 @@ import asyncio
 import aiosqlite
 import random
 import string
-import json
 
 from telegram import *
 from telegram.ext import *
@@ -26,12 +25,7 @@ def generate_order():
 def is_admin(uid):
     return uid in ADMIN_IDS
 
-# ================= DATABASE SAFE ACCESS =================
-
-async def db_execute(query, params=()):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute(query, params)
-        await db.commit()
+# ================= DATABASE HELPERS =================
 
 async def db_fetch(query, params=()):
     async with aiosqlite.connect(DB) as db:
@@ -43,13 +37,17 @@ async def db_fetchone(query, params=()):
         cursor = await db.execute(query, params)
         return await cursor.fetchone()
 
+async def db_execute(query, params=()):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(query, params)
+        await db.commit()
+
 # ================= KEYBOARDS =================
 
 def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🛒 Products","products")],
         [InlineKeyboardButton("🧺 Basket","basket")],
-        [InlineKeyboardButton("⭐ Reviews","reviews")],
         [InlineKeyboardButton("🔧 Admin","admin")]
     ])
 
@@ -57,16 +55,15 @@ def main_menu():
 
 async def start(update: Update, context):
     await update.message.reply_text(
-        "🛍 Commercial Shop Bot",
+        "🛍 Shop Bot Ready",
         reply_markup=main_menu()
     )
 
-# ================= CALLBACK ROUTER (SAFE) =================
+# ================= CALLBACK ROUTER =================
 
 async def router(update: Update, context):
 
     query = update.callback_query
-
     if not query:
         return
 
@@ -78,7 +75,7 @@ async def router(update: Update, context):
     uid = query.from_user.id
     data = query.data
 
-    # ---------- MAIN ----------
+    # MAIN MENU
     if data == "main":
         await query.edit_message_text(
             "Main Menu",
@@ -86,21 +83,12 @@ async def router(update: Update, context):
         )
         return
 
-    # ---------- PRODUCTS ----------
+    # PRODUCTS LIST
     if data == "products":
 
         products = await db_fetch(
             "SELECT id,name,price FROM products"
         )
-
-        if not products:
-            await query.edit_message_text(
-                "No products",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅ Back","main")]
-                ])
-            )
-            return
 
         buttons = [
             [InlineKeyboardButton(
@@ -118,14 +106,10 @@ async def router(update: Update, context):
         )
         return
 
-    # ---------- PRODUCT DETAIL ----------
+    # PRODUCT DETAIL
     if data.startswith("product:"):
 
-        try:
-            pid = int(data.split(":")[1])
-        except:
-            return
-
+        pid = int(data.split(":")[1])
         context.user_data["product_id"] = pid
 
         product = await db_fetchone(
@@ -150,24 +134,13 @@ async def router(update: Update, context):
         )
         return
 
-    # ---------- BASKET ----------
+    # BASKET
     if data == "basket":
-
-        uid = query.from_user.id
 
         rows = await db_fetch(
             "SELECT product_id,quantity FROM basket WHERE user_id=?",
             (uid,)
         )
-
-        if not rows:
-            await query.edit_message_text(
-                "Basket empty",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅ Back","main")]
-                ])
-            )
-            return
 
         total = 0
         text = "🧺 Basket\n\n"
@@ -190,13 +163,12 @@ async def router(update: Update, context):
         await query.edit_message_text(
             text + f"\nTotal: ${total}\nLTC ≈ {ltc:.6f}",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Checkout","checkout")],
                 [InlineKeyboardButton("⬅ Back","main")]
             ])
         )
         return
 
-    # ---------- ADMIN ----------
+    # ADMIN PANEL
     if data == "admin":
 
         if not is_admin(uid):
@@ -204,19 +176,19 @@ async def router(update: Update, context):
             return
 
         await query.edit_message_text(
-            "Admin Panel",
+            "Admin Panel\n\nProducts are manually managed in database.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📦 Orders","admin_orders")],
                 [InlineKeyboardButton("⬅ Back","main")]
             ])
         )
-        return
 
-# ================= BASKET ADD =================
+# ================= ADD BASKET =================
 
-async def add_basket(update: Update, context):
+async def addbasket(update: Update, context):
 
     query = update.callback_query
+    if not query:
+        return
 
     try:
         await query.answer()
@@ -234,9 +206,9 @@ async def add_basket(update: Update, context):
     VALUES(?,?,1)
     """,(uid,pid))
 
-    await query.answer("Added to basket", show_alert=True)
+    await query.answer("Added!", show_alert=True)
 
-# ================= APP =================
+# ================= MAIN =================
 
 async def main():
 
@@ -244,9 +216,9 @@ async def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(router))
-    app.add_handler(CallbackQueryHandler(add_basket, pattern="addbasket"))
+    app.add_handler(CallbackQueryHandler(addbasket, pattern="addbasket"))
 
-    print("✅ Commercial Shop Bot Running")
+    print("Bot running...")
     await app.run_polling()
 
 if __name__ == "__main__":
