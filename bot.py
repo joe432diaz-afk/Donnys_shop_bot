@@ -73,9 +73,10 @@ def basket_text(items):
     total = 0
     text = ""
     for i in items:
-        cost = i["price"] * i.get("quantity", 1)
+        qty = i.get("quantity", 1)
+        cost = i["price"] * qty
         total += cost
-        text += f"- {i['name']} {i['weight']}g x{i.get('quantity',1)} = £{cost:.2f}\n"
+        text += f"- {i['name']} {i['weight']}g x{qty} = £{cost:.2f}\n"
     return text, total
 
 def product_rating(product_name):
@@ -147,8 +148,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== Product navigation =====
     if data.startswith("prod_page_"):
-        page = int(data.replace("prod_page_", ""))
-        await show_product_page(update, context, uid, page)
+        try:
+            page = int(data.replace("prod_page_", ""))
+            await show_product_page(update, context, uid, page)
+        except:
+            await q.edit_message_text("Invalid page", reply_markup=home_menu())
         return
 
     if data.startswith("weight_"):
@@ -160,7 +164,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p = products[page]
         weight = data.replace("weight_", "")
         prices = {"3.5": p[4], "7": p[5], "14": p[6], "28": p[7], "56": p[8]}
-        if weight not in prices:
+        if weight not in prices or prices[weight] is None:
             await q.answer("Invalid weight", show_alert=True)
             return
 
@@ -181,8 +185,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== User orders =====
     if data.startswith("my_orders_"):
-        page = int(data.split("_")[-1])
-        await show_user_order(update, context, uid, page)
+        try:
+            page = int(data.split("_")[-1])
+            await show_user_order(update, context, uid, page)
+        except:
+            await q.edit_message_text("Invalid order page", reply_markup=home_menu())
         return
 
     if data.startswith("review_"):
@@ -214,8 +221,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "admin_orders_0" or data.startswith("admin_orders_"):
-        page = int(data.split("_")[-1]) if data != "admin_orders_0" else 0
-        await show_admin_orders(update, context, uid, page)
+        try:
+            page = int(data.split("_")[-1]) if data != "admin_orders_0" else 0
+            await show_admin_orders(update, context, uid, page)
+        except:
+            await q.edit_message_text("Invalid orders page", reply_markup=home_menu())
         return
 
     if data.startswith("paid_"):
@@ -224,8 +234,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur.execute("UPDATE orders SET status='Paid' WHERE order_id=?", (oid,))
             db.commit()
             await q.edit_message_text(f"✅ Order {oid} marked PAID")
-        except:
-            await q.answer("Error updating order", show_alert=True)
+        except Exception as e:
+            await q.answer(f"Error: {str(e)}", show_alert=True)
         return
 
     if data.startswith("dispatch_"):
@@ -234,11 +244,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur.execute("UPDATE orders SET status='Dispatched' WHERE order_id=?", (oid,))
             db.commit()
             await q.edit_message_text(f"📦 Order {oid} DISPATCHED")
-        except:
-            await q.answer("Error updating order", show_alert=True)
+        except Exception as e:
+            await q.answer(f"Error: {str(e)}", show_alert=True)
         return
 
-    # fallback
     await q.answer("Unknown action", show_alert=True)
 
 # ================= PRODUCTS =================
@@ -271,19 +280,17 @@ async def show_product_page(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     markup = InlineKeyboardMarkup(buttons)
     caption = f"📦 {p[1]}\n{rating}\n\n{p[2]}\n\nChoose weight:"
 
+    q = update.callback_query
     try:
         if p[3]:
-            await update.callback_query.edit_message_media(
+            await q.edit_message_media(
                 media=InputMediaPhoto(media=p[3], caption=caption),
                 reply_markup=markup
             )
         else:
-            await update.callback_query.edit_message_text(caption, reply_markup=markup)
+            await q.edit_message_text(caption, reply_markup=markup)
     except Exception as e:
-        await update.callback_query.edit_message_text(f"Error displaying product:\n{str(e)}", reply_markup=home_menu())
-
-# (the rest of the functions — show_user_order, show_all_reviews, show_admin_orders, message_handler — remain almost the same,
-#  just added a few try/except + existence checks for safety)
+        await q.edit_message_text(f"Error displaying product:\n{str(e)[:200]}", reply_markup=home_menu())
 
 # ================= USER ORDERS =================
 async def show_user_order(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, page: int):
@@ -318,7 +325,7 @@ async def show_user_order(update: Update, context: ContextTypes.DEFAULT_TYPE, ui
     buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
 
     await update.callback_query.edit_message_text(
-        f"🧾 Order #{oid}\n{name or '?'}\n{address or '?'}\n{items_text}\n💰 £{total:.2f}\n📌 {status}",
+        f"🧾 Order #{oid}\n{name or '?'}\n{address or '?'}\n\n{items_text}\n\n💰 £{total:.2f}\n📌 {status}",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -336,7 +343,7 @@ async def show_all_reviews(update: Update):
         return
 
     text = "\n\n".join([f"{'⭐' * s}\n{t}" for s, t in reviews])
-    await update.callback_query.edit_message_text(text or "No reviews", reply_markup=home_menu())
+    await update.callback_query.edit_message_text(text or "No reviews yet.", reply_markup=home_menu())
 
 # ================= ADMIN ORDERS =================
 async def show_admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, page: int):
@@ -373,48 +380,52 @@ async def show_admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     buttons.append([InlineKeyboardButton("🏠 Back", callback_data="back")])
 
     await update.callback_query.edit_message_text(
-        f"🧾 Order #{oid}  (user {user_id})\n{name or '?'}\n{address or '?'}\n{items_text}\n💰 £{total:.2f}\n📌 {status}",
+        f"🧾 Order #{oid}  (user {user_id})\n{name or '?'}\n{address or '?'}\n\n{items_text}\n\n💰 £{total:.2f}\n📌 {status}",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 # ================= MESSAGE HANDLER =================
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    text = update.message.text.strip()
+
+    if update.message.text:
+        text = update.message.text.strip()
+    else:
+        text = None
 
     # ── Admin flows ──
     if uid in ADMIN_SESSIONS:
         admin = ADMIN_SESSIONS[uid]
         step = admin.get("step")
 
-        if step == "name":
+        if step == "name" and text:
             admin["name"] = text
             admin["step"] = "desc"
             await update.message.reply_text("📝 Description:")
             return
 
-        if step == "desc":
+        if step == "desc" and text:
             admin["desc"] = text
             admin["step"] = "photo"
-            await update.message.reply_text("📷 Send product PHOTO (as image, not URL):")
+            await update.message.reply_text("📷 Send product PHOTO (send as photo, not file or link):")
             return
 
         if step == "photo":
             if update.message.photo:
                 admin["photo_file_id"] = update.message.photo[-1].file_id
                 admin["step"] = "prices"
-                await update.message.reply_text("💰 Prices 3.5,7,14,28,56 (comma separated, e.g. 30,55,100,180,320):")
+                await update.message.reply_text("💰 Prices (3.5g,7g,14g,28g,56g) comma separated:\nExample: 30,55,100,180,320")
             else:
-                await update.message.reply_text("❌ Please send a photo!")
+                await update.message.reply_text("❌ Please send a photo (not document/link).")
             return
 
-        if step == "prices":
+        if step == "prices" and text:
             try:
                 prices = [float(x.strip()) for x in text.split(",")]
                 if len(prices) != 5:
-                    raise ValueError
-            except:
-                await update.message.reply_text("❌ Invalid format. Use: 30,55,100,180,320")
+                    raise ValueError("Need exactly 5 prices")
+            except Exception as e:
+                await update.message.reply_text(f"❌ Invalid format.\nUse: 30,55,100,180,320\n({str(e)})")
                 return
 
             pid = admin["name"].lower().replace(" ", "_")[:50]
@@ -427,7 +438,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Product added!", reply_markup=home_menu())
             return
 
-        if step == "announcement":
+        if step == "announcement" and text:
             await context.bot.send_message(CONTACT_CHANNEL_ID, f"📢 Announcement:\n{text}")
             ADMIN_SESSIONS.pop(uid, None)
             await update.message.reply_text("✅ Announcement sent!", reply_markup=home_menu())
@@ -438,13 +449,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = USER_SESSIONS[uid]
         step = session.get("step")
 
-        if step == "name":
+        if step == "name" and text:
             session["name"] = text
             session["step"] = "address"
-            await update.message.reply_text("📍 Address:")
+            await update.message.reply_text("📍 Full delivery address:")
             return
 
-        if step == "address":
+        if step == "address" and text:
             session["address"] = text
             _, total = basket_text(session["basket"])
             cur.execute(
@@ -454,12 +465,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.commit()
             USER_SESSIONS.pop(uid, None)
             await update.message.reply_text(
-                f"✅ Order placed!\n\nPay £{total:.2f} to:\n{CRYPTO_WALLET}",
+                f"✅ Order placed!\n\nPay £{total:.2f} to:\n{CRYPTO_WALLET}\n\nThank you!",
                 reply_markup=home_menu()
             )
             return
 
-        if step == "review":
+        if step == "review" and text:
             try:
                 parts = text.split(" ", 1)
                 stars = int(parts[0])
@@ -467,7 +478,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not 1 <= stars <= 5:
                     raise ValueError
             except:
-                await update.message.reply_text("❌ Format: 5 Amazing product")
+                await update.message.reply_text("❌ Format example:\n5 Great quality and fast delivery")
                 return
 
             cur.execute(
@@ -486,6 +497,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CallbackQueryHandler(callback_router))
+
     app.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, message_handler))
     app.add_handler(MessageHandler(filters.PHOTO, message_handler))
 
