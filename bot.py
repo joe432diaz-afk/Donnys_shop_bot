@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 
 TOKEN = os.getenv("TOKEN")
-ADMIN_ID = 123456789  # CHANGE
+ADMIN_ID = 7773622161  # CHANGE
 CHANNEL_ID = -1001234567890  # CHANGE
 
 DB_NAME = "shop.db"
