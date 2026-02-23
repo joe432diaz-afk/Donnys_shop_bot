@@ -17,8 +17,6 @@ from telegram.ext import (
     ConversationHandler
 )
 
-# ================= CONFIG =================
-
 TOKEN = os.getenv("TOKEN")
 ADMIN_ID = 123456789  # CHANGE
 CHANNEL_ID = -1001234567890  # CHANGE
@@ -27,15 +25,13 @@ DB_NAME = "shop.db"
 
 logging.basicConfig(level=logging.INFO)
 
-# =============== DATABASE =================
+ASK_NAME, ASK_ADDRESS, WRITE_REVIEW = range(3)
+
+# ================= DATABASE =================
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-
-    c.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY
-    )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,15 +50,12 @@ def init_db():
     )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS reviews (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
+        user_id INTEGER PRIMARY KEY,
         text TEXT
     )""")
 
     conn.commit()
     conn.close()
-
-# =============== SAMPLE PRODUCTS ===============
 
 def seed_products():
     conn = sqlite3.connect(DB_NAME)
@@ -70,42 +63,31 @@ def seed_products():
     c.execute("SELECT COUNT(*) FROM products")
     if c.fetchone()[0] == 0:
         c.execute("INSERT INTO products (name, price, description) VALUES (?, ?, ?)",
-                  ("Product A", 10.0, "Description A"))
+                  ("Product A", 10, "Description A"))
         c.execute("INSERT INTO products (name, price, description) VALUES (?, ?, ?)",
-                  ("Product B", 20.0, "Description B"))
+                  ("Product B", 20, "Description B"))
     conn.commit()
     conn.close()
 
-# =============== STATES ===============
-
-ASK_NAME, ASK_ADDRESS, REVIEW_TEXT = range(3)
-
-# =============== MAIN MENU ===============
+# ================= MENUS =================
 
 def main_menu():
-    keyboard = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🛍 Products", callback_data="products")],
         [InlineKeyboardButton("🧺 Basket", callback_data="basket")],
-        [InlineKeyboardButton("⭐ Reviews", callback_data="reviews")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+        [InlineKeyboardButton("📦 Order History", callback_data="history")],
+        [InlineKeyboardButton("⭐ Public Reviews", callback_data="public_reviews")]
+    ])
 
-# =============== START ===============
+# ================= START =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users VALUES (?)", (user.id,))
-    conn.commit()
-    conn.close()
-
     await update.message.reply_text(
-        "Welcome to the Shop!",
+        "Welcome to the Production Shop.",
         reply_markup=main_menu()
     )
 
-# =============== PRODUCTS ===============
+# ================= PRODUCTS =================
 
 async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -127,22 +109,19 @@ async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="menu")])
 
     await query.edit_message_text(
-        "Available Products:",
+        "Products:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-# =============== BASKET ===============
+# ================= BASKET =================
 
 async def add_to_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    product_id = int(query.data.split("_")[1])
+    pid = int(query.data.split("_")[1])
 
-    if "basket" not in context.user_data:
-        context.user_data["basket"] = []
-
-    context.user_data["basket"].append(product_id)
+    context.user_data.setdefault("basket", []).append(pid)
 
     await query.edit_message_text(
         "Added to basket.",
@@ -159,7 +138,7 @@ async def view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     basket = context.user_data.get("basket", [])
     if not basket:
         await query.edit_message_text(
-            "Basket is empty.",
+            "Basket empty.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅ Back", callback_data="menu")]
             ])
@@ -171,7 +150,6 @@ async def view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total = 0
     text = "Your Basket:\n\n"
-
     for pid in basket:
         c.execute("SELECT name, price FROM products WHERE id=?", (pid,))
         p = c.fetchone()
@@ -191,12 +169,11 @@ async def view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     )
 
-# =============== CHECKOUT ===============
+# ================= CHECKOUT =================
 
 async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Enter your name:")
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text("Enter your name:")
     return ASK_NAME
 
 async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -205,8 +182,8 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_ADDRESS
 
 async def get_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    address = update.message.text
     name = context.user_data["name"]
+    address = update.message.text
     basket = context.user_data.get("basket", [])
 
     conn = sqlite3.connect(DB_NAME)
@@ -223,14 +200,13 @@ async def get_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     c.execute("INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?)",
               (order_id, update.effective_user.id, name, address, total, "Pending"))
-
     conn.commit()
     conn.close()
 
     context.user_data["basket"] = []
 
     await update.message.reply_text(
-        f"Order Created!\nOrder ID: {order_id}\nTotal LTC: {total}",
+        f"Order Created!\nOrder ID: {order_id}\nStatus: Pending",
         reply_markup=main_menu()
     )
 
@@ -241,22 +217,133 @@ async def get_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
-# =============== ADMIN PANEL ===============
+# ================= ORDER HISTORY =================
+
+async def order_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT id, status FROM orders WHERE user_id=?",
+              (query.from_user.id,))
+    orders = c.fetchall()
+    conn.close()
+
+    if not orders:
+        text = "No orders yet."
+    else:
+        text = "Your Orders:\n\n"
+        for o in orders:
+            text += f"Order: {o[0]} | Status: {o[1]}\n"
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅ Back", callback_data="menu")]
+        ])
+    )
+
+# ================= REVIEWS =================
+
+async def public_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT text FROM reviews")
+    reviews = c.fetchall()
+    conn.close()
+
+    if not reviews:
+        text = "No reviews yet."
+    else:
+        text = "Public Reviews:\n\n"
+        for r in reviews:
+            text += f"⭐ {r[0]}\n\n"
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅ Back", callback_data="menu")]
+        ])
+    )
+
+async def write_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text("Write your review:")
+    return WRITE_REVIEW
+
+async def save_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO reviews VALUES (?, ?)",
+              (user_id, text))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        "Review saved.",
+        reply_markup=main_menu()
+    )
+
+    return ConversationHandler.END
+
+# ================= ADMIN =================
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    keyboard = [
-        [InlineKeyboardButton("📦 Orders", callback_data="admin_orders")]
-    ]
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT id FROM orders WHERE status='Pending'")
+    orders = c.fetchall()
+    conn.close()
+
+    keyboard = []
+    for o in orders:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"Mark Paid {o[0]}",
+                callback_data=f"paid_{o[0]}"
+            )
+        ])
 
     await update.message.reply_text(
-        "Admin Panel",
+        "Pending Orders:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-# =============== ROUTER ===============
+async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    order_id = query.data.split("_")[1]
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("UPDATE orders SET status='Paid' WHERE id=?", (order_id,))
+    c.execute("SELECT user_id FROM orders WHERE id=?", (order_id,))
+    user_id = c.fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=f"Order {order_id} marked as PAID.\nLeave a review?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Write Review", callback_data="write_review")]
+        ])
+    )
+
+    await query.edit_message_text("Marked as Paid.")
+
+# ================= ROUTER =================
 
 async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = update.callback_query.data
@@ -272,10 +359,16 @@ async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await add_to_basket(update, context)
     elif data == "basket":
         await view_basket(update, context)
-    elif data == "checkout":
-        return await checkout(update, context)
+    elif data == "history":
+        await order_history(update, context)
+    elif data == "public_reviews":
+        await public_reviews(update, context)
+    elif data.startswith("paid_"):
+        await mark_paid(update, context)
+    elif data == "write_review":
+        return await write_review(update, context)
 
-# =============== MAIN ===============
+# ================= MAIN =================
 
 def main():
     init_db()
@@ -283,7 +376,15 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    conv = ConversationHandler(
+    review_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(write_review, pattern="^write_review$")],
+        states={
+            WRITE_REVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_review)]
+        },
+        fallbacks=[]
+    )
+
+    checkout_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(checkout, pattern="^checkout$")],
         states={
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
@@ -294,10 +395,11 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin))
-    app.add_handler(conv)
+    app.add_handler(review_conv)
+    app.add_handler(checkout_conv)
     app.add_handler(CallbackQueryHandler(router))
 
-    print("Bot running...")
+    print("Production Shop Running...")
     app.run_polling()
 
 if __name__ == "__main__":
