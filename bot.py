@@ -5,18 +5,20 @@ from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (ApplicationBuilder, CommandHandler, CallbackQueryHandler,
                            MessageHandler, ConversationHandler, ContextTypes, filters)
 
-# CONFIG
-TOKEN    = os.getenv("TOKEN")
-ADMIN_ID = 7773622161
-LTC_ADDR = "YOUR_LTC_ADDRESS"
-DB_NAME  = "shop.db"
-STARS    = {1:"⭐", 2:"⭐⭐", 3:"⭐⭐⭐", 4:"⭐⭐⭐⭐", 5:"⭐⭐⭐⭐⭐"}
+# ⚙️ CONFIG
+TOKEN      = os.getenv("TOKEN")
+ADMIN_ID   = 7773622161
+CHANNEL_ID = -1003833257976      # order notifications channel
+LTC_ADDR   = "ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
+DB_NAME    = "shop.db"
+STARS      = {1:"⭐", 2:"⭐⭐", 3:"⭐⭐⭐", 4:"⭐⭐⭐⭐", 5:"⭐⭐⭐⭐⭐"}
 logging.basicConfig(level=logging.INFO)
 
-# States
+# 💬 Conversation states
 (ASK_NAME, ASK_ADDR, PICK_STARS, WRITE_REVIEW,
  ADD_PHOTO, ADD_TITLE, ADD_DESC, ADD_QTY, EDIT_TIERS) = range(9)
 
+# ⚖️ Default weight tiers
 DEFAULT_TIERS = [
     {"qty":1,   "price":10.0},
     {"qty":3.5, "price":5.0},
@@ -26,7 +28,7 @@ DEFAULT_TIERS = [
     {"qty":56,  "price":1.0},
 ]
 
-# DATABASE
+# ═══ 🗄️ DATABASE ═══
 def db(): return sqlite3.connect(DB_NAME)
 
 def init_db():
@@ -52,14 +54,15 @@ def init_db():
     except: pass
     c.commit(); c.close()
 
-# HELPERS
-def fq(q): return f"{int(q)}g" if q == int(q) else f"{q}g"
-def ft(t): return f"⚖️ {fq(t['qty'])} — £{t['price']:.2f}/g"
-def mask_user(uid): return "**********"
+# ═══ 🛠️ HELPERS ═══
+def fq(q):  return f"{int(q)}g" if q == int(q) else f"{q}g"
+def ft(t):  return f"⚖️ {fq(t['qty'])} — £{t['price']:.2f}/g"
 
 def ltc_rate():
     try:
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=gbp", timeout=10)
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=gbp",
+            timeout=10)
         return r.json()["litecoin"]["gbp"]
     except: return 55
 
@@ -71,39 +74,74 @@ def menu():
         [InlineKeyboardButton("⭐ Reviews",   callback_data="pub_reviews")],
     ])
 
-def back_btn(): return InlineKeyboardButton("⬅️ Back", callback_data="menu")
+def back(): return [InlineKeyboardButton("⬅️ Back", callback_data="menu")]
 
-# START
+# ═══ 👋 START ═══
 async def start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "🛒 Welcome to <b>Shop Bot</b>!\n\nUse the menu below to get started.",
-        reply_markup=menu(), parse_mode="HTML")
+        "👋 Welcome to <b>Donny's Shop</b>! 🌿\n\n"
+        "Here's everything you need to know to get started:\n\n"
+        "🛍️ <b>Products</b> — Browse what's available and pick your weight\n"
+        "🧺 <b>Basket</b> — Review your items before you checkout\n"
+        "📦 <b>My Orders</b> — Track all your past and current orders\n"
+        "⭐ <b>Reviews</b> — See what other customers are saying\n\n"
+        "🛒 <b>How to order:</b>\n"
+        "1️⃣ Tap <b>Products</b> and choose what you want\n"
+        "2️⃣ Select your weight from the buttons\n"
+        "3️⃣ Go to <b>Basket</b> and tap <b>Checkout</b>\n"
+        "4️⃣ Enter your name and delivery address\n"
+        "5️⃣ Send the LTC payment to the address shown\n"
+        "6️⃣ Tap <b>I Have Paid</b> and we'll confirm shortly ✅\n\n"
+        "💬 Any issues? Contact support directly.\n\n"
+        "Enjoy your journey! 🚀",
+        reply_markup=menu(), parse_mode="HTML"
+    )
 
-# PRODUCTS
+# ═══ 🛍️ PRODUCT LIST (buttons, not flood of photos) ═══
 async def show_products(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
-    c = db().cursor(); c.execute("SELECT id,name,description,photo,stock,tiers FROM products")
-    rows = c.fetchall()
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT id, name, stock FROM products")
+    rows = cur.fetchall(); con.close()
     if not rows:
-        await q.edit_message_text("😔 No products available.", reply_markup=menu()); return
-    for pid, name, desc, photo, stock, tj in rows:
-        tiers = json.loads(tj) if tj else DEFAULT_TIERS[:]
-        btns  = [InlineKeyboardButton(ft(t), callback_data=f"pick_{pid}_{t['qty']}_{t['price']}") for t in tiers]
-        rows2 = [btns[i:i+2] for i in range(0, len(btns), 2)]
-        rows2.append([back_btn()])
-        cap = (f"🌿 <b>{name}</b>\n\n📝 {desc}\n\n"
-               f"📦 In stock: <b>{stock}</b>\n\n"
-               f"<b>Select weight:</b>\n" + "\n".join(ft(t) for t in tiers))
-        await ctx.bot.send_photo(q.message.chat_id, photo, caption=cap,
-                                 reply_markup=InlineKeyboardMarkup(rows2), parse_mode="HTML")
+        await q.edit_message_text("😔 No products available.", reply_markup=InlineKeyboardMarkup([back()]))
+        return
+    kb = [[InlineKeyboardButton(f"🌿 {name}  (📦 {stock} in stock)", callback_data=f"prod_{pid}")]
+          for pid, name, stock in rows]
+    kb.append(back())
+    await q.edit_message_text("🛍️ <b>Choose a product:</b>",
+                               parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
-# ADD TO CART
+# ═══ 🌿 SINGLE PRODUCT VIEW ═══
+async def show_product(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer()
+    pid = int(q.data.split("_")[1])
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT name, description, photo, stock, tiers FROM products WHERE id=?", (pid,))
+    row = cur.fetchone(); con.close()
+    if not row:
+        await q.edit_message_text("❌ Product not found.", reply_markup=InlineKeyboardMarkup([back()]))
+        return
+    name, desc, photo, stock, tj = row
+    tiers = json.loads(tj) if tj else DEFAULT_TIERS[:]
+    tier_btns = [InlineKeyboardButton(ft(t), callback_data=f"pick_{pid}_{t['qty']}_{t['price']}") for t in tiers]
+    rows2 = [tier_btns[i:i+2] for i in range(0, len(tier_btns), 2)]
+    rows2.append([InlineKeyboardButton("⬅️ Back to Products", callback_data="products")])
+    cap = (f"🌿 <b>{name}</b>\n\n📝 {desc}\n\n"
+           f"📦 In stock: <b>{stock}</b>\n\n"
+           f"<b>Select weight:</b>\n" + "\n".join(ft(t) for t in tiers))
+    # Delete the text message and send a photo card
+    await q.message.delete()
+    await ctx.bot.send_photo(q.message.chat_id, photo, caption=cap,
+                             reply_markup=InlineKeyboardMarkup(rows2), parse_mode="HTML")
+
+# ═══ ➕ ADD TO CART ═══
 async def pick_weight(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     parts = q.data.split("_")
     pid = int(parts[1]); qty = float(parts[2]); price = float(parts[3])
     con = db(); cur = con.cursor()
-    cur.execute("SELECT name,stock FROM products WHERE id=?", (pid,)); row = cur.fetchone()
+    cur.execute("SELECT name, stock FROM products WHERE id=?", (pid,)); row = cur.fetchone()
     if not row or row[1] < 1:
         con.close(); await q.answer("❌ Out of stock!", show_alert=True); return
     cur.execute("INSERT INTO cart(user_id,product_id,chosen_qty,chosen_price) VALUES(?,?,?,?)",
@@ -111,7 +149,7 @@ async def pick_weight(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     con.commit(); con.close()
     await q.answer(f"✅ Added {fq(qty)} of {row[0]} — £{price:.2f}", show_alert=True)
 
-# BASKET
+# ═══ 🧺 BASKET ═══
 async def view_basket(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     con = db(); cur = con.cursor()
@@ -120,14 +158,16 @@ async def view_basket(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
                    WHERE cart.user_id=?""", (q.from_user.id,))
     items = cur.fetchall(); con.close()
     if not items:
-        await q.edit_message_text("🧺 Your basket is empty.", reply_markup=menu()); return
+        await q.edit_message_text("🧺 Your basket is empty.", reply_markup=InlineKeyboardMarkup([back()]))
+        return
     total = sum(i[3] for i in items)
     txt = "🧺 <b>Your Basket</b>\n\n"
     for _, n, qy, p in items:
         txt += f"🌿 {n} ({fq(qy)}) — £{p:.2f}\n"
     txt += f"\n💰 <b>Total: £{total:.2f}</b>"
-    rm  = [[InlineKeyboardButton(f"🗑️ Remove {n} ({fq(qy)})", callback_data=f"remove_{cid}")] for cid,n,qy,_ in items]
-    kb  = rm + [[InlineKeyboardButton("💳 Checkout", callback_data="checkout")], [back_btn()]]
+    rm  = [[InlineKeyboardButton(f"🗑️ Remove {n} ({fq(qy)})", callback_data=f"remove_{cid}")]
+           for cid, n, qy, _ in items]
+    kb  = rm + [[InlineKeyboardButton("💳 Checkout", callback_data="checkout")], back()]
     await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
 async def remove_item(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -138,45 +178,47 @@ async def remove_item(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     con.commit(); con.close()
     await view_basket(u, ctx)
 
-# ORDERS
+# ═══ 📦 ORDERS ═══
 async def view_orders(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     con = db(); cur = con.cursor()
-    cur.execute("SELECT id,total_gbp,total_ltc,status FROM orders WHERE user_id=? ORDER BY rowid DESC", (q.from_user.id,))
+    cur.execute("SELECT id,total_gbp,total_ltc,status FROM orders WHERE user_id=? ORDER BY rowid DESC",
+                (q.from_user.id,))
     rows = cur.fetchall(); con.close()
     if not rows:
-        await q.edit_message_text("📭 No orders found.", reply_markup=menu()); return
-    emap = {"Awaiting Payment":"⏳ Awaiting Payment", "Paid":"✅ Paid", "Dispatched":"🚚 Dispatched", "Rejected":"❌ Rejected"}
-    txt  = "📦 <b>Your Orders</b>\n\n"
+        await q.edit_message_text("📭 No orders found.", reply_markup=InlineKeyboardMarkup([back()]))
+        return
+    emap = {"Awaiting Payment":"⏳ Awaiting Payment", "Paid":"✅ Paid",
+            "Dispatched":"🚚 Dispatched", "Rejected":"❌ Rejected"}
+    txt = "📦 <b>Your Orders</b>\n\n"
     for o in rows:
         txt += f"🔖 <code>{o[0]}</code>\n💷 £{o[1]:.2f} ({o[2]} LTC)\n{emap.get(o[3], o[3])}\n\n"
-    await q.edit_message_text(txt, parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[back_btn()]]))
+    await q.edit_message_text(txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([back()]))
 
-# PUBLIC REVIEWS
+# ═══ ⭐ PUBLIC REVIEWS ═══
 async def pub_reviews(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     con = db(); cur = con.cursor()
-    cur.execute("SELECT user_id,stars,text FROM reviews ORDER BY rowid DESC LIMIT 20")
+    cur.execute("SELECT stars, text FROM reviews ORDER BY rowid DESC LIMIT 20")
     rows = cur.fetchall(); con.close()
     if not rows:
-        await q.edit_message_text("💬 No reviews yet.", reply_markup=InlineKeyboardMarkup([[back_btn()]])); return
+        await q.edit_message_text("💬 No reviews yet.", reply_markup=InlineKeyboardMarkup([back()]))
+        return
     txt = "⭐ <b>Customer Reviews</b>\n\n"
     for r in rows:
-        txt += f"👤 **********\n{STARS.get(r[1], 'No rating')}\n💬 {r[2]}\n\n"
-    await q.edit_message_text(txt, parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[back_btn()]]))
+        txt += f"👤 **********\n{STARS.get(r[0], 'No rating')}\n💬 {r[1]}\n\n"
+    await q.edit_message_text(txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([back()]))
 
-# REVIEW FLOW
+# ═══ ⭐ REVIEW FLOW ═══
 async def review_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     ctx.user_data["rev_order"] = q.data[7:]
     kb = [
-        [InlineKeyboardButton("⭐ 1",    callback_data="stars_1"),
-         InlineKeyboardButton("⭐⭐ 2",   callback_data="stars_2"),
-         InlineKeyboardButton("⭐⭐⭐ 3",  callback_data="stars_3")],
-        [InlineKeyboardButton("⭐⭐⭐⭐ 4",   callback_data="stars_4"),
-         InlineKeyboardButton("⭐⭐⭐⭐⭐ 5",  callback_data="stars_5")],
+        [InlineKeyboardButton("⭐ 1",       callback_data="stars_1"),
+         InlineKeyboardButton("⭐⭐ 2",      callback_data="stars_2"),
+         InlineKeyboardButton("⭐⭐⭐ 3",     callback_data="stars_3")],
+        [InlineKeyboardButton("⭐⭐⭐⭐ 4",    callback_data="stars_4"),
+         InlineKeyboardButton("⭐⭐⭐⭐⭐ 5",   callback_data="stars_5")],
     ]
     await q.edit_message_text("⭐ <b>Rate Your Order</b>\n\nHow many stars?",
                                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
@@ -195,17 +237,18 @@ async def save_review(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = u.effective_user.id
     txt   = u.message.text
     con   = db(); cur = con.cursor()
-    cur.execute("SELECT id FROM orders WHERE id=? AND user_id=? AND status IN ('Paid','Dispatched')", (oid, uid))
+    cur.execute("SELECT id FROM orders WHERE id=? AND user_id=? AND status IN ('Paid','Dispatched')",
+                (oid, uid))
     if not cur.fetchone():
         con.close()
-        await u.message.reply_text("⚠️ This order is not eligible for a review.")
+        await u.message.reply_text("⚠️ This order is not eligible for a review.", reply_markup=menu())
         return ConversationHandler.END
     cur.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?,?)", (oid, uid, stars, txt))
     con.commit(); con.close()
     await u.message.reply_text(f"✅ Review saved! {STARS.get(stars, '')} Thank you 🙏", reply_markup=menu())
     return ConversationHandler.END
 
-# CHECKOUT
+# ═══ 💳 CHECKOUT ═══
 async def checkout_start(u: Update, ctx):
     await u.callback_query.answer()
     await u.callback_query.edit_message_text("✍️ Enter your name:")
@@ -219,27 +262,57 @@ async def get_name(u: Update, ctx):
 async def get_addr(u: Update, ctx):
     name = ctx.user_data["name"]; addr = u.message.text; uid = u.effective_user.id
     con  = db(); cur = con.cursor()
-    cur.execute("SELECT chosen_price FROM cart WHERE user_id=?", (uid,)); prices = cur.fetchall()
+    cur.execute("SELECT chosen_price FROM cart WHERE user_id=?", (uid,))
+    prices = cur.fetchall()
     if not prices:
-        con.close(); await u.message.reply_text("🧺 Your basket is empty.", reply_markup=menu()); return ConversationHandler.END
+        con.close()
+        await u.message.reply_text("🧺 Your basket is empty.", reply_markup=menu())
+        return ConversationHandler.END
     gbp = round(sum(p[0] for p in prices), 2)
     ltc = round(gbp / ltc_rate(), 6)
     oid = str(uuid4())[:8]
-    cur.execute("INSERT INTO orders VALUES(?,?,?,?,?,?,?)", (oid, uid, name, addr, gbp, ltc, "Awaiting Payment"))
+    cur.execute("INSERT INTO orders VALUES(?,?,?,?,?,?,?)",
+                (oid, uid, name, addr, gbp, ltc, "Awaiting Payment"))
     cur.execute("DELETE FROM cart WHERE user_id=?", (uid,))
     con.commit(); con.close()
+
+    summary = (
+        f"🧾 <b>Order Summary</b>\n\n"
+        f"🔖 Order ID: <code>{oid}</code>\n"
+        f"👤 Name: {name}\n"
+        f"🏠 Address: {addr}\n\n"
+        f"💷 Total: £{gbp}\n"
+        f"⚡ LTC Total: {ltc}\n\n"
+        f"📤 Send LTC to:\n<code>{LTC_ADDR}</code>"
+    )
+
+    # Send order details to the channel
+    await ctx.bot.send_message(
+        CHANNEL_ID,
+        f"🛒 <b>New Order!</b>\n\n"
+        f"🔖 Order ID: <code>{oid}</code>\n"
+        f"👤 Name: {name}\n"
+        f"🏠 Address: {addr}\n"
+        f"💷 Total: £{gbp}\n"
+        f"⚡ LTC: {ltc}\n"
+        f"⏳ Status: Awaiting Payment",
+        parse_mode="HTML"
+    )
+
     await u.message.reply_text(
-        f"🧾 <b>Order Summary</b>\n\n🔖 Order ID: <code>{oid}</code>\n👤 Name: {name}\n🏠 Address: {addr}\n\n"
-        f"💷 Total: £{gbp}\n⚡ LTC Total: {ltc}\n\n📤 Send LTC to:\n<code>{LTC_ADDR}</code>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{oid}")]]))
+        summary, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{oid}")]
+        ])
+    )
     return ConversationHandler.END
 
-# ADMIN
+# ═══ 🔧 ADMIN ═══
 async def admin_panel(u: Update, ctx):
     if u.effective_user.id != ADMIN_ID: return
     con = db(); cur = con.cursor()
-    cur.execute("SELECT id,status FROM orders ORDER BY rowid DESC"); orders = cur.fetchall(); con.close()
+    cur.execute("SELECT id, status FROM orders ORDER BY rowid DESC")
+    orders = cur.fetchall(); con.close()
     kb = []
     for oid, st in orders:
         if st == "Awaiting Payment":
@@ -247,53 +320,67 @@ async def admin_panel(u: Update, ctx):
                        InlineKeyboardButton(f"❌ Reject {oid}",  callback_data=f"adm_no_{oid}")])
         elif st == "Paid":
             kb.append([InlineKeyboardButton(f"🚚 Dispatch {oid}", callback_data=f"adm_go_{oid}")])
-    kb += [[InlineKeyboardButton("➕ Add Product",  callback_data="adm_addprod")],
-           [InlineKeyboardButton("✏️ Edit Tiers",   callback_data="adm_tiers")]]
-    await u.message.reply_text("🔧 <b>Admin Dashboard</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    kb += [[InlineKeyboardButton("➕ Add Product", callback_data="adm_addprod")],
+           [InlineKeyboardButton("✏️ Edit Tiers",  callback_data="adm_tiers")]]
+    await u.message.reply_text("🔧 <b>Admin Dashboard</b>", parse_mode="HTML",
+                                reply_markup=InlineKeyboardMarkup(kb))
 
 async def adm_confirm(u, ctx):
     q = u.callback_query; await q.answer(); oid = q.data[7:]
     con = db(); cur = con.cursor()
     cur.execute("UPDATE orders SET status='Paid' WHERE id=?", (oid,))
-    cur.execute("SELECT user_id FROM orders WHERE id=?", (oid,)); row = cur.fetchone()
-    con.commit(); con.close()
+    cur.execute("SELECT user_id FROM orders WHERE id=?", (oid,))
+    row = cur.fetchone(); con.commit(); con.close()
     if row:
-        await ctx.bot.send_message(row[0],
-            f"✅ Payment confirmed for order <code>{oid}</code>\n\n🌟 Leave a review once your order arrives:",
+        await ctx.bot.send_message(
+            row[0],
+            f"✅ Payment confirmed for order <code>{oid}</code>\n\n"
+            f"🌟 Leave a review once your order arrives!",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Leave a Review", callback_data=f"review_{oid}")]]))
-    await q.edit_message_text(f"Confirmed order {oid}")
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⭐ Leave a Review", callback_data=f"review_{oid}")]
+            ]))
+    await q.edit_message_text(f"✅ Confirmed order {oid}")
 
 async def adm_reject(u, ctx):
     q = u.callback_query; await q.answer(); oid = q.data[7:]
     con = db(); cur = con.cursor()
     cur.execute("UPDATE orders SET status='Rejected' WHERE id=?", (oid,))
-    cur.execute("SELECT user_id FROM orders WHERE id=?", (oid,)); row = cur.fetchone()
-    con.commit(); con.close()
-    if row: await ctx.bot.send_message(row[0], f"❌ Payment for order <code>{oid}</code> was rejected. Please contact support.", parse_mode="HTML")
-    await q.edit_message_text(f"Rejected order {oid}")
+    cur.execute("SELECT user_id FROM orders WHERE id=?", (oid,))
+    row = cur.fetchone(); con.commit(); con.close()
+    if row:
+        await ctx.bot.send_message(row[0],
+            f"❌ Payment for order <code>{oid}</code> was rejected. Please contact support.",
+            parse_mode="HTML")
+    await q.edit_message_text(f"❌ Rejected order {oid}")
 
 async def adm_dispatch(u, ctx):
     q = u.callback_query; await q.answer(); oid = q.data[7:]
     con = db(); cur = con.cursor()
     cur.execute("UPDATE orders SET status='Dispatched' WHERE id=?", (oid,))
-    cur.execute("SELECT user_id FROM orders WHERE id=?", (oid,)); row = cur.fetchone()
-    con.commit(); con.close()
-    if row: await ctx.bot.send_message(row[0], f"🚚 Order <code>{oid}</code> has been dispatched! 📬", parse_mode="HTML")
-    await q.edit_message_text(f"Dispatched order {oid}")
+    cur.execute("SELECT user_id FROM orders WHERE id=?", (oid,))
+    row = cur.fetchone(); con.commit(); con.close()
+    if row:
+        await ctx.bot.send_message(row[0],
+            f"🚚 Order <code>{oid}</code> has been dispatched! 📬",
+            parse_mode="HTML")
+    await q.edit_message_text(f"🚚 Dispatched order {oid}")
 
 async def user_paid(u, ctx):
     q = u.callback_query; await q.answer(); oid = q.data[5:]
-    await ctx.bot.send_message(ADMIN_ID, f"💬 User {q.from_user.id} claims payment for order <code>{oid}</code>", parse_mode="HTML")
+    await ctx.bot.send_message(ADMIN_ID,
+        f"💬 User {q.from_user.id} claims payment for order <code>{oid}</code>",
+        parse_mode="HTML")
     await q.edit_message_text("⏳ Payment submitted. Awaiting admin confirmation.")
 
-# ADD PRODUCT
+# ═══ 📸 ADD PRODUCT ═══
 async def addprod_start(u, ctx):
     if u.effective_user.id != ADMIN_ID: return
     await u.message.reply_text("📸 Send the product photo:"); return ADD_PHOTO
 
 async def addprod_photo(u, ctx):
-    if not u.message.photo: await u.message.reply_text("⚠️ Please send a photo."); return ADD_PHOTO
+    if not u.message.photo:
+        await u.message.reply_text("⚠️ Please send a photo."); return ADD_PHOTO
     ctx.user_data["ph"] = u.message.photo[-1].file_id
     await u.message.reply_text("📝 Enter product title:"); return ADD_TITLE
 
@@ -314,71 +401,89 @@ async def addprod_qty(u, ctx):
     cur.execute("INSERT INTO products(name,description,photo,stock,tiers) VALUES(?,?,?,?,?)",
                 (d["nm"], d["ds"], d["ph"], qty, json.dumps(DEFAULT_TIERS)))
     con.commit(); con.close()
-    await u.message.reply_photo(d["ph"], caption=f"✅ <b>Product added!</b>\n\n🌿 {d['nm']}\n📦 Stock: {qty}", parse_mode="HTML")
+    await u.message.reply_photo(d["ph"],
+        caption=f"✅ <b>Product added!</b>\n\n🌿 {d['nm']}\n📦 Stock: {qty}", parse_mode="HTML")
     return ConversationHandler.END
 
 async def cancel(u, ctx):
-    await u.message.reply_text("🚫 Cancelled."); return ConversationHandler.END
+    await u.message.reply_text("🚫 Cancelled.", reply_markup=menu())
+    return ConversationHandler.END
 
-# EDIT TIERS
+# ═══ ✏️ EDIT TIERS ═══
 async def adm_list_tiers(u, ctx):
     q = u.callback_query; await q.answer()
-    con = db(); cur = con.cursor(); cur.execute("SELECT id,name FROM products"); rows = cur.fetchall(); con.close()
-    if not rows: await q.edit_message_text("😔 No products found."); return
-    kb = [[InlineKeyboardButton(r[1], callback_data=f"edtier_{r[0]}")] for r in rows] + [[back_btn()]]
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT id, name FROM products"); rows = cur.fetchall(); con.close()
+    if not rows:
+        await q.edit_message_text("😔 No products found.", reply_markup=InlineKeyboardMarkup([back()]))
+        return
+    kb = [[InlineKeyboardButton(f"🌿 {r[1]}", callback_data=f"edtier_{r[0]}")] for r in rows]
+    kb.append(back())
     await q.edit_message_text("✏️ Select a product to edit tiers:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def adm_show_tiers(u, ctx):
     q = u.callback_query; await q.answer()
     pid = int(q.data.split("_")[1]); ctx.user_data["tpid"] = pid
-    con = db(); cur = con.cursor(); cur.execute("SELECT name,tiers FROM products WHERE id=?", (pid,)); row = cur.fetchone(); con.close()
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT name, tiers FROM products WHERE id=?", (pid,))
+    row = cur.fetchone(); con.close()
     tiers = json.loads(row[1]); txt = "\n".join(ft(t) for t in tiers)
     await q.message.reply_text(
-        f"✏️ <b>Tiers for {row[0]}</b>\n\n{txt}\n\nSend new tiers one per line as qty,price\nExample:\n<code>1,10\n3.5,5\n7,4</code>\n\nSend /cancel to stop.",
+        f"✏️ <b>Tiers for {row[0]}</b>\n\n{txt}\n\n"
+        f"Send new tiers one per line as <code>qty,price</code>\nExample:\n"
+        f"<code>1,10\n3.5,5\n7,4</code>\n\nSend /cancel to stop.",
         parse_mode="HTML")
     return EDIT_TIERS
 
 async def save_tiers(u, ctx):
-    pid = ctx.user_data.get("tpid"); lines = u.message.text.strip().splitlines(); new = []; errs = []
+    pid = ctx.user_data.get("tpid")
+    lines = u.message.text.strip().splitlines(); new = []; errs = []
     for i, line in enumerate(lines, 1):
         p = line.strip().split(",")
         if len(p) != 2: errs.append(f"Line {i}: expected qty,price"); continue
         try:
-            q2, pr = float(p[0]), float(p[1]); assert q2 > 0 and pr > 0; new.append({"qty":q2,"price":pr})
+            q2, pr = float(p[0]), float(p[1]); assert q2 > 0 and pr > 0
+            new.append({"qty": q2, "price": pr})
         except: errs.append(f"Line {i}: invalid numbers")
     if errs or not new:
-        await u.message.reply_text("Errors:\n" + "\n".join(errs or ["No valid tiers."]) + "\n\nFix and retry or /cancel.")
+        await u.message.reply_text("❌ Errors:\n" + "\n".join(errs or ["No valid tiers."]) +
+                                    "\n\nFix and retry or /cancel.")
         return EDIT_TIERS
     new.sort(key=lambda t: t["qty"])
-    con = db(); cur = con.cursor(); cur.execute("UPDATE products SET tiers=? WHERE id=?", (json.dumps(new), pid)); con.commit(); con.close()
-    await u.message.reply_text("✅ <b>Tiers updated!</b>\n\n" + "\n".join(ft(t) for t in new), parse_mode="HTML")
+    con = db(); cur = con.cursor()
+    cur.execute("UPDATE products SET tiers=? WHERE id=?", (json.dumps(new), pid))
+    con.commit(); con.close()
+    await u.message.reply_text("✅ <b>Tiers updated!</b>\n\n" + "\n".join(ft(t) for t in new),
+                                parse_mode="HTML")
     return ConversationHandler.END
 
-# ROUTER
+# ═══ 🔀 ROUTER ═══
 async def router(u: Update, ctx):
     data = u.callback_query.data
     if   data == "menu":           await u.callback_query.edit_message_text("🏠 Main Menu", reply_markup=menu())
     elif data == "products":       await show_products(u, ctx)
+    elif data.startswith("prod_"): await show_product(u, ctx)
     elif data == "basket":         await view_basket(u, ctx)
     elif data == "orders":         await view_orders(u, ctx)
     elif data == "pub_reviews":    await pub_reviews(u, ctx)
-    elif data.startswith("pick_"):     await pick_weight(u, ctx)
-    elif data.startswith("remove_"):   await remove_item(u, ctx)
-    elif data.startswith("paid_"):     await user_paid(u, ctx)
-    elif data.startswith("adm_ok_"):   await adm_confirm(u, ctx)
-    elif data.startswith("adm_no_"):   await adm_reject(u, ctx)
-    elif data.startswith("adm_go_"):   await adm_dispatch(u, ctx)
+    elif data.startswith("pick_"):    await pick_weight(u, ctx)
+    elif data.startswith("remove_"):  await remove_item(u, ctx)
+    elif data.startswith("paid_"):    await user_paid(u, ctx)
+    elif data.startswith("adm_ok_"):  await adm_confirm(u, ctx)
+    elif data.startswith("adm_no_"):  await adm_reject(u, ctx)
+    elif data.startswith("adm_go_"):  await adm_dispatch(u, ctx)
     elif data == "adm_addprod":
         if u.effective_user.id == ADMIN_ID:
-            await u.callback_query.message.reply_text("Use /addproduct to add a new product.")
+            await u.callback_query.message.reply_text("💡 Use /addproduct to add a new product.")
     elif data == "adm_tiers":
         if u.effective_user.id == ADMIN_ID: await adm_list_tiers(u, ctx)
 
-# MAIN
+# ═══ 🚀 MAIN ═══
 def main():
     init_db()
     app = ApplicationBuilder().token(TOKEN).build()
 
+    # ⭐ review_conv MUST be registered before the generic router
     review_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(review_start, pattern="^review_")],
         states={
@@ -414,13 +519,13 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(review_conv)       # Must be before router
+    app.add_handler(review_conv)       # ⭐ before router
     app.add_handler(checkout_conv)
     app.add_handler(addprod_conv)
     app.add_handler(edtiers_conv)
     app.add_handler(CallbackQueryHandler(router))
 
-    print("Bot is running")
+    print("🚀 Bot running...")
     app.run_polling()
 
 if __name__ == "__main__":
