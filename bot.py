@@ -459,7 +459,6 @@ def main():
     app.add_handler(CommandHandler("start",start))
     app.add_handler(CommandHandler("admin",admin_panel))
     app.add_handler(CommandHandler("reply",admin_reply_cmd))
-    app.add_handler(CommandHandler("addproduct",addprod_start))
 
     app.add_handler(conv([CallbackQueryHandler(review_start,pattern="^review_")],
         {PICK_STARS:[CallbackQueryHandler(pick_stars,pattern="^stars_")],
