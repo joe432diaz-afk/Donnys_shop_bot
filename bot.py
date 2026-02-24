@@ -746,14 +746,10 @@ async def router(update, context):
         if update.effective_user.id != ADMIN_ID:
             return
         await admin_list_tiers(update, context)
-
 # ================= MAIN =================
-
 def main():
     init_db()
-
     app = ApplicationBuilder().token(TOKEN).build()
-
     checkout_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(checkout_start, pattern="^checkout$")],
         states={
@@ -762,7 +758,6 @@ def main():
         },
         fallbacks=[]
     )
-
     review_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(write_review_start, pattern="^review_")],
         states={
@@ -770,7 +765,6 @@ def main():
         },
         fallbacks=[]
     )
-
     add_product_conv = ConversationHandler(
         entry_points=[CommandHandler("addproduct", add_product_start)],
         states={
@@ -781,7 +775,6 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel_add_product)]
     )
-
     edit_tiers_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_show_tiers, pattern="^edit_tiers_")],
         states={
@@ -789,7 +782,6 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel_edit_tiers)]
     )
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(checkout_conv)
