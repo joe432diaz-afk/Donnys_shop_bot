@@ -4,7 +4,8 @@ from threading import Thread
 from http.server import HTTPServer,BaseHTTPRequestHandler
 from uuid import uuid4
 from datetime import datetime,timedelta
-from telegram import Update,InlineKeyboardMarkup,InlineKeyboardButton as IB
+from telegram import Update,InlineKeyboardMarkup,InlineKeyboardButton as _IB
+def IB(t,c): return _IB(text=t,callback_data=c)
 from telegram.ext import ApplicationBuilder,CommandHandler,CallbackQueryHandler,MessageHandler,ContextTypes,filters
 
 TOKEN=os.getenv("TOKEN"); ADMIN_ID=7773622161; CHANNEL_ID=-1003833257976
