@@ -4,12 +4,12 @@ from threading import Thread
 from http.server import HTTPServer,BaseHTTPRequestHandler
 from uuid import uuid4
 from datetime import datetime,timedelta
-from telegram import Update,InlineKeyboardMarkup,InlineKeyboardButton as _IB
-def IB(text,cb): return _IB(text=text,callback_data=cb)
+from telegram import Update,InlineKeyboardMarkup,InlineKeyboardButton as IB
 from telegram.ext import ApplicationBuilder,CommandHandler,CallbackQueryHandler,MessageHandler,ContextTypes,filters
 
 TOKEN=os.getenv("TOKEN"); ADMIN_ID=7773622161; CHANNEL_ID=-1003833257976
-LTC_ADDR="ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"; DB="/app/data/shop.db"
+LTC_ADDR="ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
+DB_DIR="/app/data"; DB=f"{DB_DIR}/shop.db"; os.makedirs(DB_DIR,exist_ok=True)
 SHIP={"tracked24":{"label":"📦 Tracked24","price":5.0,"ltc":True},"drop":{"label":"📍 Local Drop","price":0.0,"ltc":False}}
 TIERS=[{"qty":1,"price":10.0},{"qty":3.5,"price":35.0},{"qty":7,"price":60.0},{"qty":14,"price":110.0},{"qty":28,"price":200.0},{"qty":56,"price":380.0}]
 STARS={1:"⭐",2:"⭐⭐",3:"⭐⭐⭐",4:"⭐⭐⭐⭐",5:"⭐⭐⭐⭐⭐"}; RPP=5
@@ -50,32 +50,8 @@ def init_db():
     """)
     cur.execute("INSERT OR IGNORE INTO admins(user_id,username) VALUES(?,'owner')",(ADMIN_ID,))
     cur.execute("INSERT OR IGNORE INTO discount_codes(code,pct,active) VALUES('SAVE10',0.10,1)")
-    migrations=[
-        "ALTER TABLE products ADD COLUMN category_id INTEGER DEFAULT 0",
-        "ALTER TABLE products ADD COLUMN hidden INTEGER DEFAULT 0",
-        "ALTER TABLE products ADD COLUMN tiers TEXT DEFAULT '[]'",
-        "ALTER TABLE orders ADD COLUMN ltc REAL DEFAULT 0",
-        "ALTER TABLE orders ADD COLUMN summary TEXT DEFAULT ''",
-        "ALTER TABLE orders ADD COLUMN created_at TEXT DEFAULT NULL",
-        "ALTER TABLE discount_codes ADD COLUMN expires TEXT",
-        "ALTER TABLE cart ADD COLUMN created_at TEXT DEFAULT NULL",
-        "ALTER TABLE loyalty ADD COLUMN lifetime INTEGER DEFAULT 0",
-        "ALTER TABLE announcements ADD COLUMN photo TEXT DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN joined DATETIME DEFAULT CURRENT_TIMESTAMP",
-    ]
-    renames=[
-        ("cart","chosen_qty","qty"),("cart","chosen_price","price"),
-        ("orders","name","cust_name"),("orders","total_gbp","gbp"),
-        ("orders","shipping_type","ship"),("orders","items_summary","summary"),
-        ("loyalty","lifetime_pts","lifetime"),
-        ("referrals","ref_code","code"),
-        ("review_reminders","dispatch_time","dispatched"),
-    ]
-    for s in migrations:
+    for s in ["ALTER TABLE products ADD COLUMN category_id INTEGER DEFAULT 0","ALTER TABLE products ADD COLUMN hidden INTEGER DEFAULT 0","ALTER TABLE orders ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP","ALTER TABLE orders ADD COLUMN ltc REAL DEFAULT 0","ALTER TABLE discount_codes ADD COLUMN expires TEXT"]:
         try: cur.execute(s)
-        except: pass
-    for tbl,old,new in renames:
-        try: cur.execute(f"ALTER TABLE {tbl} RENAME COLUMN {old} TO {new}")
         except: pass
     c.commit(); c.close()
 def is_admin(uid): return uid==ADMIN_ID or bool(q1("SELECT 1 FROM admins WHERE user_id=?",(uid,)))
@@ -125,13 +101,11 @@ def purge():
     c=(datetime.now()-timedelta(days=30)).isoformat(); qx("DELETE FROM drop_chats WHERE created_at<?",(c,)); qx("DELETE FROM cart WHERE created_at<?",(c,))
 
 def menu():
-    rows=[[IB("🛍️  Shop Now","shop")],
-          [IB("🧺  Basket","basket"),IB("📦  My Orders","orders")],
-          [IB("⭐  Reviews","reviews_0"),IB("📢  News","news")],
-          [IB("🎁  Loyalty","loyalty"),IB("🔗  Refer & Earn","my_ref")],
-          [IB("💬  Contact Us","contact")]]
-    if not is_open(): rows.insert(1,[IB("🔔 Notify Me When Open","notify_open")])
-    return InlineKeyboardMarkup(rows)
+    return KM([IB("🛍️  Shop Now","shop")],
+              [IB("🧺  Basket","basket"),IB("📦  My Orders","orders")],
+              [IB("⭐  Reviews","reviews_0"),IB("📢  News","news")],
+              [IB("🎁  Loyalty","loyalty"),IB("🔗  Refer & Earn","my_ref")],
+              [IB("💬  Contact Us","contact")])
 
 def back_kb(): return KM([IB("⬅️ Back","menu")])
 def cancel_kb(): return KM([IB("❌ Cancel","menu")])
@@ -274,8 +248,7 @@ async def co_confirm(u,ctx):
     if sk=="drop": qx("INSERT INTO drop_chats(order_id,user_id,sender,message) VALUES(?,?,?,?)",(oid,uid,"vendor",f"👋 Hi {hl.escape(name)}! Order received. Message to arrange pickup."))
     uname=q.from_user.username or str(uid)
     notif=f"🛒 <b>NEW ORDER {oid}</b>\n👤 {hl.escape(name)} (@{uname}) · 🏠 {hl.escape(addr_disp)}\n📦 {summary} · 🚚 {sl} · 💷 £{gbp:.2f}{f' | {ltc} LTC' if needs_ltc else ''}"
-    try: await ctx.bot.send_message(CHANNEL_ID,notif,parse_mode="HTML")
-    except: pass
+    await ctx.bot.send_message(CHANNEL_ID,notif,parse_mode="HTML")
     adm_kb=InlineKeyboardMarkup([[IB("✅ Confirm",f"adm_ok_{oid}"),IB("❌ Reject",f"adm_no_{oid}")]]+([[IB("💬 Chat",f"dch_{oid}")]] if sk=="drop" else []))
     try: await ctx.bot.send_message(ADMIN_ID,notif,parse_mode="HTML",reply_markup=adm_kb)
     except: pass
@@ -293,72 +266,19 @@ async def co_confirm(u,ctx):
     except: pass
     await q.message.reply_text(invoice,parse_mode="HTML",reply_markup=kb)
 
-def order_progress(status):
-    steps={"Pending":1,"Paid":2,"Dispatched":3,"Rejected":0}
-    n=steps.get(status,1)
-    if status=="Rejected": return "❌ <i>Rejected</i>"
-    bar=["🟢" if i<=n else "⚪" for i in range(1,4)]
-    labels=["Order Placed","Confirmed","Dispatched"]
-    return " → ".join(f"{'<b>' if i+1==n else ''}{bar[i]} {labels[i]}{'</b>' if i+1==n else ''}" for i in range(3))
-
 async def view_orders(u,ctx):
     q=u.callback_query; uid=q.from_user.id
     rows=qa("SELECT id,gbp,status,ship,summary FROM orders WHERE user_id=? ORDER BY rowid DESC",(uid,))
     if not rows: await safe_edit(q,"📭 No orders yet — shop now! 🛍️",parse_mode="HTML",reply_markup=KM([IB("🛍️ Shop","shop")],[IB("⬅️ Back","menu")])); return
+    sm={"Pending":("🕐","Pending"),"Paid":("✅","Confirmed"),"Dispatched":("🚚","Dispatched"),"Rejected":("❌","Rejected")}
     txt="📦 <b>Your Orders</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"; kb=[]
     for o in rows:
-        ship_icon="📍" if o["ship"]=="drop" else "📦"
-        txt+=f"{ship_icon} <b>Order {o['id']}</b> · 💷 £{o['gbp']:.2f}\n{hl.escape(o['summary'])}\n{order_progress(o['status'])}\n\n"
+        icon,lbl=sm.get(o["status"],("📋",o["status"]))
+        txt+=f"{icon} <b>Order {o['id']}</b> · {lbl} · {'📍' if o['ship']=='drop' else '📦'} · 💷 £{o['gbp']:.2f}\n{hl.escape(o['summary'])}\n\n"
         if o["ship"]=="drop" and o["status"] in ("Pending","Paid","Dispatched"):
             closed=gs(f"cc_{o['id']}","0")=="1"
             kb.append([IB(f"{'🔒 Closed' if closed else '💬 Drop Chat'} — {o['id']}",f"dcv_{o['id']}")])
-        if o["status"] in ("Paid","Dispatched"):
-            kb.append([IB(f"🔄 Reorder {o['id']}",f"reorder_{o['id']}")])
     await safe_edit(q,txt[:4000],parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb+[[IB("⬅️ Back","menu")]]))
-async def reorder_cb(u,ctx):
-    q=u.callback_query; oid=q.data[8:]; uid=q.from_user.id
-    o=q1("SELECT summary FROM orders WHERE id=? AND user_id=?",(oid,uid))
-    if not o: await q.answer("❌ Order not found.",show_alert=True); return
-    await q.answer()
-    await safe_edit(q,f"🔄 <b>Reorder from {oid}</b>\n\nPrevious order: <i>{hl.escape(o['summary'])}</i>\n\n👇 Head to the shop to pick your items again.",parse_mode="HTML",reply_markup=KM([IB("🛍️ Shop Now","shop")],[IB("⬅️ Back","orders")]))
-
-async def notify_open_cb(u,ctx):
-    q=u.callback_query; uid=q.from_user.id
-    if is_open(): await q.answer("🟢 We're open right now! Go ahead and order.",show_alert=True); return
-    ss(f"notify_{uid}","1"); await q.answer("🔔 Done! You'll get a message when we open.",show_alert=True)
-
-async def open_notify_job(ctx:ContextTypes.DEFAULT_TYPE):
-    if not is_open(): return
-    rows=qa("SELECT key FROM settings WHERE key LIKE 'notify_%'")
-    for r in rows:
-        uid=int(r["key"].split("_",1)[1])
-        try: await ctx.bot.send_message(uid,"🟢 <b>Donny's Shop is now open!</b>\n\nOrders close at 11am — shop now! 👇",parse_mode="HTML",reply_markup=menu())
-        except: pass
-        qx("DELETE FROM settings WHERE key=?",(r["key"],))
-
-async def cmd_stats(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    if not is_admin(u.effective_user.id): return
-    total_rev=q1("SELECT COALESCE(SUM(gbp),0) as t FROM orders WHERE status IN ('Paid','Dispatched')")["t"]
-    total_orders=q1("SELECT COUNT(*) as c FROM orders")["c"]
-    paid_orders=q1("SELECT COUNT(*) as c FROM orders WHERE status IN ('Paid','Dispatched')")["c"]
-    pending=q1("SELECT COUNT(*) as c FROM orders WHERE status='Pending'")["c"]
-    today=datetime.now().strftime("%Y-%m-%d")
-    today_rev=q1("SELECT COALESCE(SUM(gbp),0) as t FROM orders WHERE status IN ('Paid','Dispatched') AND created_at LIKE ?",(today+"%",))["t"]
-    today_orders=q1("SELECT COUNT(*) as c FROM orders WHERE created_at LIKE ?",(today+"%",))["c"]
-    users=q1("SELECT COUNT(*) as c FROM users")["c"]
-    reviews=q1("SELECT COUNT(*) as c,COALESCE(AVG(stars),0) as avg FROM reviews")
-    top=qa("SELECT cust_name,SUM(gbp) as spent FROM orders WHERE status IN ('Paid','Dispatched') GROUP BY user_id ORDER BY spent DESC LIMIT 3")
-    top_txt="".join(f"  {'🥇🥈🥉'[i]} {hl.escape(r['cust_name'])} — £{r['spent']:.2f}\n" for i,r in enumerate(top))
-    await u.message.reply_text(
-        f"📊 <b>Shop Stats</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"💷 <b>Total Revenue:</b> £{total_rev:.2f}\n"
-        f"📦 <b>Total Orders:</b> {total_orders} ({paid_orders} paid, {pending} pending)\n"
-        f"📅 <b>Today:</b> {today_orders} orders · £{today_rev:.2f}\n"
-        f"👥 <b>Customers:</b> {users}\n"
-        f"⭐ <b>Reviews:</b> {reviews['c']} · avg {reviews['avg']:.1f}/5\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n🏆 <b>Top Customers:</b>\n{top_txt}",
-        parse_mode="HTML")
-
 async def user_paid(u,ctx):
     q=u.callback_query; oid=q.data[5:]
     row=q1("SELECT ship,cust_name,summary,gbp,ltc,address FROM orders WHERE id=?",(oid,))
@@ -860,51 +780,23 @@ async def router(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     elif d=="adm_admins":            await adm_admins(u,ctx)
     elif d=="adm_addadmin":          await adm_addadmin_start(u,ctx)
     elif d.startswith("adm_rmadmin_"):await adm_rmadmin(u,ctx)
-    elif d.startswith("reorder_"):   await reorder_cb(u,ctx)
-    elif d=="notify_open":           await notify_open_cb(u,ctx)
 
-
-async def error_handler(u,ctx:ContextTypes.DEFAULT_TYPE):
-    import traceback
-    err=ctx.error; tb="".join(traceback.format_exception(type(err),err,err.__traceback__))
-    logging.error(f"Unhandled exception:\n{tb}")
-    try:
-        if u and u.callback_query:
-            try: await u.callback_query.answer("⚠️ Something went wrong. Please try again.",show_alert=True)
-            except: pass
-            try: await u.callback_query.message.reply_text("⚠️ An error occurred. Please tap the button again or go back to /start.",reply_markup=menu())
-            except: pass
-        elif u and u.message:
-            await u.message.reply_text("⚠️ An error occurred. Please try again or use /start.",reply_markup=menu())
-    except: pass
 
 class _Ping(BaseHTTPRequestHandler):
     def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
     def log_message(self,*a): pass
-
-class _ReuseServer(HTTPServer):
-    allow_reuse_address=True
-
-def _start_ping():
-    for port in [8080,8081,8082]:
-        try: _ReuseServer(("0.0.0.0",port),_Ping).serve_forever(); break
-        except OSError: continue
-
 def main():
-    Thread(target=_start_ping,daemon=True).start()
+    Thread(target=lambda:HTTPServer(("0.0.0.0",8080),_Ping).serve_forever(),daemon=True).start()
     if not TOKEN: raise RuntimeError("❌ TOKEN not set — add it to Replit Secrets")
     init_db(); app=ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler(["start","Start"],cmd_start))
-    for cmd,fn in [("admin",cmd_admin),("reply",cmd_reply),("order",cmd_order),("customer",cmd_customer),("myorder",cmd_myorder),("addproduct",cmd_addproduct),("cancel",cmd_cancel),("stats",cmd_stats)]:
+    for cmd,fn in [("admin",cmd_admin),("reply",cmd_reply),("order",cmd_order),("customer",cmd_customer),("myorder",cmd_myorder),("addproduct",cmd_addproduct),("cancel",cmd_cancel)]:
         app.add_handler(CommandHandler(cmd,fn))
     app.add_handler(CallbackQueryHandler(router))
     app.add_handler(MessageHandler(filters.PHOTO,on_photo))
     app.add_handler(MessageHandler(filters.TEXT&~filters.COMMAND,on_message))
-    app.add_error_handler(error_handler)
-    try:
-        app.job_queue.run_repeating(review_reminder_job,interval=3600,first=300)
-        app.job_queue.run_repeating(open_notify_job,interval=1800,first=60)
-    except Exception as e: print(f"⚠️ Job queue: {e}")
-    print("🚀 Donny's Shop — Running"); app.run_polling(drop_pending_updates=True,allowed_updates=Update.ALL_TYPES)
+    try: app.job_queue.run_repeating(review_reminder_job,interval=3600,first=300)
+    except Exception as e: print(f"⚠️ Job queue not available: {e} — install with pip install python-telegram-bot[job-queue]")
+    print("🚀 Donny's Shop — Running"); app.run_polling(drop_pending_updates=True)
 if __name__=="__main__":
     main()
