@@ -1,504 +1,910 @@
 # -*- coding: utf-8 -*-
-import os, json, sqlite3, logging, requests
+import os,json,logging,requests,sqlite3,html as hl
+from threading import Thread
+from http.server import HTTPServer,BaseHTTPRequestHandler
 from uuid import uuid4
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import (ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-                           MessageHandler, ConversationHandler, ContextTypes, filters)
+from datetime import datetime,timedelta
+from telegram import Update,InlineKeyboardMarkup,InlineKeyboardButton as _IB
+def IB(text,cb): return _IB(text=text,callback_data=cb)
+from telegram.ext import ApplicationBuilder,CommandHandler,CallbackQueryHandler,MessageHandler,ContextTypes,filters
 
-# ══ CONFIG ══════════════════════════════════════════════════════════════════
-TOKEN      = os.getenv("TOKEN")
-ADMIN_ID   = 7773622161
-CHANNEL_ID = -1003833257976
-LTC_ADDR   = "ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
-DB_NAME    = "shop.db"
-STARS      = {1:"⭐",2:"⭐⭐",3:"⭐⭐⭐",4:"⭐⭐⭐⭐",5:"⭐⭐⭐⭐⭐"}
-DISCOUNT_CODES = {"SAVE10": 0.10}
-SHIPPING   = {"tracked24":{"label":"📦 Tracked24","price":5.0},
-              "free":     {"label":"🚶 Collection","price":0.0}}
-DEFAULT_TIERS = [{"qty":1,"price":10.0},{"qty":3.5,"price":5.0},{"qty":7,"price":4.0},
-                 {"qty":14,"price":3.0},{"qty":28,"price":2.0},{"qty":56,"price":1.0}]
-logging.basicConfig(level=logging.INFO)
-
-# ── Conversation states ──────────────────────────────────────────────────────
-(PICK_STARS, WRITE_REVIEW, ADD_PHOTO, ADD_TITLE, ADD_DESC, ADD_QTY,
- EDIT_TIERS, ASK_CONTACT, ASK_ANN_TITLE, ASK_ANN_BODY,
- CO_NAME, CO_ADDR, CO_DISC) = range(13)
-
-# ══ DATABASE ════════════════════════════════════════════════════════════════
-def db(): return sqlite3.connect(DB_NAME)
+TOKEN=os.getenv("TOKEN"); ADMIN_ID=7773622161; CHANNEL_ID=-1003833257976
+LTC_ADDR="ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"; DB="shop.db"
+SHIP={"tracked24":{"label":"📦 Tracked24","price":5.0,"ltc":True},"drop":{"label":"📍 Local Drop","price":0.0,"ltc":False}}
+TIERS=[{"qty":1,"price":10.0},{"qty":3.5,"price":35.0},{"qty":7,"price":60.0},{"qty":14,"price":110.0},{"qty":28,"price":200.0},{"qty":56,"price":380.0}]
+STARS={1:"⭐",2:"⭐⭐",3:"⭐⭐⭐",4:"⭐⭐⭐⭐",5:"⭐⭐⭐⭐⭐"}; RPP=5
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s",level=logging.WARNING)
+def db():
+    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
+def q1(s,p=()):
+    c=db(); r=c.execute(s,p).fetchone(); c.close(); return dict(r) if r else None
+def qa(s,p=()):
+    c=db(); r=c.execute(s,p).fetchall(); c.close(); return [dict(x) for x in r]
+def qx(s,p=()):
+    c=db(); c.execute(s,p); c.commit(); c.close()
+def qxi(s,p=()):
+    c=db(); cur=c.execute(s,p); r=cur.lastrowid; c.commit(); c.close(); return r
+def gs(k,d=""):
+    r=q1("SELECT value FROM settings WHERE key=?",(k,)); return r["value"] if r else d
+def ss(k,v): qx("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(k,v))
 
 def init_db():
-    c = db(); cur = c.cursor()
+    c=db(); cur=c.cursor()
     cur.executescript("""
-    CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,description TEXT,photo TEXT,stock INTEGER DEFAULT 0,tiers TEXT DEFAULT '[]');
-    CREATE TABLE IF NOT EXISTS cart(id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,product_id INTEGER,chosen_qty REAL,chosen_price REAL);
-    CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,user_id INTEGER,
-        name TEXT,address TEXT,total_gbp REAL,total_ltc REAL,status TEXT);
-    CREATE TABLE IF NOT EXISTS reviews(order_id TEXT PRIMARY KEY,user_id INTEGER,
-        stars INTEGER DEFAULT 0,text TEXT);
-    CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,username TEXT,message TEXT,reply TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS announcements(id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT,body TEXT,created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,username TEXT);
+    CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,username TEXT,joined DATETIME DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
+    CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY,username TEXT);
+    CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,description TEXT,photo TEXT,hidden INTEGER DEFAULT 0,tiers TEXT DEFAULT '[]',category_id INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,emoji TEXT DEFAULT '🌿');
+    CREATE TABLE IF NOT EXISTS cart(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,product_id INTEGER,qty REAL,price REAL,created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,user_id INTEGER,cust_name TEXT,address TEXT,summary TEXT DEFAULT '',gbp REAL,ltc REAL DEFAULT 0,status TEXT DEFAULT 'Pending',ship TEXT DEFAULT 'tracked24',created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS order_notes(order_id TEXT PRIMARY KEY,note TEXT);
+    CREATE TABLE IF NOT EXISTS drop_chats(id INTEGER PRIMARY KEY AUTOINCREMENT,order_id TEXT,user_id INTEGER,sender TEXT,message TEXT,created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,username TEXT,message TEXT,reply TEXT,created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS reviews(order_id TEXT PRIMARY KEY,user_id INTEGER,stars INTEGER,text TEXT,created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS announcements(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT,body TEXT,photo TEXT DEFAULT '',created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS discount_codes(code TEXT PRIMARY KEY,pct REAL,active INTEGER DEFAULT 1,expires TEXT);
+    CREATE TABLE IF NOT EXISTS loyalty(user_id INTEGER PRIMARY KEY,points INTEGER DEFAULT 0,credit REAL DEFAULT 0,lifetime INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS referrals(code TEXT PRIMARY KEY,owner_id INTEGER,count INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS review_reminders(order_id TEXT PRIMARY KEY,user_id INTEGER,dispatched DATETIME);
     """)
-    try: cur.execute("ALTER TABLE reviews ADD COLUMN stars INTEGER DEFAULT 0")
-    except: pass
-    c.commit(); c.close()
-
-# ══ HELPERS ═════════════════════════════════════════════════════════════════
-def fq(q): return f"{int(q)}g" if q==int(q) else f"{q}g"
-def ft(t): return f"⚖️ {fq(t['qty'])} — £{t['price']:.2f}/g"
-def ltc_rate():
-    try: return requests.get("https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=gbp",timeout=10).json()["litecoin"]["gbp"]
-    except: return 55
-def menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛍️ Products",       callback_data="products")],
-        [InlineKeyboardButton("🧺 Basket",          callback_data="basket")],
-        [InlineKeyboardButton("📦 My Orders",       callback_data="orders")],
-        [InlineKeyboardButton("⭐ Reviews",         callback_data="pub_reviews")],
-        [InlineKeyboardButton("📢 Announcements",   callback_data="announcements")],
-        [InlineKeyboardButton("💬 Contact Vendor",  callback_data="contact_vendor")],
-    ])
-def back(): return [InlineKeyboardButton("⬅️ Back", callback_data="menu")]
-def cancel_kb(): return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="menu")]])
-
-def co_kb(ud):
-    n,a,s,dp = ud.get("co_name"),ud.get("co_addr"),ud.get("co_shipping"),ud.get("co_disc_pct",0)
-    rows = [
-        [InlineKeyboardButton(f"✅ {n}" if n else "👤 Enter Name",     callback_data="co_name")],
-        [InlineKeyboardButton("✅ Address set" if a else "🏠 Enter Address", callback_data="co_addr")],
-        [InlineKeyboardButton(("✅ " if s=="tracked24" else "")+"📦 Tracked24 (+£5)", callback_data="co_ship_tracked24"),
-         InlineKeyboardButton(("✅ " if s=="free" else "")+"🚶 Collection",          callback_data="co_ship_free")],
-        [InlineKeyboardButton(f"🏷️ {ud.get('co_discount')} ({int(dp*100)}% off) ✅" if dp else "🏷️ Discount Code", callback_data="co_disc")],
+    cur.execute("INSERT OR IGNORE INTO admins(user_id,username) VALUES(?,'owner')",(ADMIN_ID,))
+    cur.execute("INSERT OR IGNORE INTO discount_codes(code,pct,active) VALUES('SAVE10',0.10,1)")
+    migrations=[
+        "ALTER TABLE products ADD COLUMN category_id INTEGER DEFAULT 0",
+        "ALTER TABLE products ADD COLUMN hidden INTEGER DEFAULT 0",
+        "ALTER TABLE products ADD COLUMN tiers TEXT DEFAULT '[]'",
+        "ALTER TABLE orders ADD COLUMN ltc REAL DEFAULT 0",
+        "ALTER TABLE orders ADD COLUMN summary TEXT DEFAULT ''",
+        "ALTER TABLE orders ADD COLUMN created_at TEXT DEFAULT NULL",
+        "ALTER TABLE discount_codes ADD COLUMN expires TEXT",
+        "ALTER TABLE cart ADD COLUMN created_at TEXT DEFAULT NULL",
+        "ALTER TABLE loyalty ADD COLUMN lifetime INTEGER DEFAULT 0",
+        "ALTER TABLE announcements ADD COLUMN photo TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN joined DATETIME DEFAULT CURRENT_TIMESTAMP",
     ]
-    if n and a and s: rows.append([InlineKeyboardButton("✅ Confirm & Place Order", callback_data="co_confirm")])
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="menu")])
+    renames=[
+        ("cart","chosen_qty","qty"),("cart","chosen_price","price"),
+        ("orders","name","cust_name"),("orders","total_gbp","gbp"),
+        ("orders","shipping_type","ship"),("orders","items_summary","summary"),
+        ("loyalty","lifetime_pts","lifetime"),
+        ("referrals","ref_code","code"),
+        ("review_reminders","dispatch_time","dispatched"),
+    ]
+    for s in migrations:
+        try: cur.execute(s)
+        except: pass
+    for tbl,old,new in renames:
+        try: cur.execute(f"ALTER TABLE {tbl} RENAME COLUMN {old} TO {new}")
+        except: pass
+    c.commit(); c.close()
+def is_admin(uid): return uid==ADMIN_ID or bool(q1("SELECT 1 FROM admins WHERE user_id=?",(uid,)))
+def is_known(uid): return bool(q1("SELECT 1 FROM users WHERE user_id=?",(uid,)))
+def fq(q): return f"{int(q)}g" if q==int(q) else f"{q}g"
+def ft(t): ppg=round(t["price"]/t["qty"],2) if t["qty"] else t["price"]; return f"⚖️ {fq(t['qty'])} · £{t['price']:.2f} (£{ppg}/g)"
+def KM(*rows): return InlineKeyboardMarkup(list(rows))
+def ltc_price():
+    try: return requests.get("https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=gbp",timeout=8).json()["litecoin"]["gbp"]
+    except: return 60.0
+def is_open():
+    n=datetime.now(); return n.weekday()<6 and n.hour<11
+def open_badge():
+    return "🟢 <b>Open</b> · Orders close 11am Mon–Sat" if is_open() else "🔴 <b>Closed</b> · Next working day"
+
+def gdisc(c):
+    r=q1("SELECT pct,expires FROM discount_codes WHERE code=? AND active=1",(c.upper(),))
+    if not r: return None
+    if r.get("expires"):
+        try:
+            if datetime.fromisoformat(r["expires"])<datetime.now(): qx("UPDATE discount_codes SET active=0 WHERE code=?",(c.upper(),)); return None
+        except: pass
+    return r["pct"]
+
+def get_loyalty(uid):
+    return q1("SELECT points,credit,lifetime FROM loyalty WHERE user_id=?",(uid,)) or {"points":0,"credit":0.0,"lifetime":0}
+
+def add_points(uid,gbp):
+    pts=int(gbp)*2; lo=get_loyalty(uid); np=lo["points"]+pts; lf=lo["lifetime"]+pts; m=np//100; cr=m*25.0; np=np%100; qx("INSERT INTO loyalty(user_id,points,credit,lifetime) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET points=?,credit=credit+?,lifetime=?",(uid,np,cr,lf,np,cr,lf)); return pts,cr
+
+def get_ref(uid):
+    r=q1("SELECT code FROM referrals WHERE owner_id=?",(uid,))
+    if r: return r["code"]
+    c=str(uid)[-4:]+str(uuid4())[:4].upper(); qx("INSERT OR IGNORE INTO referrals(code,owner_id) VALUES(?,?)",(c,uid)); return c
+
+def credit_ref(ref_code,new_uid):
+    r=q1("SELECT owner_id,count FROM referrals WHERE code=? AND owner_id!=?",(ref_code,new_uid))
+    if not r: return None
+    n=r["count"]+1; qx("UPDATE referrals SET count=? WHERE code=?",(n,ref_code)); return r["owner_id"],n
+
+def fmt_chat(oid):
+    msgs=qa("SELECT sender,message,created_at FROM drop_chats WHERE order_id=? ORDER BY created_at",(oid,))
+    if not msgs: return "<i>No messages yet.</i>"
+    return "\n\n".join(f"<b>{'👤 You' if m['sender']=='user' else '🏪 Donny'}</b> <i>{str(m['created_at'])[:16]}</i>\n{hl.escape(m['message'])}" for m in msgs)
+
+def purge():
+    c=(datetime.now()-timedelta(days=30)).isoformat(); qx("DELETE FROM drop_chats WHERE created_at<?",(c,)); qx("DELETE FROM cart WHERE created_at<?",(c,))
+
+def menu():
+    rows=[[IB("🛍️  Shop Now","shop")],
+          [IB("🧺  Basket","basket"),IB("📦  My Orders","orders")],
+          [IB("⭐  Reviews","reviews_0"),IB("📢  News","news")],
+          [IB("🎁  Loyalty","loyalty"),IB("🔗  Refer & Earn","my_ref")],
+          [IB("💬  Contact Us","contact")]]
+    if not is_open(): rows.insert(1,[IB("🔔 Notify Me When Open","notify_open")])
     return InlineKeyboardMarkup(rows)
 
-def co_text(ud):
-    sk = ud.get("co_shipping"); dp = ud.get("co_disc_pct",0); sub = ud.get("co_subtotal",0)
-    sp = SHIPPING[sk]["price"] if sk else 0; sl = SHIPPING[sk]["label"] if sk else "Not selected"
-    disc = round(sub*dp,2); total = round(sub-disc+sp,2)
-    t = (f"🛒 <b>Checkout</b>\n\n👤 {ud.get('co_name','—')}\n🏠 {ud.get('co_addr','—')}\n"
-         f"🚚 {sl} (+£{sp:.2f})\n")
-    if dp: t += f"🏷️ {ud.get('co_discount')} (-£{disc:.2f})\n"
-    return t+f"\n💰 <b>Total: £{total:.2f}</b>", total
+def back_kb(): return KM([IB("⬅️ Back","menu")])
+def cancel_kb(): return KM([IB("❌ Cancel","menu")])
 
-# ══ START ════════════════════════════════════════════════════════════════════
-async def start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = u.effective_user.id; uname = u.effective_user.username or ""
-    c = db(); c.execute("INSERT OR IGNORE INTO users VALUES(?,?)",(uid,uname)); c.commit(); c.close()
-    await u.message.reply_text(
-        "👋 Welcome to <b>Donny's Shop</b>! 🌿\n\n"
-        "🛍️ Products · 🧺 Basket · 📦 Orders · ⭐ Reviews\n"
-        "📢 Announcements · 💬 Contact Vendor\n\n"
-        "<b>How to order:</b> Products → pick weight → Basket → Checkout → pay LTC → I Have Paid ✅",
-        reply_markup=menu(), parse_mode="HTML")
+def co_kb(ud):
+    n,a,s,dp=ud.get("co_name"),ud.get("co_addr"),ud.get("co_ship"),ud.get("co_disc_pct",0)
+    al="✅ Address set" if a else ("📍 Not needed" if s=="drop" else "🏠 Delivery Address")
+    rows=[[IB(f"✅ {hl.escape(n)}" if n else "👤 Your Name","co_name")],[IB(al,"co_addr")],
+          [IB(("✅ " if s=="tracked24" else "")+"📦 Tracked24 (+£5)","co_ship_tracked24"),
+           IB(("✅ " if s=="drop" else "")+"📍 Local Drop (Free)","co_ship_drop")],
+          [IB(f"🏷️ {ud.get('co_disc_code')} ({int(dp*100)}% off) ✅" if dp else "🏷️ Discount Code","co_disc")]]
+    if n and s and (a or s=="drop"): rows.append([IB("🛒 Place Order","co_confirm")])
+    rows.append([IB("❌ Cancel","menu")]); return InlineKeyboardMarkup(rows)
 
-# ══ PRODUCTS ═════════════════════════════════════════════════════════════════
-async def show_products(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; await q.answer()
-    con=db(); rows=con.execute("SELECT id,name,stock FROM products").fetchall(); con.close()
-    kb=[[InlineKeyboardButton(f"🌿 {n} (📦 {s})",callback_data=f"prod_{i}")] for i,n,s in rows]+[back()]
-    txt="🛍️ <b>Choose a product:</b>" if rows else "😔 No products available."
-    try:
-        await q.edit_message_text(txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
-    except Exception:
+def co_summary(ud,uid=None):
+    s=ud.get("co_ship"); sub=ud.get("co_sub",0); dp=ud.get("co_disc_pct",0)
+    sp=SHIP[s]["price"] if s else 0; sl=SHIP[s]["label"] if s else "—"
+    disc=round(sub*dp,2); total=round(sub-disc+sp,2); addr=ud.get("co_addr") or ("Not required" if s=="drop" else "—")
+    cr=get_loyalty(uid)["credit"] if uid else 0; dl=f"🏷️ {ud.get('co_disc_code','')} -£{disc:.2f}\n" if dp else ""; cl=f"💳 £{cr:.2f} credit\n" if cr>0 else ""
+    hint="📍 <i>Local drop — local only.</i>" if s=="drop" else ("📦 <i>Enter address above.</i>" if s=="tracked24" else "<i>Select delivery method.</i>")
+    return f"🛒 <b>Checkout</b>\n━━━━━━━━━━━━━━━━━━━━\n👤 {hl.escape(ud.get('co_name') or '—')}\n🏠 {hl.escape(addr)}\n🚚 {sl}\n{cl}{dl}━━━━━━━━━━━━━━━━━━━━\n💰 <b>Total: £{total:.2f}</b>\n\n{hint}",total
+
+def dc_user_kb(oid,closed=False):
+    return KM([IB("🔓 Reopen Chat",f"dco_{oid}")],[IB("⬅️ Back","orders")]) if closed else KM([IB("✉️ Send Message",f"dcm_{oid}")],[IB("🔒 Close Chat",f"dcc_{oid}"),IB("⬅️ Back","orders")])
+def dc_admin_kb(oid): return KM([IB("↩️ Reply",f"dcr_{oid}"),IB("🔒 Close",f"dcac_{oid}"),IB("📋 History",f"dch_{oid}")])
+
+async def safe_edit(q,text,**kw):
+    try: await q.edit_message_text(text,**kw)
+    except:
         try: await q.message.delete()
         except: pass
-        await ctx.bot.send_message(q.message.chat_id,txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+        await q.message.reply_text(text,**kw)
 
-async def show_product(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; await q.answer()
-    pid = int(q.data.split("_")[1])
-    con=db(); row=con.execute("SELECT name,description,photo,stock,tiers FROM products WHERE id=?",(pid,)).fetchone(); con.close()
-    if not row: await q.edit_message_text("❌ Not found.",reply_markup=InlineKeyboardMarkup([back()])); return
-    name,desc,photo,stock,tj = row
-    tiers = json.loads(tj) if tj else DEFAULT_TIERS[:]
-    btns  = [InlineKeyboardButton(ft(t),callback_data=f"pick_{pid}_{t['qty']}_{t['price']}") for t in tiers]
-    rows2 = [btns[i:i+2] for i in range(0,len(btns),2)]
-    rows2.append([InlineKeyboardButton("⬅️ Back to Products",callback_data="products")])
-    cap = f"🌿 <b>{name}</b>\n\n📝 {desc}\n\n📦 Stock: <b>{stock}</b>\n\n"+"\n".join(ft(t) for t in tiers)
+async def cmd_start(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    try: purge()
+    except: pass
+    uid=u.effective_user.id; print(f"👤 /start from {uid}"); is_new=not q1("SELECT 1 FROM users WHERE user_id=?",(uid,))
+    qx("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",(uid,u.effective_user.username or ""))
+    if is_new and ctx.args:
+        result=credit_ref(ctx.args[0],uid)
+        if result:
+            owner_id,cnt=result
+            try:
+                msg="🎉 FREE 3.5g Lemon Cherry Gelato incoming! 🌿" if cnt%15==0 else f"🔗 +1 referral! {cnt} total · {15-(cnt%15)} more = FREE 3.5g"
+                await ctx.bot.send_message(owner_id,msg)
+                if cnt%15==0: await ctx.bot.send_message(ADMIN_ID,f"🎁 {owner_id} hit {cnt} refs — send FREE 3.5g LCG.")
+            except: pass
+    name=hl.escape(u.effective_user.first_name or "there"); extra=gs("home_extra"); el=f"\n\n{extra}" if extra else ""
+    await u.message.reply_text(
+        f"🌿 <b>Welcome to Donny's Shop, {name}.</b>\n━━━━━━━━━━━━━━━━━━━━\n\n{open_badge()}\n🕙 <b>Mon–Sat · Orders close 11am</b>\n\n"
+        f"Premium quality. Every time.{el}\n\n📦 Tracked · 📍 Local Drop · 🔒 Discreet · ⭐ 5-Star\n\n👇 <b>Tap Shop Now</b>",
+        parse_mode="HTML",reply_markup=menu())
+async def show_shop(u,ctx):
+    q=u.callback_query; cats=qa("SELECT * FROM categories ORDER BY id"); kb=[]
+    if cats:
+        kb=[[IB(f"{c['emoji']} {c['name']}",f"cat_{c['id']}")] for c in cats]
+        unc=qa("SELECT id,name FROM products WHERE hidden=0 AND (category_id=0 OR category_id IS NULL) ORDER BY id")
+        if unc: kb+=[[IB(f"🌿 {r['name']}",f"prod_{r['id']}")] for r in unc]
+    else:
+        prods=qa("SELECT id,name FROM products WHERE hidden=0 ORDER BY id")
+        kb=[[IB(f"🌿 {r['name']}",f"prod_{r['id']}")] for r in prods] or [[IB("No products yet","noop")]]
+    await safe_edit(q,"🛍️ <b>Shop</b>\n\nChoose a product:",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb+[[IB("⬅️ Back","menu")]]))
+async def show_category(u,ctx):
+    q=u.callback_query; cid=int(q.data.split("_")[1])
+    cat=q1("SELECT * FROM categories WHERE id=?",(cid,))
+    if not cat: await safe_edit(q,"❌ Category not found.",reply_markup=back_kb()); return
+    prods=qa("SELECT id,name FROM products WHERE hidden=0 AND category_id=? ORDER BY id",(cid,))
+    kb=[[IB(f"🌿 {r['name']}",f"prod_{r['id']}")] for r in prods]+[[IB("⬅️ Back","shop")]]
+    txt=f"{cat['emoji']} <b>{hl.escape(cat['name'])}</b>" if prods else f"😔 No products in {cat['name']} yet."
+    await safe_edit(q,txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+
+async def show_product(u,ctx):
+    q=u.callback_query; pid=int(q.data.split("_")[1]); row=q1("SELECT * FROM products WHERE id=? AND hidden=0",(pid,))
+    if not row: await safe_edit(q,"❌ Product not available.",reply_markup=back_kb()); return
+    tiers=json.loads(row["tiers"]) if row.get("tiers") else TIERS[:]
+    btns=[IB(ft(t),f"pick_{pid}_{t['qty']}_{t['price']}") for t in tiers]
+    kb=[btns[i:i+2] for i in range(0,len(btns),2)]+[[IB("🧺 Basket","basket"),IB("⬅️ Back","shop")]]
+    cap=f"🌿 <b>{hl.escape(row['name'])}</b>\n\n{hl.escape(row['description'])}\n\n"+"".join(ft(t)+"\n" for t in tiers)
     try: await q.message.delete()
     except: pass
-    await ctx.bot.send_photo(q.message.chat_id,photo,caption=cap,reply_markup=InlineKeyboardMarkup(rows2),parse_mode="HTML")
+    if row.get("photo"): await ctx.bot.send_photo(q.message.chat_id,row["photo"],caption=cap[:1020],parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+    else: await q.message.reply_text(cap[:4000],parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+async def pick_weight(u,ctx):
+    q=u.callback_query; p=q.data.split("_"); pid,qty,price=int(p[1]),float(p[2]),float(p[3])
+    row=q1("SELECT name FROM products WHERE id=? AND hidden=0",(pid,))
+    if not row: await q.answer("❌ Product no longer available.",show_alert=True); return
+    qx("INSERT INTO cart(user_id,product_id,qty,price) VALUES(?,?,?,?)",(q.from_user.id,pid,qty,price))
+    await q.answer(f"✅ {fq(qty)} of {row['name']} added! (£{price:.2f})",show_alert=True)
 
-async def pick_weight(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; parts=q.data.split("_")
-    pid,qty,price = int(parts[1]),float(parts[2]),float(parts[3])
-    con=db(); row=con.execute("SELECT name,stock FROM products WHERE id=?",(pid,)).fetchone()
-    if not row or row[1]<1: con.close(); await q.answer("❌ Out of stock!",show_alert=True); return
-    con.execute("INSERT INTO cart(user_id,product_id,chosen_qty,chosen_price) VALUES(?,?,?,?)",(q.from_user.id,pid,qty,price))
-    con.commit(); con.close()
-    await q.answer(f"✅ Added {fq(qty)} of {row[0]} — £{price:.2f}/g",show_alert=True)
+async def view_basket(u,ctx):
+    q=u.callback_query; uid=q.from_user.id; items=qa("SELECT cart.id,products.name,cart.qty,cart.price FROM cart JOIN products ON cart.product_id=products.id WHERE cart.user_id=? ORDER BY cart.id",(uid,))
+    if not items: await safe_edit(q,"🧺 Basket empty.",reply_markup=KM([IB("🛍️ Shop","shop")],[IB("⬅️ Back","menu")])); return
+    total=sum(r["price"] for r in items)
+    txt="🧺 <b>Basket</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"+"".join(f"• {hl.escape(r['name'])} {fq(r['qty'])} — £{r['price']:.2f}\n" for r in items)+f"\n━━━━━━━━━━━━━━━━━━━━\n💰 <b>Total: £{total:.2f}</b>"
+    await safe_edit(q,txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[IB(f"🗑️ {r['name']} {fq(r['qty'])}",f"rm_{r['id']}")] for r in items]+[[IB("💳 Checkout","checkout")],[IB("⬅️ Back","menu")]]))
+async def remove_item(u,ctx):
+    q=u.callback_query; qx("DELETE FROM cart WHERE id=? AND user_id=?",(int(q.data.split("_")[1]),q.from_user.id)); await view_basket(u,ctx)
 
-# ══ BASKET ═══════════════════════════════════════════════════════════════════
-async def view_basket(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; await q.answer()
-    con=db(); items=con.execute("SELECT cart.id,products.name,cart.chosen_qty,cart.chosen_price FROM cart JOIN products ON cart.product_id=products.id WHERE cart.user_id=?",(q.from_user.id,)).fetchall(); con.close()
-    if not items: await q.edit_message_text("🧺 Basket empty.",reply_markup=InlineKeyboardMarkup([back()])); return
-    txt="🧺 <b>Your Basket</b>\n\n"+"".join(f"🌿 {n} ({fq(qy)}) — £{p:.2f}\n" for _,n,qy,p in items)
-    txt+=f"\n💰 <b>Total: £{sum(i[3] for i in items):.2f}</b>"
-    rm=[[InlineKeyboardButton(f"🗑️ {n} ({fq(qy)})",callback_data=f"remove_{cid}")] for cid,n,qy,_ in items]
-    await q.edit_message_text(txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(rm+[[InlineKeyboardButton("💳 Checkout",callback_data="checkout")],back()]))
+async def checkout_start(u,ctx):
+    q=u.callback_query; uid=q.from_user.id; prices=qa("SELECT price FROM cart WHERE user_id=?",(uid,))
+    if not prices: await safe_edit(q,"🧺 Basket empty.",reply_markup=menu()); return
+    ctx.user_data.update({"co_name":None,"co_addr":None,"co_ship":None,"co_disc_code":None,"co_disc_pct":0,"co_credit":0.0,"co_sub":round(sum(r["price"] for r in prices),2),"wf":None})
+    t,_=co_summary(ctx.user_data,uid); await safe_edit(q,t,parse_mode="HTML",reply_markup=co_kb(ctx.user_data))
+async def co_name_start(u,ctx):
+    q=u.callback_query; ctx.user_data["wf"]="co_name"; await safe_edit(q,"👤 Enter your full name:",reply_markup=KM([IB("❌ Cancel","co_refresh")]))
 
-async def remove_item(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; await q.answer()
-    cid=int(q.data.split("_")[1]); con=db()
-    con.execute("DELETE FROM cart WHERE id=? AND user_id=?",(cid,q.from_user.id)); con.commit(); con.close()
-    await view_basket(u,ctx)
+async def co_addr_start(u,ctx):
+    q=u.callback_query
+    if ctx.user_data.get("co_ship")=="drop": await safe_edit(q,"📍 No address needed. Tap Skip or type a rough area.",reply_markup=KM([IB("⏭️ Skip","co_addr_skip")],[IB("❌ Cancel","co_refresh")]))
+    else: ctx.user_data["wf"]="co_addr"; await safe_edit(q,"🏠 Enter your full delivery address:",reply_markup=KM([IB("❌ Cancel","co_refresh")]))
 
-# ══ ORDERS ═══════════════════════════════════════════════════════════════════
-async def view_orders(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; await q.answer()
-    con=db(); rows=con.execute("SELECT id,total_gbp,total_ltc,status FROM orders WHERE user_id=? ORDER BY rowid DESC",(q.from_user.id,)).fetchall(); con.close()
-    if not rows: await q.edit_message_text("📭 No orders.",reply_markup=InlineKeyboardMarkup([back()])); return
-    emap={"Awaiting Payment":"⏳","Paid":"✅","Dispatched":"🚚","Rejected":"❌"}
-    txt="📦 <b>Your Orders</b>\n\n"+"".join(f"🔖 <code>{o[0]}</code>\n💷 £{o[1]:.2f} | {emap.get(o[3],o[3])} {o[3]}\n\n" for o in rows)
-    await q.edit_message_text(txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup([back()]))
+async def co_addr_skip(u,ctx):
+    q=u.callback_query; ctx.user_data["co_addr"]=""; ctx.user_data["wf"]=None; t,_=co_summary(ctx.user_data,q.from_user.id); await safe_edit(q,t,parse_mode="HTML",reply_markup=co_kb(ctx.user_data))
 
-# ══ REVIEWS ══════════════════════════════════════════════════════════════════
-async def pub_reviews(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; await q.answer()
-    con=db(); rows=con.execute("SELECT stars,text FROM reviews ORDER BY rowid DESC LIMIT 20").fetchall(); con.close()
-    if not rows: await q.edit_message_text("💬 No reviews yet.",reply_markup=InlineKeyboardMarkup([back()])); return
-    txt="⭐ <b>Reviews</b>\n\n"+"".join(f"👤 ****\n{STARS.get(r[0],'')}\n{r[1]}\n\n" for r in rows)
-    await q.edit_message_text(txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup([back()]))
+async def co_disc_start(u,ctx):
+    q=u.callback_query; ctx.user_data["wf"]="co_disc"
+    codes=qa("SELECT code,pct FROM discount_codes WHERE active=1")
+    hint=", ".join(f"<code>{r['code']}</code> ({int(r['pct']*100)}% off)" for r in codes) if codes else "No active codes"
+    await safe_edit(q,f"🏷️ <b>Enter discount code</b>\n\nAvailable: {hint}",parse_mode="HTML",reply_markup=KM([IB("❌ Cancel","co_refresh")]))
 
-async def review_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; await q.answer(); ctx.user_data["rev_order"]=q.data[7:]
-    kb=[[InlineKeyboardButton(f"{'⭐'*i} {i}",callback_data=f"stars_{i}") for i in range(1,4)],
-        [InlineKeyboardButton(f"{'⭐'*i} {i}",callback_data=f"stars_{i}") for i in range(4,6)]]
-    await q.edit_message_text("⭐ <b>Rate your order:</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
-    return PICK_STARS
+async def co_ship_cb(u,ctx):
+    q=u.callback_query; ctx.user_data["co_ship"]=q.data.split("co_ship_")[1]; t,_=co_summary(ctx.user_data,q.from_user.id); await safe_edit(q,t,parse_mode="HTML",reply_markup=co_kb(ctx.user_data))
 
-async def pick_stars(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; await q.answer(); s=int(q.data.split("_")[1]); ctx.user_data["rev_stars"]=s
-    await q.edit_message_text(f"✨ {STARS[s]}\n\n✏️ Write your review:"); return WRITE_REVIEW
+async def co_refresh_cb(u,ctx):
+    q=u.callback_query; ctx.user_data["wf"]=None; t,_=co_summary(ctx.user_data,q.from_user.id); await safe_edit(q,t,parse_mode="HTML",reply_markup=co_kb(ctx.user_data))
 
-async def save_review(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    oid=ctx.user_data.get("rev_order"); uid=u.effective_user.id
-    con=db(); row=con.execute("SELECT id FROM orders WHERE id=? AND user_id=? AND status IN ('Paid','Dispatched')",(oid,uid)).fetchone()
-    if not row: con.close(); await u.message.reply_text("⚠️ Not eligible.",reply_markup=menu()); return ConversationHandler.END
-    con.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?,?)",(oid,uid,ctx.user_data.get("rev_stars",0),u.message.text))
-    con.commit(); con.close()
-    await u.message.reply_text(f"✅ Review saved! {STARS.get(ctx.user_data.get('rev_stars',0),'')} 🙏",reply_markup=menu())
-    return ConversationHandler.END
+async def co_confirm(u,ctx):
+    q=u.callback_query; uid=q.from_user.id; ud=ctx.user_data
+    name,addr,sk=ud.get("co_name"),ud.get("co_addr") or "",ud.get("co_ship")
+    if not name: await q.answer("⚠️ Please enter your name first.",show_alert=True); return
+    if not sk: await q.answer("⚠️ Please select a delivery method.",show_alert=True); return
+    if sk=="tracked24" and not addr: await q.answer("⚠️ Please enter your delivery address.",show_alert=True); return
+    items=qa("SELECT products.name,cart.qty,cart.price FROM cart JOIN products ON cart.product_id=products.id WHERE cart.user_id=?",(uid,))
+    if not items: await safe_edit(q,"🧺 Your basket is empty.",reply_markup=menu()); return
+    item_lines="\n".join(f"  • {hl.escape(r['name'])} {fq(r['qty'])} — £{r['price']:.2f}" for r in items); summary=", ".join(f"{r['name']} {fq(r['qty'])}" for r in items)
+    sub=round(sum(r["price"] for r in items),2); dp=ud.get("co_disc_pct",0); sp=SHIP[sk]["price"]; sl=SHIP[sk]["label"]; needs_ltc=SHIP[sk]["ltc"]
+    disc=round(sub*dp,2); gbp=round(sub-disc+sp,2); ltc=round(gbp/ltc_price(),6) if needs_ltc else 0.0; oid=str(uuid4())[:8].upper(); addr_disp=addr or "Local Drop"
+    qx("INSERT INTO orders(id,user_id,cust_name,address,summary,gbp,ltc,status,ship) VALUES(?,?,?,?,?,?,?,?,?)",(oid,uid,name,addr_disp,summary,gbp,ltc,"Pending",sk))
+    qx("DELETE FROM cart WHERE user_id=?",(uid,))
+    if sk=="drop": qx("INSERT INTO drop_chats(order_id,user_id,sender,message) VALUES(?,?,?,?)",(oid,uid,"vendor",f"👋 Hi {hl.escape(name)}! Order received. Message to arrange pickup."))
+    uname=q.from_user.username or str(uid)
+    notif=f"🛒 <b>NEW ORDER {oid}</b>\n👤 {hl.escape(name)} (@{uname}) · 🏠 {hl.escape(addr_disp)}\n📦 {summary} · 🚚 {sl} · 💷 £{gbp:.2f}{f' | {ltc} LTC' if needs_ltc else ''}"
+    try: await ctx.bot.send_message(CHANNEL_ID,notif,parse_mode="HTML")
+    except: pass
+    adm_kb=InlineKeyboardMarkup([[IB("✅ Confirm",f"adm_ok_{oid}"),IB("❌ Reject",f"adm_no_{oid}")]]+([[IB("💬 Chat",f"dch_{oid}")]] if sk=="drop" else []))
+    try: await ctx.bot.send_message(ADMIN_ID,notif,parse_mode="HTML",reply_markup=adm_kb)
+    except: pass
+    disc_l=f"🏷️ {ud.get('co_disc_code','')} -£{disc:.2f}\n" if dp else ""; ship_l=f"🚚 +£{sp:.2f}\n" if sp else ""
+    sep2="━━━━━━━━━━━━━━━━━━━━"
+    invoice=f"🧾 <b>INVOICE — Donny's Shop</b>\n{sep2}\n📋 <b>Order {oid}</b> · {datetime.now().strftime('%d/%m/%Y %H:%M')}\n{sep2}\n👤 {hl.escape(name)} · 🏠 {hl.escape(addr_disp)} · 🚚 {sl}\n{sep2}\n<b>Items:</b>\n{item_lines}\n{sep2}\n💷 £{sub:.2f}\n{disc_l}{ship_l}💰 <b>TOTAL: £{gbp:.2f}</b>\n{sep2}\n"
+    if needs_ltc:
+        invoice+=f"\n📤 Send <b>{ltc} LTC</b> to:\n<code>{LTC_ADDR}</code>\n\n⚠️ <i>Exact amount only. Tap I Have Paid once sent.</i>"
+        kb=KM([IB("✅ I Have Paid",f"paid_{oid}")],[IB("📦 My Orders","orders")])
+    else:
+        invoice+="\n📍 Tap below to chat with Donny and arrange your pickup.\n⚠️ <i>Local customers only — non-local orders refunded.</i>"
+        kb=KM([IB("💬 Chat with Donny — Arrange Pickup",f"dcv_{oid}")],[IB("📦 My Orders","orders")])
+    for k in [k for k in list(ud) if k.startswith("co_")]: ud.pop(k)
+    try: await q.message.delete()
+    except: pass
+    await q.message.reply_text(invoice,parse_mode="HTML",reply_markup=kb)
 
-# ══ ANNOUNCEMENTS ════════════════════════════════════════════════════════════
-async def show_announcements(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; await q.answer()
-    con=db(); rows=con.execute("SELECT title,body,created_at FROM announcements ORDER BY id DESC LIMIT 10").fetchall(); con.close()
-    if not rows: await q.edit_message_text("📢 No announcements yet.",reply_markup=InlineKeyboardMarkup([back()])); return
-    txt="📢 <b>Announcements</b>\n\n"
-    for title,body,ts in rows: txt+=f"📌 <b>{title}</b>\n{body}\n<i>{ts[:10]}</i>\n\n"
-    if len(txt)>4000: txt=txt[:4000]+"…"
-    await q.edit_message_text(txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup([back()]))
+def order_progress(status):
+    steps={"Pending":1,"Paid":2,"Dispatched":3,"Rejected":0}
+    n=steps.get(status,1)
+    if status=="Rejected": return "❌ <i>Rejected</i>"
+    bar=["🟢" if i<=n else "⚪" for i in range(1,4)]
+    labels=["Order Placed","Confirmed","Dispatched"]
+    return " → ".join(f"{'<b>' if i+1==n else ''}{bar[i]} {labels[i]}{'</b>' if i+1==n else ''}" for i in range(3))
 
-async def ann_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; await q.answer()
-    await q.edit_message_text("📢 <b>New Announcement</b>\n\nEnter the title:",parse_mode="HTML",reply_markup=cancel_kb())
-    return ASK_ANN_TITLE
+async def view_orders(u,ctx):
+    q=u.callback_query; uid=q.from_user.id
+    rows=qa("SELECT id,gbp,status,ship,summary FROM orders WHERE user_id=? ORDER BY rowid DESC",(uid,))
+    if not rows: await safe_edit(q,"📭 No orders yet — shop now! 🛍️",parse_mode="HTML",reply_markup=KM([IB("🛍️ Shop","shop")],[IB("⬅️ Back","menu")])); return
+    txt="📦 <b>Your Orders</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"; kb=[]
+    for o in rows:
+        ship_icon="📍" if o["ship"]=="drop" else "📦"
+        txt+=f"{ship_icon} <b>Order {o['id']}</b> · 💷 £{o['gbp']:.2f}\n{hl.escape(o['summary'])}\n{order_progress(o['status'])}\n\n"
+        if o["ship"]=="drop" and o["status"] in ("Pending","Paid","Dispatched"):
+            closed=gs(f"cc_{o['id']}","0")=="1"
+            kb.append([IB(f"{'🔒 Closed' if closed else '💬 Drop Chat'} — {o['id']}",f"dcv_{o['id']}")])
+        if o["status"] in ("Paid","Dispatched"):
+            kb.append([IB(f"🔄 Reorder {o['id']}",f"reorder_{o['id']}")])
+    await safe_edit(q,txt[:4000],parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb+[[IB("⬅️ Back","menu")]]))
+async def reorder_cb(u,ctx):
+    q=u.callback_query; oid=q.data[8:]; uid=q.from_user.id
+    o=q1("SELECT summary FROM orders WHERE id=? AND user_id=?",(oid,uid))
+    if not o: await q.answer("❌ Order not found.",show_alert=True); return
+    await q.answer()
+    await safe_edit(q,f"🔄 <b>Reorder from {oid}</b>\n\nPrevious order: <i>{hl.escape(o['summary'])}</i>\n\n👇 Head to the shop to pick your items again.",parse_mode="HTML",reply_markup=KM([IB("🛍️ Shop Now","shop")],[IB("⬅️ Back","orders")]))
 
-async def ann_title(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["ann_title"]=u.message.text.strip()
-    await u.message.reply_text("✏️ Now enter the announcement body:",reply_markup=cancel_kb())
-    return ASK_ANN_BODY
+async def notify_open_cb(u,ctx):
+    q=u.callback_query; uid=q.from_user.id
+    if is_open(): await q.answer("🟢 We're open right now! Go ahead and order.",show_alert=True); return
+    ss(f"notify_{uid}","1"); await q.answer("🔔 Done! You'll get a message when we open.",show_alert=True)
 
-async def ann_body(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    title=ctx.user_data.get("ann_title"); body=u.message.text.strip()
-    con=db(); con.execute("INSERT INTO announcements(title,body) VALUES(?,?)",(title,body)); con.commit()
-    # Broadcast to all users
-    uids=con.execute("SELECT user_id FROM users").fetchall(); con.close()
-    sent=0
-    for (uid,) in uids:
-        try:
-            await ctx.bot.send_message(uid,f"📢 <b>{title}</b>\n\n{body}",parse_mode="HTML")
-            sent+=1
+async def open_notify_job(ctx:ContextTypes.DEFAULT_TYPE):
+    if not is_open(): return
+    rows=qa("SELECT key FROM settings WHERE key LIKE 'notify_%'")
+    for r in rows:
+        uid=int(r["key"].split("_",1)[1])
+        try: await ctx.bot.send_message(uid,"🟢 <b>Donny's Shop is now open!</b>\n\nOrders close at 11am — shop now! 👇",parse_mode="HTML",reply_markup=menu())
         except: pass
-    await u.message.reply_text(f"✅ Announcement posted & sent to {sent} user(s)!")
-    return ConversationHandler.END
+        qx("DELETE FROM settings WHERE key=?",(r["key"],))
 
-# ══ CONTACT VENDOR ════════════════════════════════════════════════════════════
-async def contact_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; await q.answer()
-    await q.edit_message_text("💬 <b>Contact Vendor</b>\n\nType your message:",parse_mode="HTML",reply_markup=cancel_kb())
-    return ASK_CONTACT
+async def cmd_stats(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    if not is_admin(u.effective_user.id): return
+    total_rev=q1("SELECT COALESCE(SUM(gbp),0) as t FROM orders WHERE status IN ('Paid','Dispatched')")["t"]
+    total_orders=q1("SELECT COUNT(*) as c FROM orders")["c"]
+    paid_orders=q1("SELECT COUNT(*) as c FROM orders WHERE status IN ('Paid','Dispatched')")["c"]
+    pending=q1("SELECT COUNT(*) as c FROM orders WHERE status='Pending'")["c"]
+    today=datetime.now().strftime("%Y-%m-%d")
+    today_rev=q1("SELECT COALESCE(SUM(gbp),0) as t FROM orders WHERE status IN ('Paid','Dispatched') AND created_at LIKE ?",(today+"%",))["t"]
+    today_orders=q1("SELECT COUNT(*) as c FROM orders WHERE created_at LIKE ?",(today+"%",))["c"]
+    users=q1("SELECT COUNT(*) as c FROM users")["c"]
+    reviews=q1("SELECT COUNT(*) as c,COALESCE(AVG(stars),0) as avg FROM reviews")
+    top=qa("SELECT cust_name,SUM(gbp) as spent FROM orders WHERE status IN ('Paid','Dispatched') GROUP BY user_id ORDER BY spent DESC LIMIT 3")
+    top_txt="".join(f"  {'🥇🥈🥉'[i]} {hl.escape(r['cust_name'])} — £{r['spent']:.2f}\n" for i,r in enumerate(top))
+    await u.message.reply_text(
+        f"📊 <b>Shop Stats</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"💷 <b>Total Revenue:</b> £{total_rev:.2f}\n"
+        f"📦 <b>Total Orders:</b> {total_orders} ({paid_orders} paid, {pending} pending)\n"
+        f"📅 <b>Today:</b> {today_orders} orders · £{today_rev:.2f}\n"
+        f"👥 <b>Customers:</b> {users}\n"
+        f"⭐ <b>Reviews:</b> {reviews['c']} · avg {reviews['avg']:.1f}/5\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n🏆 <b>Top Customers:</b>\n{top_txt}",
+        parse_mode="HTML")
 
-async def contact_save(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid=u.effective_user.id; uname=u.effective_user.username or str(uid)
-    con=db(); cur=con.cursor(); cur.execute("INSERT INTO messages(user_id,username,message) VALUES(?,?,?)",(uid,uname,u.message.text))
-    mid=cur.lastrowid; con.commit(); con.close()
-    await ctx.bot.send_message(ADMIN_ID,f"💬 <b>@{uname}</b> (ID:{uid})\nMsg ID: <code>{mid}</code>\n\n{u.message.text}\n\nReply: /reply {mid} &lt;text&gt;",parse_mode="HTML")
-    await u.message.reply_text("✅ Message sent! We'll reply soon.",reply_markup=menu())
-    return ConversationHandler.END
+async def user_paid(u,ctx):
+    q=u.callback_query; oid=q.data[5:]
+    row=q1("SELECT ship,cust_name,summary,gbp,ltc,address FROM orders WHERE id=?",(oid,))
+    if not row: await safe_edit(q,"❌ Order not found.",reply_markup=back_kb()); return
+    sl=SHIP.get(row["ship"],{}).get("label",row["ship"])
+    await ctx.bot.send_message(ADMIN_ID,f"💰 <b>PAYMENT CLAIM</b> — <code>{oid}</code>\n👤 {hl.escape(row['cust_name'])} · {row['summary']}\n💷 £{row['gbp']:.2f} | {row['ltc']} LTC",parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[IB("✅ Confirm",f"adm_ok_{oid}"),IB("❌ Reject",f"adm_no_{oid}")]]))
+    await safe_edit(q,f"⏳ <b>Payment Submitted</b>\n━━━━━━━━━━━━━━━━━━━━\n📋 Order <code>{oid}</code>\n🛍️ {hl.escape(row['summary'])}\n🚚 {sl}\n💰 £{row['gbp']:.2f} | {row['ltc']} LTC\n━━━━━━━━━━━━━━━━━━━━\n✅ Payment received — awaiting admin confirmation.",parse_mode="HTML",reply_markup=KM([IB("📦 My Orders","orders")]))
+async def show_reviews(u,ctx):
+    q=u.callback_query; page=int(q.data.split("_")[1])
+    ms=datetime.now().replace(day=1,hour=0,minute=0,second=0,microsecond=0).isoformat()
+    total=q1("SELECT COUNT(*) as c FROM reviews WHERE created_at>=?",(ms,))["c"]
+    rows=qa("SELECT stars,text FROM reviews WHERE created_at>=? ORDER BY created_at DESC LIMIT ? OFFSET ?",(ms,RPP,page*RPP))
+    if not rows and page==0: await safe_edit(q,"💬 No reviews this month yet.",reply_markup=back_kb()); return
+    txt=f"⭐ <b>Reviews of the Month</b> ({total})\n\n"+"".join(f"{STARS.get(r['stars'],'')}\n{hl.escape(r['text'])}\n\n" for r in rows)
+    pages=(total-1)//RPP if total else 0
+    nav=([IB("◀️",f"reviews_{page-1}")] if page>0 else [])+([IB("▶️",f"reviews_{page+1}")] if page<pages else [])
+    await safe_edit(q,txt[:4000],parse_mode="HTML",reply_markup=InlineKeyboardMarkup(([nav] if nav else [])+[[IB("⬅️ Back","menu")]]))
+async def review_start(u,ctx):
+    q=u.callback_query; oid=q.data[7:]
+    if not q1("SELECT 1 FROM orders WHERE id=? AND user_id=? AND status IN ('Paid','Dispatched')",(oid,q.from_user.id)):
+        await q.answer("⚠️ Not eligible to review.",show_alert=True); return
+    ctx.user_data["rev_order"]=oid
+    await safe_edit(q,"⭐ Rate your order:",reply_markup=KM([IB("⭐ 1","stars_1"),IB("⭐⭐ 2","stars_2"),IB("⭐⭐⭐ 3","stars_3")],[IB("⭐⭐⭐⭐ 4","stars_4"),IB("⭐⭐⭐⭐⭐ 5","stars_5")],[IB("❌ Cancel","menu")]))
+async def pick_stars(u,ctx):
+    q=u.callback_query; s=int(q.data.split("_")[1]); ctx.user_data.update({"rev_stars":s,"wf":"review_text"}); await safe_edit(q,f"✨ {STARS[s]}\n\n✏️ Write your review:",parse_mode="HTML",reply_markup=cancel_kb())
 
-async def admin_reply_cmd(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if u.effective_user.id!=ADMIN_ID: return
+async def show_news(u,ctx):
+    q=u.callback_query; rows=qa("SELECT id,title,body,photo,created_at FROM announcements ORDER BY id DESC LIMIT 5")
+    if not rows: await safe_edit(q,"📢 No announcements yet.",reply_markup=back_kb()); return
+    first=rows[0]; txt=f"📢 <b>{hl.escape(first['title'])}</b>\n\n{hl.escape(first['body'])}\n<i>{str(first['created_at'])[:10]}</i>"
+    if len(rows)>1: txt+="\n\n<b>Previous:</b>\n"+"".join(f"• {hl.escape(r['title'])} <i>{str(r['created_at'])[:10]}</i>\n" for r in rows[1:])
+    kb=InlineKeyboardMarkup([[IB("⬅️ Back","menu")]])
+    if first.get("photo"):
+        try: await q.message.delete()
+        except: pass
+        await ctx.bot.send_photo(q.message.chat_id,first["photo"],caption=txt[:1020],parse_mode="HTML",reply_markup=kb)
+    else: await safe_edit(q,txt[:4000],parse_mode="HTML",reply_markup=kb)
+async def show_loyalty(u,ctx):
+    q=u.callback_query; uid=q.from_user.id; lo=get_loyalty(uid)
+    pts=lo["points"]; bar="█"*(pts//10)+"░"*(10-pts//10)
+    await safe_edit(q,f"🎁 <b>Loyalty Rewards</b>\n━━━━━━━━━━━━━━━━━━━━\n\n⭐ <b>{pts}/100 pts</b>\n[{bar}]\n{100-pts} more = <b>£25 credit</b>\n💳 Available: <b>£{lo['credit']:.2f}</b>\n🏆 Lifetime: <b>{lo['lifetime']} pts</b>\n\n<i>2 pts per £1 · 100 pts = £25 credit</i>",parse_mode="HTML",reply_markup=back_kb())
+async def show_my_ref(u,ctx):
+    q=u.callback_query; uid=q.from_user.id; rc=get_ref(uid)
+    cnt=(q1("SELECT count FROM referrals WHERE owner_id=?",(uid,)) or {}).get("count",0); nxt=15-(cnt%15) if cnt%15 else 15
+    bot_name=(await ctx.bot.get_me()).username
+    await safe_edit(q,f"🔗 <b>Your Referral Link</b>\n━━━━━━━━━━━━━━━━━━━━\n\n<code>https://t.me/{bot_name}?start={rc}</code>\n\n👥 <b>{cnt}</b> joined · <b>{nxt} more</b> = FREE 3.5g Lemon Cherry Gelato 🌿\n<i>Every 15 refs = FREE 3.5g. Milestones: 15, 30, 45...</i>",parse_mode="HTML",reply_markup=back_kb())
+async def contact_start(u,ctx):
+    q=u.callback_query; ctx.user_data["wf"]="contact"; await safe_edit(q,"💬 Type your message and we'll get back to you:",parse_mode="HTML",reply_markup=cancel_kb())
+
+async def dropchat_view(u,ctx):
+    q=u.callback_query; oid=q.data[4:]; closed=gs(f"cc_{oid}","0")=="1"
+    o=q1("SELECT summary,gbp FROM orders WHERE id=?",(oid,))
+    hdr=f"💬 <b>Drop Chat — Order {oid}</b>\n━━━━━━━━━━━━━━━━━━━━\n"+(f"🛍️ {hl.escape(o['summary'])} · 💷 £{o['gbp']:.2f}\n" if o else "")+("🔒 <i>Chat closed.</i>\n" if closed else "")+"━━━━━━━━━━━━━━━━━━━━\n\n"
+    try: await q.message.delete()
+    except: pass
+    await q.message.reply_text(f"{hdr}{fmt_chat(oid)}"[:4000],parse_mode="HTML",reply_markup=dc_user_kb(oid,closed))
+async def dropchat_msg_start(u,ctx):
+    q=u.callback_query; oid=q.data[4:]; ctx.user_data.update({"dc_oid":oid,"wf":"drop_msg_user"})
+    try: await q.message.delete()
+    except: pass
+    await q.message.reply_text(f"💬 <b>Order {oid}</b>\n\n✉️ Type your message:",parse_mode="HTML",reply_markup=KM([IB("❌ Cancel",f"dcv_{oid}")]))
+
+async def dropchat_reply_start(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    oid=q.data[4:]; ctx.user_data.update({"dc_oid":oid,"wf":"drop_msg_admin"}); o=q1("SELECT cust_name,summary FROM orders WHERE id=?",(oid,))
+    hdr=f"↩️ Reply {oid}"+(f" — {hl.escape(o['cust_name'])} | {o['summary']}" if o else "")
+    await safe_edit(q,f"{hdr}\n━━━━━━━━━━━━━━━━━━━━\n\n{fmt_chat(oid)}\n\n✏️ Type reply:",parse_mode="HTML",reply_markup=KM([IB("❌ Cancel","menu")]))
+
+async def dropchat_history(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    oid=q.data[4:]; closed=gs(f"cc_{oid}","0")=="1"; o=q1("SELECT cust_name,summary,gbp FROM orders WHERE id=?",(oid,)); note=q1("SELECT note FROM order_notes WHERE order_id=?",(oid,))
+    hdr=f"📋 <b>Chat {oid}</b>"+(f"\n👤 {hl.escape(o['cust_name'])} | {o['summary']} | 💷 £{o['gbp']:.2f}" if o else "")+(f"\n📝 {hl.escape(note['note'])}" if note else "")
+    await safe_edit(q,f"{hdr}\n━━━━━━━━━━━━━━━━━━━━\n\n{fmt_chat(oid)}"[:4000],parse_mode="HTML",reply_markup=dc_admin_kb(oid) if not closed else KM([IB("🔓 Reopen",f"dco_{oid}")]))
+
+async def dropchat_close(u,ctx):
+    q=u.callback_query; oid=q.data.split("_",1)[1]; ss(f"cc_{oid}","1")
+    r=q1("SELECT user_id FROM orders WHERE id=?",(oid,))
+    if r and is_admin(u.effective_user.id):
+        try: await ctx.bot.send_message(r["user_id"],f"🔒 Drop Chat for order {oid} has been closed by the vendor.\nUse Contact Us if you need anything.",reply_markup=menu())
+        except: pass
+    await safe_edit(q,f"🔒 Chat {oid} closed.",reply_markup=KM([IB("🔓 Reopen",f"dco_{oid}"),IB("⬅️ Back","menu")]))
+
+async def dropchat_open(u,ctx):
+    q=u.callback_query; oid=q.data[4:]; ss(f"cc_{oid}","0")
+    await safe_edit(q,f"🔓 Chat {oid} reopened.\n\n{fmt_chat(oid)}",parse_mode="HTML",reply_markup=dc_user_kb(oid,False))
+
+async def cmd_admin(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    if not is_admin(u.effective_user.id): return
+    orders=qa("SELECT id,status,ship FROM orders ORDER BY rowid DESC LIMIT 30")
+    unread=q1("SELECT COUNT(*) as c FROM messages WHERE reply IS NULL")["c"]
+    drops=len([o for o in orders if o["ship"]=="drop" and o["status"] in ("Pending","Paid")])
+    kb=[[IB(f"✅ {o['id']}",f"adm_ok_{o['id']}"),IB(f"❌ {o['id']}",f"adm_no_{o['id']}")] for o in orders if o["status"]=="Pending"]+[[IB(f"🚚 {o['id']}",f"adm_go_{o['id']}")] for o in orders if o["status"]=="Paid" and o["ship"]!="drop"]
+    kb+=[[IB("➕ Add","adm_addprod"),IB("🗑️ Remove","adm_rmprod"),IB("✏️ Desc","adm_editdesc"),IB("⚖️ Tiers","adm_tiers")],
+         [IB("👁️ Hide/Show","adm_hideprod"),IB("📂 Cats","adm_cats"),IB(f"💬 Msgs{f' ({unread})' if unread else ''}","adm_msgs"),IB(f"📍 Drops{f' ({drops})' if drops else ''}","adm_drops")],
+         [IB("🏷️ Discounts","adm_discounts"),IB("📢 Announce","adm_announce"),IB("📊 Reviews","adm_rev_0")],
+         [IB("👥 Admins","adm_admins"),IB("🏠 Edit Home","adm_edit_home")]]
+    await u.message.reply_text("🔧 <b>Admin Panel</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+async def adm_confirm(u,ctx):
+    q=u.callback_query; oid=q.data[7:]; qx("UPDATE orders SET status='Paid' WHERE id=?",(oid,))
+    r=q1("SELECT user_id,ship,gbp FROM orders WHERE id=?",(oid,))
+    if r:
+        pts,cr=add_points(r["user_id"],r.get("gbp",0))
+        lnote=f"\n🎁 +{pts} pts!{f' 💳 £{cr:.0f} credit added!' if cr else ''}"
+        try:
+            if r["ship"]=="drop": await ctx.bot.send_message(r["user_id"],f"✅ <b>Order {oid} confirmed!</b> Open Drop Chat to arrange pickup.{lnote}",parse_mode="HTML",reply_markup=KM([IB("💬 Drop Chat",f"dcv_{oid}")]))
+            else: await ctx.bot.send_message(r["user_id"],f"✅ Payment confirmed — <code>{oid}</code>! 🌟{lnote}",parse_mode="HTML",reply_markup=KM([IB("⭐ Leave a Review",f"review_{oid}")]))
+        except: pass
+    await safe_edit(q,f"✅ Order {oid} confirmed.")
+async def adm_reject(u,ctx):
+    q=u.callback_query; oid=q.data[7:]; qx("UPDATE orders SET status='Rejected' WHERE id=?",(oid,))
+    r=q1("SELECT user_id FROM orders WHERE id=?",(oid,))
+    if r:
+        try: await ctx.bot.send_message(r["user_id"],f"❌ Order <code>{oid}</code> rejected. Contact us if needed.",parse_mode="HTML")
+        except: pass
+    await safe_edit(q,f"❌ Rejected {oid}.")
+
+async def adm_dispatch(u,ctx):
+    q=u.callback_query; oid=q.data[7:]; qx("UPDATE orders SET status='Dispatched' WHERE id=?",(oid,))
+    r=q1("SELECT user_id,summary FROM orders WHERE id=?",(oid,))
+    if r:
+        try: await ctx.bot.send_message(r["user_id"],f"🚚 <b>Order {oid} dispatched!</b> 📬\n{hl.escape(r['summary'])}",parse_mode="HTML",reply_markup=KM([IB("⭐ Leave a Review",f"review_{oid}")]))
+        except: pass
+        qx("INSERT OR IGNORE INTO review_reminders(order_id,user_id,dispatched) VALUES(?,?,?)",(oid,r["user_id"],datetime.now().isoformat()))
+    await safe_edit(q,f"🚚 Dispatched {oid}.")
+
+async def adm_msgs(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    rows=qa("SELECT id,username,message,reply FROM messages ORDER BY id DESC LIMIT 15")
+    if not rows: await safe_edit(q,"📭 No messages.",reply_markup=back_kb()); return
+    txt="💬 <b>Messages</b>\n\n"+"".join(f"{'✅' if r['reply'] else '⏳'} #{r['id']} @{r['username'] or '?'}\n{hl.escape(r['message'][:70])}\n/reply {r['id']}\n\n" for r in rows)
+    await safe_edit(q,txt[:4000],parse_mode="HTML",reply_markup=back_kb())
+
+async def adm_rev_cb(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    page=int(q.data.split("adm_rev_")[1]); total=q1("SELECT COUNT(*) as c FROM reviews")["c"]
+    rows=qa("SELECT stars,text,created_at FROM reviews ORDER BY created_at DESC LIMIT ? OFFSET ?",(RPP,page*RPP))
+    if not rows and page==0: await safe_edit(q,"📭 No reviews yet.",reply_markup=back_kb()); return
+    txt=f"📊 <b>All Reviews</b> ({total})\n\n"+"".join(f"{STARS.get(r['stars'],'')} · {str(r['created_at'])[:10]}\n{hl.escape(r['text'])}\n\n" for r in rows)
+    pages=(total-1)//RPP if total else 0; nav=([IB("◀️",f"adm_rev_{page-1}")] if page>0 else [])+([IB("▶️",f"adm_rev_{page+1}")] if page<pages else [])
+    await safe_edit(q,txt[:4000],parse_mode="HTML",reply_markup=InlineKeyboardMarkup(([nav] if nav else [])+[[IB("⬅️ Back","menu")]]))
+
+async def adm_edit_home(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    cur=gs("home_extra"); ctx.user_data["wf"]="edit_home"; await safe_edit(q,f"🏠 Current: <i>{hl.escape(cur) if cur else 'None'}</i>\n\nType new text or <code>clear</code>:",parse_mode="HTML",reply_markup=cancel_kb())
+
+async def adm_admins(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    rows=qa("SELECT user_id,username FROM admins ORDER BY rowid")
+    txt="👥 <b>Admins</b>\n\n"+"".join(f"{'👑' if r['user_id']==ADMIN_ID else '🔑'} <code>{r['user_id']}</code> @{r['username'] or '?'}\n" for r in rows)
+    kb=[[IB("➕ Add","adm_addadmin")]]+[[IB(f"🗑️ {r['username'] or r['user_id']}",f"adm_rmadmin_{r['user_id']}")] for r in rows if r["user_id"]!=ADMIN_ID]+[[IB("⬅️ Back","menu")]]
+    await safe_edit(q,txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+
+async def adm_addadmin_start(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    ctx.user_data["wf"]="add_admin"; await safe_edit(q,"➕ Send new admin's numeric Telegram <b>user_id</b>\n<i>(find via @userinfobot)</i>",parse_mode="HTML",reply_markup=cancel_kb())
+
+async def adm_rmadmin(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    uid=int(q.data.split("adm_rmadmin_")[1])
+    if uid==ADMIN_ID: await q.answer("❌ Cannot remove owner.",show_alert=True); return
+    r=q1("SELECT username FROM admins WHERE user_id=?",(uid,)); qx("DELETE FROM admins WHERE user_id=?",(uid,))
+    await q.answer(f"✅ Removed {r['username'] if r else uid}",show_alert=True); await adm_admins(u,ctx)
+
+async def adm_note_start(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    oid=q.data[9:]; ctx.user_data.update({"note_oid":oid,"wf":"order_note"}); note=q1("SELECT note FROM order_notes WHERE order_id=?",(oid,))
+    await q.message.reply_text(f"📝 Note for {oid} — current: <i>{hl.escape(note['note']) if note else 'none'}</i>\n\nType note:",parse_mode="HTML")
+
+async def adm_drop_overview(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    rows=qa("SELECT o.id,o.cust_name,o.status,(SELECT COUNT(*) FROM drop_chats d WHERE d.order_id=o.id) as msgs FROM orders o WHERE o.ship='drop' ORDER BY o.rowid DESC LIMIT 20")
+    if not rows: await safe_edit(q,"📍 No drop orders.",reply_markup=back_kb()); return
+    em={"Pending":"⏳","Paid":"✅","Dispatched":"🚚","Rejected":"❌"}; kb=[[IB(("🔒" if gs(f"cc_{o['id']}","0")=="1" else "💬")+f" {o['id']} · {o['cust_name']} {em.get(o['status'],'')} ({o['msgs']})",f"dch_{o['id']}")] for o in rows]+[[IB("⬅️ Back","menu")]]
+    await safe_edit(q,"📍 <b>Drop Orders</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+
+async def adm_discounts(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    rows=qa("SELECT code,pct,active,expires FROM discount_codes ORDER BY code")
+    txt="🏷️ <b>Discount Codes</b>\n\n"+"".join(f"{'✅' if r['active'] else '❌'} <code>{r['code']}</code> {int(r['pct']*100)}%{f' exp {r["expires"][:10]}' if r.get('expires') else ''}\n" for r in rows)
+    kb=[[IB(f"{'🚫' if r['active'] else '✅'} {r['code']}",f"toggledisc_{r['code']}")] for r in rows]+[[IB("➕ Add","adm_adddisc")],[IB("⬅️ Back","menu")]]
+    await safe_edit(q,txt or "No codes.",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+
+async def adm_toggledisc(u,ctx):
+    q=u.callback_query; c=q.data.split("toggledisc_")[1]
+    r=q1("SELECT active FROM discount_codes WHERE code=?",(c,))
+    if r: qx("UPDATE discount_codes SET active=? WHERE code=?",(0 if r["active"] else 1,c))
+    await adm_discounts(u,ctx)
+
+async def adm_adddisc_start(u,ctx):
+    q=u.callback_query; ctx.user_data["wf"]="disc_code"; await safe_edit(q,"🏷️ Add code: <code>CODE,PCT</code> or <code>CODE,PCT,HOURS</code>\ne.g. <code>SAVE20,20</code> or <code>FLASH50,50,4</code>",parse_mode="HTML",reply_markup=cancel_kb())
+
+async def ann_start(u,ctx):
+    q=u.callback_query; ctx.user_data.update({"wf":"ann_title"}); ctx.user_data.pop("ann_photo",""); await safe_edit(q,"📢 Enter announcement title:",reply_markup=cancel_kb())
+
+async def adm_cats(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    cats=qa("SELECT * FROM categories ORDER BY id")
+    txt="📂 <b>Categories</b>\n\n"+("\n".join(f"{c['emoji']} {c['name']}" for c in cats) if cats else "No categories yet.")
+    kb=[[IB(f"✏️ {c['emoji']} {c['name']}",f"cat_assign_{c['id']}")] for c in cats]+[[IB("➕ New Category","adm_newcat"),IB("🗑️ Delete","adm_delcat")],[IB("⬅️ Back","menu")]]
+    await safe_edit(q,txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+
+async def adm_newcat(u,ctx):
+    q=u.callback_query; ctx.user_data["wf"]="new_cat"; await safe_edit(q,"📂 Send: <code>🍃 Indoor Strains</code>",parse_mode="HTML",reply_markup=cancel_kb())
+
+async def adm_delcat_list(u,ctx):
+    q=u.callback_query; cats=qa("SELECT * FROM categories ORDER BY id")
+    if not cats: await safe_edit(q,"No categories to delete.",reply_markup=back_kb()); return
+    await safe_edit(q,"🗑️ Delete which category?",reply_markup=InlineKeyboardMarkup([[IB(f"🗑️ {c['emoji']} {c['name']}",f"delcat_{c['id']}")] for c in cats]+[[IB("⬅️ Back","adm_cats")]]))
+
+async def adm_delcat_do(u,ctx):
+    q=u.callback_query; cid=int(q.data.split("_")[1])
+    qx("UPDATE products SET category_id=0 WHERE category_id=?",(cid,)); qx("DELETE FROM categories WHERE id=?",(cid,))
+    await adm_cats(u,ctx)
+
+async def adm_cat_assign(u,ctx):
+    q=u.callback_query; cid=int(q.data.split("_")[2]); cat=q1("SELECT name,emoji FROM categories WHERE id=?",(cid,))
+    rows=qa("SELECT id,name,category_id FROM products ORDER BY id")
+    kb=[[IB(("✅ " if r["category_id"]==cid else "○ ")+r["name"],f"togglecat_{r['id']}_{cid}")] for r in rows]+[[IB("✅ Done","adm_cats")]]
+    await safe_edit(q,f"📂 Assign to <b>{cat['emoji']} {cat['name']}</b>:",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+
+async def adm_togglecat(u,ctx):
+    q=u.callback_query; p=q.data.split("_"); pid,cid=int(p[1]),int(p[2])
+    row=q1("SELECT category_id FROM products WHERE id=?",(pid,))
+    if row: qx("UPDATE products SET category_id=? WHERE id=?",(0 if row["category_id"]==cid else cid,pid))
+    u.callback_query.data=f"cat_assign_{cid}"; await adm_cat_assign(u,ctx)
+
+async def adm_rmprod_list(u,ctx):
+    q=u.callback_query; rows=qa("SELECT id,name FROM products ORDER BY id")
+    if not rows: await safe_edit(q,"No products.",reply_markup=back_kb()); return
+    await safe_edit(q,"🗑️ Remove which product?",reply_markup=InlineKeyboardMarkup([[IB(f"🗑️ {r['name']}",f"rmprod_{r['id']}")] for r in rows]+[[IB("⬅️ Back","menu")]]))
+
+async def adm_rmprod_confirm(u,ctx):
+    q=u.callback_query; pid=int(q.data.split("_")[1]); r=q1("SELECT name FROM products WHERE id=?",(pid,))
+    if r: await safe_edit(q,f"🗑️ Delete <b>{hl.escape(r['name'])}</b>? Cannot be undone.",parse_mode="HTML",reply_markup=KM([IB("✅ Yes Delete",f"rmprod_yes_{pid}"),IB("❌ No","menu")]))
+
+async def adm_rmprod_do(u,ctx):
+    q=u.callback_query; qx("DELETE FROM products WHERE id=?",(int(q.data.split("_")[2]),)); await safe_edit(q,"✅ Deleted.",reply_markup=back_kb())
+
+async def adm_editdesc_list(u,ctx):
+    q=u.callback_query; rows=qa("SELECT id,name FROM products ORDER BY id")
+    if not rows: await safe_edit(q,"No products.",reply_markup=back_kb()); return
+    await safe_edit(q,"✏️ Edit description for:",reply_markup=InlineKeyboardMarkup([[IB(f"✏️ {r['name']}",f"editdesc_{r['id']}")] for r in rows]+[[IB("⬅️ Back","menu")]]))
+
+async def adm_editdesc_start(u,ctx):
+    q=u.callback_query; pid=int(q.data.split("_")[1]); ctx.user_data.update({"edit_pid":pid,"wf":"edit_desc"})
+    r=q1("SELECT name,description FROM products WHERE id=?",(pid,))
+    await safe_edit(q,f"✏️ <b>Edit: {hl.escape(r['name'])}</b>\n\nCurrent: {hl.escape(r['description'] or '—')}\n\nSend new description:",parse_mode="HTML",reply_markup=cancel_kb())
+
+async def adm_hideprod_list(u,ctx):
+    q=u.callback_query; rows=qa("SELECT id,name,hidden FROM products ORDER BY id")
+    if not rows: await safe_edit(q,"No products.",reply_markup=back_kb()); return
+    await safe_edit(q,"👁️ <b>Hide / Show Products</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[IB(f"{'👁️ Show' if r['hidden'] else '🙈 Hide'} {r['name']}",f"togglehide_{r['id']}")] for r in rows]+[[IB("⬅️ Back","menu")]]))
+
+async def adm_togglehide(u,ctx):
+    q=u.callback_query; pid=int(q.data.split("_")[1])
+    row=q1("SELECT name,hidden FROM products WHERE id=?",(pid,))
+    if not row: await q.answer(); return
+    qx("UPDATE products SET hidden=? WHERE id=?",(0 if row["hidden"] else 1,pid))
+    await q.answer(f"{'Shown' if row['hidden'] else 'Hidden'}: {row['name']}",show_alert=True)
+    await adm_hideprod_list(u,ctx)
+
+async def adm_list_tiers(u,ctx):
+    q=u.callback_query; rows=qa("SELECT id,name FROM products ORDER BY id")
+    if not rows: await safe_edit(q,"No products.",reply_markup=back_kb()); return
+    await safe_edit(q,"⚖️ Edit tiers for:",reply_markup=InlineKeyboardMarkup([[IB(f"⚖️ {r['name']}",f"edtier_{r['id']}")] for r in rows]+[[IB("⬅️ Back","menu")]]))
+
+async def adm_show_tiers(u,ctx):
+    q=u.callback_query; pid=int(q.data.split("_")[1]); ctx.user_data.update({"tpid":pid,"wf":"edit_tiers"})
+    r=q1("SELECT name,tiers FROM products WHERE id=?",(pid,)); tiers=json.loads(r["tiers"]) if r.get("tiers") else TIERS[:]
+    await q.message.reply_text(f"⚖️ <b>{hl.escape(r['name'])}</b>\n\n"+"".join(ft(t)+"\n" for t in tiers)+"\nSend new tiers (qty,price per line) or /cancel",parse_mode="HTML")
+
+async def cmd_reply(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    if not is_admin(u.effective_user.id): return
     if not ctx.args or len(ctx.args)<2: await u.message.reply_text("Usage: /reply <id> <text>"); return
     try: mid=int(ctx.args[0])
     except: await u.message.reply_text("⚠️ Invalid ID."); return
-    txt=" ".join(ctx.args[1:]); con=db()
-    row=con.execute("SELECT user_id,username,message FROM messages WHERE id=?",(mid,)).fetchone()
-    if not row: con.close(); await u.message.reply_text("❌ Not found."); return
-    con.execute("UPDATE messages SET reply=? WHERE id=?",(txt,mid)); con.commit(); con.close()
-    try:
-        await ctx.bot.send_message(row[0],f"💬 <b>Vendor reply</b>\n\nYour msg: <i>{row[2]}</i>\n\n✉️ {txt}",parse_mode="HTML",reply_markup=menu())
-        await u.message.reply_text(f"✅ Replied to @{row[1]}.")
-    except Exception as e: await u.message.reply_text(f"❌ Failed: {e}")
+    msg=" ".join(ctx.args[1:]); row=q1("SELECT user_id,username,message FROM messages WHERE id=?",(mid,))
+    if not row: await u.message.reply_text("❌ Not found."); return
+    qx("UPDATE messages SET reply=? WHERE id=?",(msg,mid))
+    try: await ctx.bot.send_message(row["user_id"],f"💬 <b>Reply from Donny's Shop</b>\n\n<i>Your msg:</i> {hl.escape(row['message'])}\n\n✉️ {hl.escape(msg)}",parse_mode="HTML",reply_markup=menu()); await u.message.reply_text(f"✅ Replied to @{row['username']}.")
+    except Exception as e: await u.message.reply_text(f"❌ {e}")
+async def cmd_order(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    if not is_admin(u.effective_user.id): return
+    if not ctx.args: await u.message.reply_text("Usage: /order <id>"); return
+    oid=ctx.args[0]; row=q1("SELECT * FROM orders WHERE id=?",(oid,))
+    if not row: await u.message.reply_text("❌ Not found."); return
+    sl=SHIP.get(row["ship"],{}).get("label",row["ship"]); em={"Pending":"⏳","Paid":"✅","Dispatched":"🚚","Rejected":"❌"}
+    note=q1("SELECT note FROM order_notes WHERE order_id=?",(oid,)); ntxt=f"\n📝 {hl.escape(note['note'])}" if note else ""
+    txt=f"🔖 <b>{oid}</b> {em.get(row['status'],'')}\n👤 {hl.escape(row['cust_name'])}\n🏠 {hl.escape(row['address'])}\n🚚 {sl} · 💷 £{row['gbp']:.2f}{f' | {row[chr(108)+chr(116)+chr(99)]} LTC' if row.get('ltc') else ''}\n{hl.escape(row['summary'])}{ntxt}"
+    kb=([[IB("✅ Confirm",f"adm_ok_{oid}"),IB("❌ Reject",f"adm_no_{oid}")]] if row["status"]=="Pending" else [])+([[IB("🚚 Dispatch",f"adm_go_{oid}")]] if row["status"]=="Paid" and row["ship"]!="drop" else [])+([[IB("💬 Drop Chat",f"dch_{oid}")]] if row["ship"]=="drop" else [])+[[IB("📝 Note",f"adm_note_{oid}")]]
+    await u.message.reply_text(txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+async def cmd_customer(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    if not is_admin(u.effective_user.id): return
+    if not ctx.args: await u.message.reply_text("Usage: /customer @username or user_id"); return
+    arg=ctx.args[0].lstrip("@")
+    try: cid=int(arg); row=q1("SELECT user_id,username FROM users WHERE user_id=?",(cid,))
+    except: row=q1("SELECT user_id,username FROM users WHERE username=?",(arg,))
+    if not row: await u.message.reply_text("❌ Not found."); return
+    cid=row["user_id"]; orders=qa("SELECT id,gbp,status,summary FROM orders WHERE user_id=? ORDER BY rowid DESC LIMIT 10",(cid,))
+    spent=sum(o["gbp"] for o in orders if o["status"] in ("Paid","Dispatched")); lo=get_loyalty(cid)
+    await u.message.reply_text((f"👤 @{hl.escape(row['username'] or str(cid))} (<code>{cid}</code>)\n━━━━━━━━━━━━━━━━━━━━\n💷 £{spent:.2f} · {len(orders)} orders · ⭐ {lo['points']} pts · 💳 £{lo['credit']:.2f}\n\n"+"".join(f"• {o['id']} — {o['status']} — £{o['gbp']:.2f} — {hl.escape(o['summary'][:40])}\n" for o in orders))[:4000],parse_mode="HTML")
+async def cmd_myorder(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    uid=u.effective_user.id
+    if not is_known(uid) and not is_admin(uid): await u.message.reply_text("Please /start first."); return
+    if not ctx.args: await u.message.reply_text("Usage: /myorder <id>"); return
+    oid=ctx.args[0]; row=q1("SELECT * FROM orders WHERE id=? AND user_id=?",(oid,uid))
+    if not row: await u.message.reply_text("❌ Not found."); return
+    sl=SHIP.get(row["ship"],{}).get("label",row["ship"]); em={"Pending":"🕐","Paid":"✅","Dispatched":"🚚","Rejected":"❌"}
+    await u.message.reply_text(f"🧾 <b>Order {oid}</b>\n━━━━━━━━━━━━━━━━━━━━\n{em.get(row['status'],'')} {row['status']}\n👤 {hl.escape(row['cust_name'])}\n🏠 {hl.escape(row['address'])}\n🚚 {sl}\n{hl.escape(row['summary'])}\n💰 £{row['gbp']:.2f}",parse_mode="HTML")
 
-# ══ CHECKOUT ═════════════════════════════════════════════════════════════════
-async def checkout_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; await q.answer(); uid=q.from_user.id
-    con=db(); prices=con.execute("SELECT chosen_price FROM cart WHERE user_id=?",(uid,)).fetchall(); con.close()
-    if not prices: await q.edit_message_text("🧺 Basket empty.",reply_markup=menu()); return ConversationHandler.END
-    ctx.user_data.update({"co_name":None,"co_addr":None,"co_shipping":None,"co_discount":None,"co_disc_pct":0,"co_subtotal":round(sum(p[0] for p in prices),2)})
-    txt,_=co_text(ctx.user_data); await q.edit_message_text(txt,parse_mode="HTML",reply_markup=co_kb(ctx.user_data))
-    return ConversationHandler.END
+async def cmd_addproduct(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    if not is_admin(u.effective_user.id): return
+    ctx.user_data["wf"]="add_photo"; await u.message.reply_text("📸 Send product photo:")
+async def cmd_cancel(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear(); await u.message.reply_text("🚫 Cancelled.",reply_markup=menu())
 
-async def co_setname(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q=u.callback_query; await q.answer()
-    await q.edit_message_text("👤 Enter your name:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="co_refresh")]])); return CO_NAME
+async def on_message(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    uid=u.effective_user.id; txt=(u.message.text or "").strip()
+    qx("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",(uid,u.effective_user.username or ""))
+    wf=ctx.user_data.get("wf")
+    if wf=="co_name":
+        ctx.user_data.update({"co_name":txt,"wf":None}); t,_=co_summary(ctx.user_data,uid); await u.message.reply_text(t,parse_mode="HTML",reply_markup=co_kb(ctx.user_data))
+    elif wf=="co_addr":
+        ctx.user_data.update({"co_addr":txt,"wf":None}); t,_=co_summary(ctx.user_data,uid); await u.message.reply_text(t,parse_mode="HTML",reply_markup=co_kb(ctx.user_data))
+    elif wf=="co_disc":
+        pct=gdisc(txt)
+        if pct: ctx.user_data.update({"co_disc_code":txt.upper(),"co_disc_pct":pct,"wf":None}); await u.message.reply_text(f"✅ Code <b>{txt.upper()}</b> applied — {int(pct*100)}% off!",parse_mode="HTML")
+        else: ctx.user_data.update({"co_disc_code":None,"co_disc_pct":0,"wf":None}); await u.message.reply_text("❌ Invalid or expired code.")
+        t,_=co_summary(ctx.user_data,uid); await u.message.reply_text(t,parse_mode="HTML",reply_markup=co_kb(ctx.user_data))
+    elif wf=="contact":
+        uname=u.effective_user.username or str(uid); mid=qxi("INSERT INTO messages(user_id,username,message) VALUES(?,?,?)",(uid,uname,txt))
+        await ctx.bot.send_message(ADMIN_ID,f"💬 @{uname} #{mid}\n{hl.escape(txt)}\n/reply {mid}",parse_mode="HTML"); await u.message.reply_text("✅ Message sent!",reply_markup=menu()); ctx.user_data["wf"]=None
+    elif wf=="ann_title":
+        ctx.user_data.update({"ann_title":txt,"wf":"ann_photo"}); await u.message.reply_text("📸 Send photo or type <b>skip</b>:",parse_mode="HTML")
+    elif wf=="ann_photo":
+        if txt.lower()=="skip": ctx.user_data["wf"]="ann_body"; await u.message.reply_text("✏️ Enter announcement body:")
+        else: await u.message.reply_text("📸 Send photo or type <b>skip</b>:",parse_mode="HTML")
+    elif wf=="ann_body":
+        title=ctx.user_data.pop("ann_title",""); photo=ctx.user_data.pop("ann_photo","")
+        qx("INSERT INTO announcements(title,body,photo) VALUES(?,?,?)",(title,txt,photo))
+        uids=qa("SELECT user_id FROM users"); sent=0
+        for r in uids:
+            try:
+                fn=ctx.bot.send_photo(r["user_id"],photo,caption=f"📢 <b>{hl.escape(title)}</b>\n\n{hl.escape(txt)}",parse_mode="HTML") if photo else ctx.bot.send_message(r["user_id"],f"📢 <b>{hl.escape(title)}</b>\n\n{hl.escape(txt)}",parse_mode="HTML")
+                await fn; sent+=1
+            except: pass
+        await u.message.reply_text(f"✅ Broadcast to {sent} users!"); ctx.user_data["wf"]=None
+    elif wf=="review_text":
+        oid=ctx.user_data.get("rev_order"); s=ctx.user_data.get("rev_stars",5); qx("INSERT OR REPLACE INTO reviews(order_id,user_id,stars,text) VALUES(?,?,?,?)",(oid,uid,s,txt))
+        await u.message.reply_text(f"✅ {STARS.get(s,'')} Thanks! 🙏",reply_markup=menu()); ctx.user_data["wf"]=None
+    elif wf=="add_title":
+        ctx.user_data.update({"nm":txt,"wf":"add_desc"}); await u.message.reply_text("📄 Enter product description:")
+    elif wf=="add_desc":
+        d=ctx.user_data; d["wf"]=None; qx("INSERT INTO products(name,description,photo,hidden,tiers) VALUES(?,?,?,0,?)",(d["nm"],txt,d.get("ph",""),json.dumps(TIERS)))
+        await u.message.reply_text(f"✅ <b>{hl.escape(d['nm'])}</b> added!",parse_mode="HTML",reply_markup=menu())
+    elif wf=="edit_desc":
+        qx("UPDATE products SET description=? WHERE id=?",(txt,ctx.user_data.get("edit_pid"))); await u.message.reply_text("✅ Updated!",reply_markup=menu()); ctx.user_data["wf"]=None
+    elif wf=="edit_tiers":
+        pid=ctx.user_data.get("tpid"); new=[]; errs=[]
+        for i,line in enumerate(txt.splitlines(),1):
+            p=line.strip().split(",")
+            try: assert len(p)==2; q2,pr=float(p[0]),float(p[1]); assert q2>0 and pr>0; new.append({"qty":q2,"price":pr})
+            except: errs.append(f"Line {i}: invalid")
+        if errs or not new: await u.message.reply_text("❌ "+("\n".join(errs or ["No valid tiers."]))+"\n\nRetry or /cancel"); return
+        new.sort(key=lambda t:t["qty"]); qx("UPDATE products SET tiers=? WHERE id=?",(json.dumps(new),pid))
+        await u.message.reply_text("✅ Tiers:\n"+"".join(ft(t)+"\n" for t in new),parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
+    elif wf=="drop_msg_user":
+        oid=ctx.user_data.get("dc_oid"); uname=u.effective_user.username or str(uid)
+        qx("INSERT INTO drop_chats(order_id,user_id,sender,message) VALUES(?,?,?,?)",(oid,uid,"user",txt))
+        await ctx.bot.send_message(ADMIN_ID,f"💬 Drop Chat {oid}\n@{uname}: {hl.escape(txt)}",parse_mode="HTML",reply_markup=dc_admin_kb(oid))
+        await u.message.reply_text(f"✅ Sent!\n\n💬 <b>Drop Chat — {oid}</b>\n━━━━━━━━━━━━━━━━━━━━\n\n{fmt_chat(oid)}",parse_mode="HTML",reply_markup=dc_user_kb(oid,gs(f"cc_{oid}","0")=="1")); ctx.user_data["wf"]=None
+    elif wf=="drop_msg_admin":
+        oid=ctx.user_data.get("dc_oid"); row=q1("SELECT user_id FROM orders WHERE id=?",(oid,))
+        if not row: await u.message.reply_text("❌ Not found."); ctx.user_data["wf"]=None; return
+        qx("INSERT INTO drop_chats(order_id,user_id,sender,message) VALUES(?,?,?,?)",(oid,row["user_id"],"admin",txt))
+        try: await ctx.bot.send_message(row["user_id"],f"🏪 <b>Donny's Shop</b>\n━━━━━━━━━━━━━━━━━━━━\n\n{fmt_chat(oid)}",parse_mode="HTML",reply_markup=dc_user_kb(oid,gs(f"cc_{oid}","0")=="1"))
+        except: pass
+        await u.message.reply_text("✅ Sent.",reply_markup=menu()); ctx.user_data["wf"]=None
+    elif wf=="disc_code":
+        parts=txt.upper().split(",")
+        if len(parts) not in (2,3): await u.message.reply_text("⚠️ Format: CODE,PCT or CODE,PCT,HOURS"); return
+        try: dc=parts[0].strip(); pct=float(parts[1].strip())/100; assert 0<pct<=1
+        except: await u.message.reply_text("⚠️ Invalid. E.g. SAVE20,20"); return
+        exp=(datetime.now()+timedelta(hours=float(parts[2].strip()))).isoformat() if len(parts)==3 else None
+        qx("INSERT OR REPLACE INTO discount_codes(code,pct,active,expires) VALUES(?,?,1,?)",(dc,pct,exp))
+        await u.message.reply_text(f"✅ <code>{dc}</code> {int(pct*100)}% off{f' · {parts[2]}h' if exp else ''} added!",parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
+    elif wf=="new_cat":
+        parts=txt.split(None,1); emoji,name=(parts[0],parts[1]) if len(parts)==2 and len(parts[0])<=2 else ("🌿",parts[0]) if len(parts)==1 else (None,None)
+        if not name: await u.message.reply_text("⚠️ Format: 🍃 Category Name"); return
+        qxi("INSERT INTO categories(name,emoji) VALUES(?,?)",(name,emoji)); await u.message.reply_text(f"✅ {emoji} {hl.escape(name)} created!",parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
+    elif wf=="order_note":
+        oid=ctx.user_data.get("note_oid"); qx("INSERT OR REPLACE INTO order_notes(order_id,note) VALUES(?,?)",(oid,txt)); await u.message.reply_text("✅ Note saved.",reply_markup=menu()); ctx.user_data["wf"]=None
+    elif wf=="edit_home":
+        if not is_admin(uid): ctx.user_data["wf"]=None; return
+        val="" if txt.lower()=="clear" else txt; ss("home_extra",val); await u.message.reply_text("✅ Cleared." if not val else f"✅ Updated: <i>{hl.escape(val)}</i>",parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
+    elif wf=="add_admin":
+        if not is_admin(uid): ctx.user_data["wf"]=None; return
+        try: new_id=int(txt.strip())
+        except: await u.message.reply_text("⚠️ Numeric user_id only (use @userinfobot)."); return
+        if q1("SELECT 1 FROM admins WHERE user_id=?",(new_id,)): await u.message.reply_text("⚠️ Already an admin."); ctx.user_data["wf"]=None; return
+        qx("INSERT OR IGNORE INTO admins(user_id,username) VALUES(?,?)",(new_id,str(new_id)))
+        try: info=await ctx.bot.get_chat(new_id); un=info.username or info.first_name or str(new_id); qx("UPDATE admins SET username=? WHERE user_id=?",(un,new_id))
+        except: un=str(new_id)
+        await u.message.reply_text(f"✅ {hl.escape(un)} added.",parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
+    else:
+        await u.message.reply_text(f"🌿 <b>Donny's Shop</b>\n\n{open_badge()}\n\n📦 Tracked · 📍 Local Drop · 🔒 Trusted\n\n👇 Tap below to get started.",parse_mode="HTML",reply_markup=menu())
 
-async def co_setaddr(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q=u.callback_query; await q.answer()
-    await q.edit_message_text("🏠 Enter delivery address:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="co_refresh")]])); return CO_ADDR
+async def on_photo(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    uid=u.effective_user.id; wf=ctx.user_data.get("wf"); ph=u.message.photo[-1].file_id
+    if not is_known(uid): qx("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",(uid,u.effective_user.username or ""))
+    if wf=="add_photo": ctx.user_data.update({"ph":ph,"wf":"add_title"}); await u.message.reply_text("📝 Enter the product title:")
+    elif wf=="ann_photo": ctx.user_data.update({"ann_photo":ph,"wf":"ann_body"}); await u.message.reply_text("✏️ Now enter the announcement body:")
 
-async def co_setdisc(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q=u.callback_query; await q.answer()
-    await q.edit_message_text("🏷️ Enter discount code:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="co_refresh")]])); return CO_DISC
+async def review_reminder_job(ctx:ContextTypes.DEFAULT_TYPE):
+    now=datetime.now(); t24=(now-timedelta(hours=24)).isoformat(); t48=(now-timedelta(hours=48)).isoformat()
+    for r in qa("SELECT order_id,user_id FROM review_reminders WHERE dispatched<? AND dispatched>?",(t24,t48)):
+        qx("DELETE FROM review_reminders WHERE order_id=?",(r["order_id"],))
+        if q1("SELECT 1 FROM reviews WHERE order_id=?",(r["order_id"],)): continue
+        try: await ctx.bot.send_message(r["user_id"],f"⭐ How was your order <code>{r['order_id']}</code>? Leave a quick review!",parse_mode="HTML",reply_markup=KM([IB("⭐ Review",f"review_{r['order_id']}")]))
+        except: pass
 
-async def co_recv_name(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["co_name"]=u.message.text.strip(); txt,_=co_text(ctx.user_data)
-    await u.message.reply_text(txt,parse_mode="HTML",reply_markup=co_kb(ctx.user_data)); return ConversationHandler.END
-
-async def co_recv_addr(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["co_addr"]=u.message.text.strip(); txt,_=co_text(ctx.user_data)
-    await u.message.reply_text(txt,parse_mode="HTML",reply_markup=co_kb(ctx.user_data)); return ConversationHandler.END
-
-async def co_recv_disc(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    code=u.message.text.strip().upper(); pct=DISCOUNT_CODES.get(code)
-    if pct: ctx.user_data.update({"co_discount":code,"co_disc_pct":pct}); await u.message.reply_text(f"✅ {code} — {int(pct*100)}% off!")
-    else: ctx.user_data.update({"co_discount":None,"co_disc_pct":0}); await u.message.reply_text("❌ Invalid code.")
-    txt,_=co_text(ctx.user_data); await u.message.reply_text(txt,parse_mode="HTML",reply_markup=co_kb(ctx.user_data)); return ConversationHandler.END
-
-async def co_ship(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q=u.callback_query; await q.answer(); ctx.user_data["co_shipping"]=q.data.split("co_ship_")[1]
-    txt,_=co_text(ctx.user_data); await q.edit_message_text(txt,parse_mode="HTML",reply_markup=co_kb(ctx.user_data))
-
-async def co_refresh(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q=u.callback_query; await q.answer(); txt,_=co_text(ctx.user_data)
-    await q.edit_message_text(txt,parse_mode="HTML",reply_markup=co_kb(ctx.user_data))
-
-async def co_confirm(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q=u.callback_query; await q.answer(); uid=q.from_user.id; ud=ctx.user_data
-    name,addr,sk=ud.get("co_name"),ud.get("co_addr"),ud.get("co_shipping")
-    if not (name and addr and sk): await q.answer("⚠️ Fill in all fields first.",show_alert=True); return
-    con=db(); prices=con.execute("SELECT chosen_price FROM cart WHERE user_id=?",(uid,)).fetchall()
-    if not prices: con.close(); await q.edit_message_text("🧺 Basket empty.",reply_markup=menu()); return
-    sub=round(sum(p[0] for p in prices),2); dp=ud.get("co_disc_pct",0)
-    sp=SHIPPING[sk]["price"]; sl=SHIPPING[sk]["label"]
-    gbp=round(sub-round(sub*dp,2)+sp,2); ltc=round(gbp/ltc_rate(),6); oid=str(uuid4())[:8]
-    con.execute("INSERT INTO orders VALUES(?,?,?,?,?,?,?)",(oid,uid,name,addr,gbp,ltc,"Awaiting Payment"))
-    con.execute("DELETE FROM cart WHERE user_id=?",(uid,)); con.commit(); con.close()
-    await ctx.bot.send_message(CHANNEL_ID,f"🛒 <b>New Order</b>\n🔖 <code>{oid}</code>\n👤 {name}\n🏠 {addr}\n🚚 {sl}\n💷 £{gbp} | {ltc} LTC\n⏳ Awaiting Payment",parse_mode="HTML")
-    await q.edit_message_text(f"🧾 <b>Order Placed!</b>\n\n🔖 <code>{oid}</code>\n👤 {name}\n🏠 {addr}\n🚚 {sl}\n💷 £{gbp}\n⚡ {ltc} LTC\n\n📤 Send LTC to:\n<code>{LTC_ADDR}</code>",
-        parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ I Have Paid",callback_data=f"paid_{oid}")]]))
-    for k in list(ud.keys()):
-        if k.startswith("co_"): ud.pop(k)
-
-# ══ ADMIN ════════════════════════════════════════════════════════════════════
-async def admin_panel(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if u.effective_user.id!=ADMIN_ID: return
-    con=db(); orders=con.execute("SELECT id,status FROM orders ORDER BY rowid DESC").fetchall()
-    unread=con.execute("SELECT COUNT(*) FROM messages WHERE reply IS NULL").fetchone()[0]; con.close()
-    kb=[]
-    for oid,st in orders:
-        if st=="Awaiting Payment": kb.append([InlineKeyboardButton(f"✅ Confirm {oid}",callback_data=f"adm_ok_{oid}"),InlineKeyboardButton(f"❌ Reject {oid}",callback_data=f"adm_no_{oid}")])
-        elif st=="Paid": kb.append([InlineKeyboardButton(f"🚚 Dispatch {oid}",callback_data=f"adm_go_{oid}")])
-    kb+=[
-        [InlineKeyboardButton("➕ Add Product",  callback_data="adm_addprod")],
-        [InlineKeyboardButton("✏️ Edit Tiers",   callback_data="adm_tiers")],
-        [InlineKeyboardButton(f"💬 Messages{f' ({unread} unread)' if unread else ''}",callback_data="adm_msgs")],
-        [InlineKeyboardButton("📢 New Announcement",callback_data="adm_announce")],
-    ]
-    await u.message.reply_text("🔧 <b>Admin Panel</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
-
-async def adm_confirm(u,ctx):
-    q=u.callback_query; await q.answer(); oid=q.data[7:]; con=db()
-    con.execute("UPDATE orders SET status='Paid' WHERE id=?",(oid,))
-    uid=con.execute("SELECT user_id FROM orders WHERE id=?",(oid,)).fetchone(); con.commit(); con.close()
-    if uid: await ctx.bot.send_message(uid[0],f"✅ Payment confirmed for <code>{oid}</code>! 🌟\nLeave a review when it arrives.",parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Leave Review",callback_data=f"review_{oid}")]]))
-    await q.edit_message_text(f"✅ Confirmed {oid}")
-
-async def adm_reject(u,ctx):
-    q=u.callback_query; await q.answer(); oid=q.data[7:]; con=db()
-    con.execute("UPDATE orders SET status='Rejected' WHERE id=?",(oid,))
-    uid=con.execute("SELECT user_id FROM orders WHERE id=?",(oid,)).fetchone(); con.commit(); con.close()
-    if uid: await ctx.bot.send_message(uid[0],f"❌ Payment for <code>{oid}</code> rejected. Contact support.",parse_mode="HTML")
-    await q.edit_message_text(f"❌ Rejected {oid}")
-
-async def adm_dispatch(u,ctx):
-    q=u.callback_query; await q.answer(); oid=q.data[7:]; con=db()
-    con.execute("UPDATE orders SET status='Dispatched' WHERE id=?",(oid,))
-    uid=con.execute("SELECT user_id FROM orders WHERE id=?",(oid,)).fetchone(); con.commit(); con.close()
-    if uid: await ctx.bot.send_message(uid[0],f"🚚 Order <code>{oid}</code> dispatched! 📬",parse_mode="HTML")
-    await q.edit_message_text(f"🚚 Dispatched {oid}")
-
-async def adm_msgs(u,ctx):
-    q=u.callback_query; await q.answer()
-    if u.effective_user.id!=ADMIN_ID: return
-    con=db(); rows=con.execute("SELECT id,username,message,reply FROM messages ORDER BY id DESC LIMIT 15").fetchall(); con.close()
-    if not rows: await q.edit_message_text("📭 No messages.",reply_markup=InlineKeyboardMarkup([back()])); return
-    txt="💬 <b>Messages</b>\n\n"
-    for mid,uname,msg,reply in rows:
-        status="✅" if reply else "⏳"
-        txt+=f"{status} <code>{mid}</code> @{uname}\n{msg[:80]}\n/reply {mid} &lt;text&gt;\n\n"
-    if len(txt)>4000: txt=txt[:4000]+"…"
-    await q.edit_message_text(txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup([back()]))
-
-async def user_paid(u,ctx):
-    q=u.callback_query; await q.answer(); oid=q.data[5:]
-    await ctx.bot.send_message(ADMIN_ID,f"💰 User {q.from_user.id} claims payment for <code>{oid}</code>",parse_mode="HTML")
-    await q.edit_message_text("⏳ Payment submitted. Awaiting confirmation.")
-
-# ══ ADD PRODUCT ══════════════════════════════════════════════════════════════
-async def addprod_start(u,ctx):
-    if u.effective_user.id!=ADMIN_ID: return
-    await u.message.reply_text("📸 Send product photo:"); return ADD_PHOTO
-
-async def addprod_photo(u,ctx):
-    if not u.message.photo: await u.message.reply_text("⚠️ Send a photo."); return ADD_PHOTO
-    ctx.user_data["ph"]=u.message.photo[-1].file_id; await u.message.reply_text("📝 Title:"); return ADD_TITLE
-
-async def addprod_title(u,ctx):
-    ctx.user_data["nm"]=u.message.text.strip(); await u.message.reply_text("📄 Description:"); return ADD_DESC
-
-async def addprod_desc(u,ctx):
-    ctx.user_data["ds"]=u.message.text.strip(); await u.message.reply_text("📦 Stock (1-1000):"); return ADD_QTY
-
-async def addprod_qty(u,ctx):
-    try: qty=int(u.message.text.strip()); assert 1<=qty<=1000
-    except: await u.message.reply_text("⚠️ Enter 1–1000:"); return ADD_QTY
-    d=ctx.user_data; con=db()
-    con.execute("INSERT INTO products(name,description,photo,stock,tiers) VALUES(?,?,?,?,?)",(d["nm"],d["ds"],d["ph"],qty,json.dumps(DEFAULT_TIERS)))
-    con.commit(); con.close()
-    await u.message.reply_photo(d["ph"],caption=f"✅ <b>{d['nm']}</b> added! Stock: {qty}",parse_mode="HTML")
-    return ConversationHandler.END
-
-# ══ EDIT TIERS ════════════════════════════════════════════════════════════════
-async def adm_list_tiers(u,ctx):
-    q=u.callback_query; await q.answer(); con=db()
-    rows=con.execute("SELECT id,name FROM products").fetchall(); con.close()
-    if not rows: await q.edit_message_text("No products.",reply_markup=InlineKeyboardMarkup([back()])); return
-    kb=[[InlineKeyboardButton(f"🌿 {r[1]}",callback_data=f"edtier_{r[0]}")] for r in rows]+[back()]
-    await q.edit_message_text("✏️ Pick product to edit tiers:",reply_markup=InlineKeyboardMarkup(kb))
-
-async def adm_show_tiers(u,ctx):
-    q=u.callback_query; await q.answer(); pid=int(q.data.split("_")[1]); ctx.user_data["tpid"]=pid
-    con=db(); row=con.execute("SELECT name,tiers FROM products WHERE id=?",(pid,)).fetchone(); con.close()
-    tiers=json.loads(row[1])
-    await q.message.reply_text(f"✏️ <b>{row[0]}</b>\n\n"+"\n".join(ft(t) for t in tiers)+"\n\nSend new tiers as <code>qty,price</code> one per line.\n/cancel to stop.",parse_mode="HTML")
-    return EDIT_TIERS
-
-async def save_tiers(u,ctx):
-    pid=ctx.user_data.get("tpid"); new=[]; errs=[]
-    for i,line in enumerate(u.message.text.strip().splitlines(),1):
-        p=line.strip().split(",")
-        if len(p)!=2: errs.append(f"Line {i}: need qty,price"); continue
-        try: q2,pr=float(p[0]),float(p[1]); assert q2>0 and pr>0; new.append({"qty":q2,"price":pr})
-        except: errs.append(f"Line {i}: invalid numbers")
-    if errs or not new: await u.message.reply_text("❌ "+"\n".join(errs or ["No valid tiers."])+"\n\nRetry or /cancel."); return EDIT_TIERS
-    new.sort(key=lambda t:t["qty"]); con=db()
-    con.execute("UPDATE products SET tiers=? WHERE id=?",(json.dumps(new),pid)); con.commit(); con.close()
-    await u.message.reply_text("✅ <b>Tiers updated!</b>\n\n"+"\n".join(ft(t) for t in new),parse_mode="HTML")
-    return ConversationHandler.END
-
-async def cancel(u,ctx):
-    await u.message.reply_text("🚫 Cancelled.",reply_markup=menu()); return ConversationHandler.END
-
-# ══ ROUTER ═══════════════════════════════════════════════════════════════════
-async def router(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    d=u.callback_query.data
-    if   d=="menu":            await u.callback_query.edit_message_text("🏠 Main Menu",reply_markup=menu())
-    elif d=="products":        await show_products(u,ctx)
-    elif d.startswith("prod_"):await show_product(u,ctx)
-    elif d=="basket":          await view_basket(u,ctx)
-    elif d=="orders":          await view_orders(u,ctx)
-    elif d=="pub_reviews":     await pub_reviews(u,ctx)
-    elif d=="announcements":   await show_announcements(u,ctx)
-    elif d.startswith("pick_"):await pick_weight(u,ctx)
-    elif d.startswith("remove_"):await remove_item(u,ctx)
-    elif d.startswith("paid_"): await user_paid(u,ctx)
-    elif d.startswith("adm_ok_"):await adm_confirm(u,ctx)
-    elif d.startswith("adm_no_"):await adm_reject(u,ctx)
-    elif d.startswith("adm_go_"):await adm_dispatch(u,ctx)
-    elif d=="adm_msgs":        await adm_msgs(u,ctx)
-    elif d=="adm_tiers":       await adm_list_tiers(u,ctx)
+async def router(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    q=u.callback_query; d=q.data; uid=q.from_user.id
+    if not is_known(uid) and not is_admin(uid): await q.answer("Please /start the bot first.",show_alert=True); return
+    if d.startswith("pick_"):       await pick_weight(u,ctx); return
+    if d.startswith("togglehide_"): await adm_togglehide(u,ctx); return
+    if d=="noop":                   await q.answer(); return
+    await q.answer()
+    if   d=="menu":                  await safe_edit(q,f"🌿 <b>Donny's Shop</b>\n━━━━━━━━━━━━━━━━━━━━\n\n{open_badge()}\n🕙 <b>Mon–Sat · Orders close 11am</b>\n\n📦 Tracked · 📍 Local Drop · 🔒 Trusted\n\n👇 <b>What are you looking for?</b>",parse_mode="HTML",reply_markup=menu())
+    elif d=="shop":                  await show_shop(u,ctx)
+    elif d.startswith("cat_assign_"):await adm_cat_assign(u,ctx)
+    elif d.startswith("togglecat_"): await adm_togglecat(u,ctx)
+    elif d.startswith("cat_"):       await show_category(u,ctx)
+    elif d.startswith("prod_"):      await show_product(u,ctx)
+    elif d=="basket":                await view_basket(u,ctx)
+    elif d=="orders":                await view_orders(u,ctx)
+    elif d.startswith("reviews_"):   await show_reviews(u,ctx)
+    elif d=="news":                  await show_news(u,ctx)
+    elif d=="contact":               await contact_start(u,ctx)
+    elif d.startswith("rm_"):        await remove_item(u,ctx)
+    elif d.startswith("paid_"):      await user_paid(u,ctx)
+    elif d.startswith("review_"):    await review_start(u,ctx)
+    elif d.startswith("stars_"):     await pick_stars(u,ctx)
+    elif d=="loyalty":               await show_loyalty(u,ctx)
+    elif d=="my_ref":                await show_my_ref(u,ctx)
+    elif d=="checkout":              await checkout_start(u,ctx)
+    elif d=="co_name":               await co_name_start(u,ctx)
+    elif d=="co_addr":               await co_addr_start(u,ctx)
+    elif d=="co_addr_skip":          await co_addr_skip(u,ctx)
+    elif d=="co_disc":               await co_disc_start(u,ctx)
+    elif d.startswith("co_ship_"):   await co_ship_cb(u,ctx)
+    elif d=="co_refresh":            await co_refresh_cb(u,ctx)
+    elif d=="co_confirm":            await co_confirm(u,ctx)
+    elif d.startswith("adm_ok_"):    await adm_confirm(u,ctx)
+    elif d.startswith("adm_no_"):    await adm_reject(u,ctx)
+    elif d.startswith("adm_go_"):    await adm_dispatch(u,ctx)
+    elif d=="adm_msgs":              await adm_msgs(u,ctx)
+    elif d=="adm_tiers":             await adm_list_tiers(u,ctx)
+    elif d=="adm_rmprod":            await adm_rmprod_list(u,ctx)
+    elif d.startswith("rmprod_yes_"):await adm_rmprod_do(u,ctx)
+    elif d.startswith("rmprod_"):    await adm_rmprod_confirm(u,ctx)
+    elif d=="adm_editdesc":          await adm_editdesc_list(u,ctx)
+    elif d.startswith("editdesc_"):  await adm_editdesc_start(u,ctx)
+    elif d=="adm_hideprod":          await adm_hideprod_list(u,ctx)
+    elif d=="adm_cats":              await adm_cats(u,ctx)
+    elif d=="adm_newcat":            await adm_newcat(u,ctx)
+    elif d=="adm_delcat":            await adm_delcat_list(u,ctx)
+    elif d.startswith("delcat_"):    await adm_delcat_do(u,ctx)
+    elif d=="adm_drops":             await adm_drop_overview(u,ctx)
+    elif d.startswith("adm_rev_"):   await adm_rev_cb(u,ctx)
+    elif d=="adm_discounts":         await adm_discounts(u,ctx)
+    elif d.startswith("toggledisc_"):await adm_toggledisc(u,ctx)
+    elif d=="adm_adddisc":           await adm_adddisc_start(u,ctx)
+    elif d=="adm_announce":          await ann_start(u,ctx)
     elif d=="adm_addprod":
-        if u.effective_user.id==ADMIN_ID: await u.callback_query.message.reply_text("Use /addproduct")
-    elif d.startswith("co_ship_"):await co_ship(u,ctx)
-    elif d=="co_refresh":      await co_refresh(u,ctx)
-    elif d=="co_confirm":      await co_confirm(u,ctx)
+        if is_admin(uid): ctx.user_data["wf"]="add_photo"; await q.message.reply_text("📸 Send the product photo:")
+    elif d.startswith("edtier_"):    await adm_show_tiers(u,ctx)
+    elif d.startswith("dcv_"):       await dropchat_view(u,ctx)
+    elif d.startswith("dch_"):       await dropchat_history(u,ctx)
+    elif d.startswith("dcc_"):       await dropchat_close(u,ctx)
+    elif d.startswith("dcac_"):      await dropchat_close(u,ctx)
+    elif d.startswith("dco_"):       await dropchat_open(u,ctx)
+    elif d.startswith("dcm_"):       await dropchat_msg_start(u,ctx)
+    elif d.startswith("dcr_"):       await dropchat_reply_start(u,ctx)
+    elif d.startswith("adm_note_"):  await adm_note_start(u,ctx)
+    elif d=="adm_edit_home":         await adm_edit_home(u,ctx)
+    elif d=="adm_admins":            await adm_admins(u,ctx)
+    elif d=="adm_addadmin":          await adm_addadmin_start(u,ctx)
+    elif d.startswith("adm_rmadmin_"):await adm_rmadmin(u,ctx)
+    elif d.startswith("reorder_"):   await reorder_cb(u,ctx)
+    elif d=="notify_open":           await notify_open_cb(u,ctx)
 
-# ══ MAIN ═════════════════════════════════════════════════════════════════════
+
+async def error_handler(u,ctx:ContextTypes.DEFAULT_TYPE):
+    import traceback
+    err=ctx.error; tb="".join(traceback.format_exception(type(err),err,err.__traceback__))
+    logging.error(f"Unhandled exception:\n{tb}")
+    try:
+        if u and u.callback_query:
+            try: await u.callback_query.answer("⚠️ Something went wrong. Please try again.",show_alert=True)
+            except: pass
+            try: await u.callback_query.message.reply_text("⚠️ An error occurred. Please tap the button again or go back to /start.",reply_markup=menu())
+            except: pass
+        elif u and u.message:
+            await u.message.reply_text("⚠️ An error occurred. Please try again or use /start.",reply_markup=menu())
+    except: pass
+
+class _Ping(BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+    def log_message(self,*a): pass
+
+class _ReuseServer(HTTPServer):
+    allow_reuse_address=True
+
+def _start_ping():
+    for port in [8080,8081,8082]:
+        try: _ReuseServer(("0.0.0.0",port),_Ping).serve_forever(); break
+        except OSError: continue
+
 def main():
-    init_db()
-    app = ApplicationBuilder().token(TOKEN).build()
-    END = ConversationHandler.END
-
-    def conv(entry, states, fallbacks=None, **kw):
-        fb = (fallbacks or []) + [CommandHandler("cancel",cancel)]
-        return ConversationHandler(entry_points=entry, states=states, fallbacks=fb, per_message=False, **kw)
-
-    app.add_handler(CommandHandler("start",start))
-    app.add_handler(CommandHandler("admin",admin_panel))
-    app.add_handler(CommandHandler("reply",admin_reply_cmd))
-
-    app.add_handler(conv([CallbackQueryHandler(review_start,pattern="^review_")],
-        {PICK_STARS:[CallbackQueryHandler(pick_stars,pattern="^stars_")],
-         WRITE_REVIEW:[MessageHandler(filters.TEXT&~filters.COMMAND,save_review)]}))
-
-    app.add_handler(conv([CallbackQueryHandler(contact_start,pattern="^contact_vendor$")],
-        {ASK_CONTACT:[MessageHandler(filters.TEXT&~filters.COMMAND,contact_save)]}))
-
-    app.add_handler(conv([CallbackQueryHandler(ann_start,pattern="^adm_announce$")],
-        {ASK_ANN_TITLE:[MessageHandler(filters.TEXT&~filters.COMMAND,ann_title)],
-         ASK_ANN_BODY: [MessageHandler(filters.TEXT&~filters.COMMAND,ann_body)]}))
-
-    app.add_handler(conv([CallbackQueryHandler(checkout_start,pattern="^checkout$")],
-        {CO_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,co_recv_name)],
-         CO_ADDR:[MessageHandler(filters.TEXT&~filters.COMMAND,co_recv_addr)],
-         CO_DISC:[MessageHandler(filters.TEXT&~filters.COMMAND,co_recv_disc)]}))
-
-    app.add_handler(conv([CallbackQueryHandler(co_setname,pattern="^co_name$")],
-        {CO_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,co_recv_name)]},
-        [CallbackQueryHandler(co_refresh,pattern="^co_refresh$")]))
-
-    app.add_handler(conv([CallbackQueryHandler(co_setaddr,pattern="^co_addr$")],
-        {CO_ADDR:[MessageHandler(filters.TEXT&~filters.COMMAND,co_recv_addr)]},
-        [CallbackQueryHandler(co_refresh,pattern="^co_refresh$")]))
-
-    app.add_handler(conv([CallbackQueryHandler(co_setdisc,pattern="^co_disc$")],
-        {CO_DISC:[MessageHandler(filters.TEXT&~filters.COMMAND,co_recv_disc)]},
-        [CallbackQueryHandler(co_refresh,pattern="^co_refresh$")]))
-
-    app.add_handler(conv([CommandHandler("addproduct",addprod_start)],
-        {ADD_PHOTO:[MessageHandler(filters.PHOTO,addprod_photo)],
-         ADD_TITLE:[MessageHandler(filters.TEXT&~filters.COMMAND,addprod_title)],
-         ADD_DESC: [MessageHandler(filters.TEXT&~filters.COMMAND,addprod_desc)],
-         ADD_QTY:  [MessageHandler(filters.TEXT&~filters.COMMAND,addprod_qty)]}))
-
-    app.add_handler(conv([CallbackQueryHandler(adm_show_tiers,pattern="^edtier_")],
-        {EDIT_TIERS:[MessageHandler(filters.TEXT&~filters.COMMAND,save_tiers)]}))
-
+    Thread(target=_start_ping,daemon=True).start()
+    if not TOKEN: raise RuntimeError("❌ TOKEN not set — add it to Replit Secrets")
+    init_db(); app=ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler(["start","Start"],cmd_start))
+    for cmd,fn in [("admin",cmd_admin),("reply",cmd_reply),("order",cmd_order),("customer",cmd_customer),("myorder",cmd_myorder),("addproduct",cmd_addproduct),("cancel",cmd_cancel),("stats",cmd_stats)]:
+        app.add_handler(CommandHandler(cmd,fn))
     app.add_handler(CallbackQueryHandler(router))
-    print("🚀 Bot running..."); app.run_polling()
-
+    app.add_handler(MessageHandler(filters.PHOTO,on_photo))
+    app.add_handler(MessageHandler(filters.TEXT&~filters.COMMAND,on_message))
+    app.add_error_handler(error_handler)
+    try:
+        app.job_queue.run_repeating(review_reminder_job,interval=3600,first=300)
+        app.job_queue.run_repeating(open_notify_job,interval=1800,first=60)
+    except Exception as e: print(f"⚠️ Job queue: {e}")
+    print("🚀 Donny's Shop — Running"); app.run_polling(drop_pending_updates=True,allowed_updates=Update.ALL_TYPES)
 if __name__=="__main__":
     main()
