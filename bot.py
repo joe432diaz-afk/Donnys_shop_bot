@@ -9,7 +9,7 @@ def IB(text,cb): return _IB(text=text,callback_data=cb)
 from telegram.ext import ApplicationBuilder,CommandHandler,CallbackQueryHandler,MessageHandler,ContextTypes,filters
 
 TOKEN=os.getenv("TOKEN"); ADMIN_ID=7773622161; CHANNEL_ID=-1003833257976
-LTC_ADDR="ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"; DB="shop.db"
+LTC_ADDR="ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"; DB="/app/data/shop.db"
 SHIP={"tracked24":{"label":"📦 Tracked24","price":5.0,"ltc":True},"drop":{"label":"📍 Local Drop","price":0.0,"ltc":False}}
 TIERS=[{"qty":1,"price":10.0},{"qty":3.5,"price":35.0},{"qty":7,"price":60.0},{"qty":14,"price":110.0},{"qty":28,"price":200.0},{"qty":56,"price":380.0}]
 STARS={1:"⭐",2:"⭐⭐",3:"⭐⭐⭐",4:"⭐⭐⭐⭐",5:"⭐⭐⭐⭐⭐"}; RPP=5
