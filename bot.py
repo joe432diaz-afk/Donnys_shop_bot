@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# PhiVara Network — Multi-Vendor Telegram Bot
+# PhiVara Network — Multi-Vendor Telegram Bot — v2.0 UPGRADED
 import os,json,logging,requests,sqlite3,html as hl
 from threading import Thread
 from http.server import HTTPServer,BaseHTTPRequestHandler
@@ -29,14 +29,14 @@ def ss(k,v): qx("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(k,v))
 def init_db():
     c=db(); cur=c.cursor()
     cur.executescript("""
-    CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,username TEXT,joined DATETIME DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,username TEXT,joined DATETIME DEFAULT CURRENT_TIMESTAMP,banned INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
     CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY,username TEXT);
     CREATE TABLE IF NOT EXISTS vendors(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,emoji TEXT DEFAULT '🏪',description TEXT DEFAULT '',ltc_addr TEXT,commission_pct REAL DEFAULT 10,admin_user_id INTEGER,active INTEGER DEFAULT 1);
-    CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT,vendor_id INTEGER DEFAULT 1,name TEXT,description TEXT,photo TEXT,hidden INTEGER DEFAULT 0,tiers TEXT DEFAULT '[]',category_id INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT,vendor_id INTEGER DEFAULT 1,name TEXT,description TEXT,photo TEXT,hidden INTEGER DEFAULT 0,tiers TEXT DEFAULT '[]',category_id INTEGER DEFAULT 0,stock INTEGER DEFAULT -1,featured INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT,vendor_id INTEGER DEFAULT 1,name TEXT,emoji TEXT DEFAULT '🌿');
     CREATE TABLE IF NOT EXISTS cart(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,product_id INTEGER,vendor_id INTEGER DEFAULT 1,qty REAL,price REAL,created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,user_id INTEGER,vendor_id INTEGER DEFAULT 1,cust_name TEXT,address TEXT,summary TEXT DEFAULT '',gbp REAL,vendor_gbp REAL DEFAULT 0,platform_gbp REAL DEFAULT 0,ltc REAL DEFAULT 0,status TEXT DEFAULT 'Pending',ship TEXT DEFAULT 'tracked24',created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,user_id INTEGER,vendor_id INTEGER DEFAULT 1,cust_name TEXT,address TEXT,summary TEXT DEFAULT '',gbp REAL,vendor_gbp REAL DEFAULT 0,platform_gbp REAL DEFAULT 0,ltc REAL DEFAULT 0,ltc_addr TEXT DEFAULT '',status TEXT DEFAULT 'Pending',ship TEXT DEFAULT 'tracked24',created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS order_notes(order_id TEXT PRIMARY KEY,note TEXT);
     CREATE TABLE IF NOT EXISTS drop_chats(id INTEGER PRIMARY KEY AUTOINCREMENT,order_id TEXT,user_id INTEGER,sender TEXT,message TEXT,created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,username TEXT,vendor_id INTEGER DEFAULT 1,message TEXT,reply TEXT,created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
@@ -46,6 +46,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS loyalty(user_id INTEGER PRIMARY KEY,points INTEGER DEFAULT 0,credit REAL DEFAULT 0,lifetime INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS referrals(code TEXT PRIMARY KEY,owner_id INTEGER,count INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS review_reminders(order_id TEXT PRIMARY KEY,user_id INTEGER,dispatched DATETIME);
+    CREATE TABLE IF NOT EXISTS customer_notes(user_id INTEGER PRIMARY KEY,note TEXT);
     """)
     cur.execute("INSERT OR IGNORE INTO admins(user_id,username) VALUES(?,'owner')",(ADMIN_ID,))
     cur.execute("INSERT OR IGNORE INTO vendors(id,name,emoji,description,ltc_addr,commission_pct,admin_user_id) VALUES(1,'Donny''s Shop','🌿','Premium quality. Every time.','ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc',10,?)",(ADMIN_ID,))
@@ -54,6 +55,7 @@ def init_db():
 
 def is_admin(uid): return uid==ADMIN_ID or bool(q1("SELECT 1 FROM admins WHERE user_id=?",(uid,)))
 def is_known(uid): return bool(q1("SELECT 1 FROM users WHERE user_id=?",(uid,)))
+def is_banned(uid): r=q1("SELECT banned FROM users WHERE user_id=?",(uid,)); return r and r.get("banned",0)==1
 def get_vendor(uid): return q1("SELECT * FROM vendors WHERE admin_user_id=? AND active=1",(uid,))
 def is_vendor_admin(uid): return not is_admin(uid) and bool(get_vendor(uid))
 def get_vid(ctx,uid):
@@ -94,12 +96,24 @@ def fmt_chat(oid):
     return "\n\n".join(f"<b>{'👤 You' if m['sender']=='user' else '🏪 Vendor'}</b> <i>{str(m['created_at'])[:16]}</i>\n{hl.escape(m['message'])}" for m in msgs)
 def purge(): c=(datetime.now()-timedelta(days=30)).isoformat(); qx("DELETE FROM drop_chats WHERE created_at<?",(c,)); qx("DELETE FROM cart WHERE created_at<?",(c,))
 
+# ── UPGRADE 3: Sales analytics helper ──────────────────────────────────────────
+def get_stats(vid=None):
+    base="WHERE status IN ('Paid','Dispatched')"
+    vf=f" AND vendor_id={vid}" if vid else ""
+    tot=q1(f"SELECT COUNT(*) as c, COALESCE(SUM(gbp),0) as s FROM orders {base}{vf}") or {"c":0,"s":0}
+    today=datetime.now().strftime("%Y-%m-%d")
+    td=q1(f"SELECT COUNT(*) as c, COALESCE(SUM(gbp),0) as s FROM orders {base}{vf} AND created_at>=?",(today,)) or {"c":0,"s":0}
+    pending=q1(f"SELECT COUNT(*) as c FROM orders WHERE status='Pending'{vf}") or {"c":0}
+    top=qa(f"SELECT summary, COUNT(*) as c FROM orders {base}{vf} GROUP BY summary ORDER BY c DESC LIMIT 3")
+    avg=q1(f"SELECT COALESCE(AVG(gbp),0) as a FROM orders {base}{vf}") or {"a":0}
+    return tot,td,pending,top,avg
+
 def menu():
     return KM([IB("🏪  Browse Vendors","vendors")],
               [IB("🧺  Basket","basket"),IB("📦  My Orders","orders")],
               [IB("⭐  Reviews","reviews_0"),IB("📢  News","news")],
               [IB("🎁  Loyalty","loyalty"),IB("🔗  Refer & Earn","my_ref")],
-              [IB("💬  Contact","contact")])
+              [IB("🔍  Search","search_prompt"),IB("💬  Contact","contact")])
 def back_kb(): return KM([IB("⬅️ Back","menu")])
 def cancel_kb(): return KM([IB("❌ Cancel","menu")])
 def co_kb(ud):
@@ -128,7 +142,9 @@ async def safe_edit(q,text,**kw):
         await q.message.reply_text(text,**kw)
 
 async def cmd_start(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    purge(); uid=u.effective_user.id; is_new=not q1("SELECT 1 FROM users WHERE user_id=?",(uid,))
+    purge(); uid=u.effective_user.id
+    if is_banned(uid): await u.message.reply_text("🚫 You are banned from this platform."); return
+    is_new=not q1("SELECT 1 FROM users WHERE user_id=?",(uid,))
     qx("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",(uid,u.effective_user.username or ""))
     if is_new and ctx.args:
         r_=credit_ref(ctx.args[0],uid)
@@ -155,30 +171,37 @@ async def show_vendor(u,ctx):
     q=u.callback_query; vid=int(q.data.split("_")[1]); v=q1("SELECT * FROM vendors WHERE id=? AND active=1",(vid,))
     if not v: await safe_edit(q,"❌ Vendor not found.",reply_markup=back_kb()); return
     cats=qa("SELECT * FROM categories WHERE vendor_id=? ORDER BY id",(vid,)); kb=[]
+    # Featured products pinned to top — UPGRADE 12
+    featured=qa("SELECT id,name FROM products WHERE hidden=0 AND vendor_id=? AND featured=1 ORDER BY id",(vid,))
+    if featured: kb+=[[IB(f"⭐ {r['name']}",f"prod_{r['id']}")] for r in featured]
     if cats:
-        kb=[[IB(f"{c['emoji']} {c['name']}",f"cat_{c['id']}")] for c in cats]
-        unc=qa("SELECT id,name FROM products WHERE hidden=0 AND vendor_id=? AND (category_id=0 OR category_id IS NULL) ORDER BY id",(vid,))
+        kb+=[[IB(f"{c['emoji']} {c['name']}",f"cat_{c['id']}")] for c in cats]
+        unc=qa("SELECT id,name FROM products WHERE hidden=0 AND vendor_id=? AND featured=0 AND (category_id=0 OR category_id IS NULL) ORDER BY id",(vid,))
         if unc: kb+=[[IB(f"🌿 {r['name']}",f"prod_{r['id']}")] for r in unc]
     else:
-        prods=qa("SELECT id,name FROM products WHERE hidden=0 AND vendor_id=? ORDER BY id",(vid,))
-        kb=[[IB(f"🌿 {r['name']}",f"prod_{r['id']}")] for r in prods] or [[IB("No products yet","noop")]]
+        prods=qa("SELECT id,name FROM products WHERE hidden=0 AND vendor_id=? AND featured=0 ORDER BY id",(vid,))
+        kb+=[[IB(f"🌿 {r['name']}",f"prod_{r['id']}")] for r in prods] or [[IB("No products yet","noop")]]
     kb+=[[IB("⬅️ Back","vendors")]]; desc=f"\n<i>{hl.escape(v['description'])}</i>" if v.get("description") else ""
     await safe_edit(q,f"{v['emoji']} <b>{hl.escape(v['name'])}</b>{desc}",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
 
 async def show_category(u,ctx):
     q=u.callback_query; cid=int(q.data.split("_")[1]); cat=q1("SELECT * FROM categories WHERE id=?",(cid,))
     if not cat: await safe_edit(q,"❌ Not found.",reply_markup=back_kb()); return
-    vid=cat.get("vendor_id",1); prods=qa("SELECT id,name FROM products WHERE hidden=0 AND category_id=? ORDER BY id",(cid,))
-    kb=[[IB(f"🌿 {r['name']}",f"prod_{r['id']}")] for r in prods]+[[IB("⬅️ Back",f"vend_{vid}")]]
+    vid=cat.get("vendor_id",1); prods=qa("SELECT id,name FROM products WHERE hidden=0 AND category_id=? ORDER BY featured DESC,id",(cid,))
+    kb=[[IB(("⭐ " if r.get("featured") else "🌿 ")+r['name'],f"prod_{r['id']}")] for r in prods]+[[IB("⬅️ Back",f"vend_{vid}")]]
     await safe_edit(q,f"{cat['emoji']} <b>{hl.escape(cat['name'])}</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb if prods else [[IB("No products here","noop")]]+[[IB("⬅️ Back",f"vend_{vid}")]]))
 
 async def show_product(u,ctx):
     q=u.callback_query; pid=int(q.data.split("_")[1]); row=q1("SELECT * FROM products WHERE id=? AND hidden=0",(pid,))
     if not row: await safe_edit(q,"❌ Not available.",reply_markup=back_kb()); return
     tiers=json.loads(row["tiers"]) if row.get("tiers") else TIERS[:]; vid=row.get("vendor_id",1)
+    # UPGRADE 4: Stock warning
+    stock=row.get("stock",-1); stock_txt=""
+    if stock==0: await safe_edit(q,"❌ Out of stock.",reply_markup=KM([IB("⬅️ Back",f"vend_{vid}")])); return
+    elif 0<stock<=5: stock_txt=f"\n⚠️ <b>Only {stock} left in stock!</b>"
     btns=[IB(ft(t),f"pick_{pid}_{t['qty']}_{t['price']}") for t in tiers]
     kb=[btns[i:i+2] for i in range(0,len(btns),2)]+[[IB("🧺 Basket","basket"),IB("⬅️ Back",f"vend_{vid}")]]
-    cap=f"🌿 <b>{hl.escape(row['name'])}</b>\n\n{hl.escape(row['description'])}\n\n"+"".join(ft(t)+"\n" for t in tiers)
+    cap=f"{'⭐ ' if row.get('featured') else '🌿 '}<b>{hl.escape(row['name'])}</b>{stock_txt}\n\n{hl.escape(row['description'])}\n\n"+"".join(ft(t)+"\n" for t in tiers)
     try: await q.message.delete()
     except: pass
     if row.get("photo"): await ctx.bot.send_photo(q.message.chat_id,row["photo"],caption=cap[:1020],parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
@@ -186,8 +209,9 @@ async def show_product(u,ctx):
 
 async def pick_weight(u,ctx):
     q=u.callback_query; p=q.data.split("_"); pid,qty,price=int(p[1]),float(p[2]),float(p[3])
-    row=q1("SELECT name,vendor_id FROM products WHERE id=? AND hidden=0",(pid,))
+    row=q1("SELECT name,vendor_id,stock FROM products WHERE id=? AND hidden=0",(pid,))
     if not row: await q.answer("❌ Not available.",show_alert=True); return
+    if row.get("stock",- 1)==0: await q.answer("❌ Out of stock.",show_alert=True); return
     qx("INSERT INTO cart(user_id,product_id,vendor_id,qty,price) VALUES(?,?,?,?,?)",(q.from_user.id,pid,row.get("vendor_id",1),qty,price))
     await q.answer(f"✅ {fq(qty)} of {row['name']} added! (£{price:.2f})",show_alert=True)
 
@@ -204,7 +228,7 @@ async def checkout_start(u,ctx):
     q=u.callback_query; uid=q.from_user.id; items=qa("SELECT vendor_id,price FROM cart WHERE user_id=?",(uid,))
     if not items: await safe_edit(q,"🧺 Basket empty.",reply_markup=menu()); return
     vids=list(set(r["vendor_id"] for r in items))
-    if len(vids)>1: await safe_edit(q,"⚠️ <b>Mixed vendors in basket</b>\n\nYou can only checkout one vendor at a time. Clear your basket and shop from one vendor.",parse_mode="HTML",reply_markup=KM([IB("🗑️ Clear Basket","clear_cart")],[IB("⬅️ Back","basket")])); return
+    if len(vids)>1: await safe_edit(q,"⚠️ <b>Mixed vendors in basket</b>\n\nYou can only checkout one vendor at a time.",parse_mode="HTML",reply_markup=KM([IB("🗑️ Clear Basket","clear_cart")],[IB("⬅️ Back","basket")])); return
     vid=vids[0]; ctx.user_data.update({"co_name":None,"co_addr":None,"co_ship":None,"co_disc_code":None,"co_disc_pct":0,"co_sub":round(sum(r["price"] for r in items),2),"co_vid":vid,"wf":None})
     t,_=co_summary(ctx.user_data,uid); await safe_edit(q,t,parse_mode="HTML",reply_markup=co_kb(ctx.user_data))
 async def co_name_start(u,ctx):
@@ -231,16 +255,21 @@ async def co_confirm(u,ctx):
     if sk=="tracked24" and not addr: await q.answer("⚠️ Enter delivery address.",show_alert=True); return
     vid=ud.get("co_vid",1); vendor=q1("SELECT * FROM vendors WHERE id=?",(vid,))
     if not vendor: await safe_edit(q,"❌ Vendor error.",reply_markup=menu()); return
-    items=qa("SELECT products.name,cart.qty,cart.price FROM cart JOIN products ON cart.product_id=products.id WHERE cart.user_id=? AND cart.vendor_id=?",(uid,vid))
+    items=qa("SELECT products.name,cart.qty,cart.price,cart.product_id FROM cart JOIN products ON cart.product_id=products.id WHERE cart.user_id=? AND cart.vendor_id=?",(uid,vid))
     if not items: await safe_edit(q,"🧺 Basket empty.",reply_markup=menu()); return
     item_lines="\n".join(f"  • {hl.escape(r['name'])} {fq(r['qty'])} — £{r['price']:.2f}" for r in items)
     summary=", ".join(f"{r['name']} {fq(r['qty'])}" for r in items); sub=round(sum(r["price"] for r in items),2)
     dp=ud.get("co_disc_pct",0); sp=SHIP[sk]["price"]; sl=SHIP[sk]["label"]; needs_ltc=SHIP[sk]["ltc"]
     disc=round(sub*dp,2); gbp=round(sub-disc+sp,2)
     com=vendor.get("commission_pct",10)/100; platform_gbp=round(gbp*com,2); vendor_gbp=round(gbp-platform_gbp,2)
-    ltc=round(gbp/ltc_price(),6) if needs_ltc else 0.0; oid=str(uuid4())[:8].upper(); addr_disp=addr or "Local Drop"
-    qx("INSERT INTO orders(id,user_id,vendor_id,cust_name,address,summary,gbp,vendor_gbp,platform_gbp,ltc,status,ship) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(oid,uid,vid,name,addr_disp,summary,gbp,vendor_gbp,platform_gbp,ltc,"Pending",sk))
+    ltc_rate=ltc_price(); ltc=round(gbp/ltc_rate,6) if needs_ltc else 0.0
+    ltc_addr=vendor.get("ltc_addr",""); oid=str(uuid4())[:8].upper(); addr_disp=addr or "Local Drop"
+    qx("INSERT INTO orders(id,user_id,vendor_id,cust_name,address,summary,gbp,vendor_gbp,platform_gbp,ltc,ltc_addr,status,ship) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(oid,uid,vid,name,addr_disp,summary,gbp,vendor_gbp,platform_gbp,ltc,ltc_addr,"Pending",sk))
     qx("DELETE FROM cart WHERE user_id=? AND vendor_id=?",(uid,vid))
+    # UPGRADE 4: Decrement stock
+    for r in items:
+        p=q1("SELECT stock FROM products WHERE id=?",(r["product_id"],))
+        if p and p.get("stock",-1)>0: qx("UPDATE products SET stock=stock-1 WHERE id=?",(r["product_id"],))
     if sk=="drop": qx("INSERT INTO drop_chats(order_id,user_id,sender,message) VALUES(?,?,?,?)",(oid,uid,"vendor",f"👋 Hi {hl.escape(name)}! Order received. Message to arrange pickup."))
     uname=q.from_user.username or str(uid)
     notif=(f"🛒 <b>NEW ORDER — {oid}</b>\n{vendor['emoji']} {hl.escape(vendor['name'])} via PhiVara\n"
@@ -255,13 +284,19 @@ async def co_confirm(u,ctx):
         except: pass
     sep="━━━━━━━━━━━━━━━━━━━━"
     disc_l=f"🏷️ {ud.get('co_disc_code','')} -£{disc:.2f}\n" if dp else ""; ship_l=f"🚚 +£{sp:.2f}\n" if sp else ""
+    # UPGRADE 2: Full invoice with LTC address and amount prominently displayed
     invoice=(f"🧾 <b>INVOICE — {hl.escape(vendor['name'])}</b>\n<i>via PhiVara Network</i>\n{sep}\n"
              f"📋 <b>Order {oid}</b> · {datetime.now().strftime('%d/%m/%Y %H:%M')}\n{sep}\n"
-             f"👤 {hl.escape(name)} · 🏠 {hl.escape(addr_disp)} · 🚚 {sl}\n{sep}\n"
-             f"<b>Items:</b>\n{item_lines}\n{sep}\n💷 £{sub:.2f}\n{disc_l}{ship_l}💰 <b>TOTAL: £{gbp:.2f}</b>\n{sep}\n")
-    ltc_addr=vendor.get("ltc_addr","")
+             f"👤 {hl.escape(name)}\n🏠 {hl.escape(addr_disp)}\n🚚 {sl}\n{sep}\n"
+             f"<b>Items:</b>\n{item_lines}\n{sep}\n"
+             f"💷 Subtotal: £{sub:.2f}\n{disc_l}{ship_l}"
+             f"💰 <b>TOTAL: £{gbp:.2f}</b>\n{sep}\n")
     if needs_ltc:
-        invoice+=f"\n📤 Send <b>{ltc} LTC</b> to:\n<code>{ltc_addr}</code>\n\n⚠️ <i>Exact amount only. Tap I Have Paid once sent.</i>"
+        invoice+=(f"\n💎 <b>PAYMENT DETAILS</b>\n{sep}\n"
+                  f"💠 Amount: <b>{ltc} LTC</b>\n"
+                  f"📊 Rate: £{ltc_rate:.2f}/LTC\n\n"
+                  f"📤 Send to:\n<code>{ltc_addr}</code>\n\n"
+                  f"⚠️ <i>Send EXACT amount. Tap below once sent.</i>")
         kb=KM([IB("✅ I Have Paid",f"paid_{oid}")],[IB("📦 My Orders","orders")])
     else:
         invoice+="\n📍 Tap below to arrange pickup with the vendor.\n⚠️ <i>Local customers only.</i>"
@@ -282,20 +317,53 @@ async def view_orders(u,ctx):
         v=q1("SELECT name,emoji FROM vendors WHERE id=?",(o["vendor_id"],)); vtxt=f" · {v['emoji']} {v['name']}" if v else ""
         txt+=f"{icon} <b>Order {o['id']}</b> · {lbl}{vtxt} · {dp} · 💷 £{o['gbp']:.2f}\n{hl.escape(o['summary'])}\n\n"
         if o["ship"]=="drop" and o["status"] in ("Pending","Paid","Dispatched"): kb.append([IB(("🔒 Closed" if gs("cc_"+o["id"],"0")=="1" else "💬 Drop Chat")+" — "+o["id"],"dcv_"+o["id"])])
+        # UPGRADE 6: Quick reorder button
+        if o["status"] in ("Paid","Dispatched"): kb.append([IB(f"🔁 Reorder {o['id']}",f"reorder_{o['id']}")])
     await safe_edit(q,txt[:4000],parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb+[[IB("⬅️ Back","menu")]]))
 
+# UPGRADE 6: Quick Reorder
+async def reorder(u,ctx):
+    q=u.callback_query; uid=q.from_user.id; oid=q.data[8:]
+    row=q1("SELECT vendor_id,summary FROM orders WHERE id=? AND user_id=?",(oid,uid))
+    if not row: await q.answer("❌ Not found.",show_alert=True); return
+    vid=row["vendor_id"]
+    # get products from original summary by looking for matching product names
+    prods=qa("SELECT id,name,tiers FROM products WHERE vendor_id=? AND hidden=0",(vid,))
+    added=0
+    for p in prods:
+        if p["name"] in row["summary"]:
+            tiers=json.loads(p["tiers"]) if p.get("tiers") else TIERS[:]
+            if tiers: qx("INSERT INTO cart(user_id,product_id,vendor_id,qty,price) VALUES(?,?,?,?,?)",(uid,p["id"],vid,tiers[0]["qty"],tiers[0]["price"])); added+=1
+    if added: await q.answer(f"✅ {added} item(s) added to basket!",show_alert=True)
+    else: await q.answer("⚠️ Products no longer available.",show_alert=True)
+    await view_orders(u,ctx)
+
 async def user_paid(u,ctx):
-    q=u.callback_query; oid=q.data[5:]; row=q1("SELECT ship,cust_name,summary,gbp,ltc,vendor_id FROM orders WHERE id=?",(oid,))
+    q=u.callback_query; oid=q.data[5:]; row=q1("SELECT ship,cust_name,summary,gbp,ltc,ltc_addr,vendor_id FROM orders WHERE id=?",(oid,))
     if not row: await safe_edit(q,"❌ Not found.",reply_markup=back_kb()); return
     sl=SHIP.get(row["ship"],{}).get("label",row["ship"]); vendor=q1("SELECT admin_user_id FROM vendors WHERE id=?",(row["vendor_id"],))
-    notif=f"💰 <b>PAYMENT CLAIM — {oid}</b>\n👤 {hl.escape(row['cust_name'])} · {row['summary']}\n💷 £{row['gbp']:.2f} | {row['ltc']} LTC"
+    notif=(f"💰 <b>PAYMENT CLAIM — {oid}</b>\n"
+           f"👤 {hl.escape(row['cust_name'])} · {row['summary']}\n"
+           f"💷 £{row['gbp']:.2f} | 💠 {row['ltc']} LTC\n"
+           f"📤 To: <code>{row.get('ltc_addr','')}</code>")
     adm_kb=InlineKeyboardMarkup([[IB("✅ Confirm",f"adm_ok_{oid}"),IB("❌ Reject",f"adm_no_{oid}")]])
     notify_ids=[ADMIN_ID]
     if vendor and vendor.get("admin_user_id") and vendor["admin_user_id"]!=ADMIN_ID: notify_ids.append(vendor["admin_user_id"])
     for rid in notify_ids:
         try: await ctx.bot.send_message(rid,notif,parse_mode="HTML",reply_markup=adm_kb)
         except: pass
-    await safe_edit(q,f"⏳ <b>Payment Submitted</b>\n━━━━━━━━━━━━━━━━━━━━\n📋 Order <code>{oid}</code>\n🛍️ {hl.escape(row['summary'])}\n🚚 {sl} · 💷 £{row['gbp']:.2f}\n━━━━━━━━━━━━━━━━━━━━\n✅ Awaiting confirmation.",parse_mode="HTML",reply_markup=KM([IB("📦 My Orders","orders")]))
+    await safe_edit(q,
+        f"⏳ <b>Payment Submitted</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 Order <code>{oid}</code>\n"
+        f"🛍️ {hl.escape(row['summary'])}\n"
+        f"🚚 {sl} · 💷 £{row['gbp']:.2f}\n"
+        f"💠 {row['ltc']} LTC\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n✅ Awaiting confirmation.",
+        parse_mode="HTML",reply_markup=KM([IB("📦 My Orders","orders")]))
+
+# UPGRADE 5: Search handler
+async def search_prompt(u,ctx):
+    q=u.callback_query; ctx.user_data["wf"]="search"; await safe_edit(q,"🔍 Enter search term:",reply_markup=cancel_kb())
 
 async def show_reviews(u,ctx):
     q=u.callback_query; page=int(q.data.split("_")[1])
@@ -331,7 +399,19 @@ async def show_my_ref(u,ctx):
     q=u.callback_query; uid=q.from_user.id; rc=get_ref(uid)
     cnt=(q1("SELECT count FROM referrals WHERE owner_id=?",(uid,)) or {}).get("count",0); nxt=15-(cnt%15) if cnt%15 else 15
     bn=(await ctx.bot.get_me()).username
-    await safe_edit(q,f"🔗 <b>Your Referral Link</b>\n━━━━━━━━━━━━━━━━━━━━\n\n<code>https://t.me/{bn}?start={rc}</code>\n\n👥 <b>{cnt}</b> joined · <b>{nxt} more</b> = FREE reward 🎁",parse_mode="HTML",reply_markup=back_kb())
+    await safe_edit(q,f"🔗 <b>Your Referral Link</b>\n━━━━━━━━━━━━━━━━━━━━\n\n<code>https://t.me/{bn}?start={rc}</code>\n\n👥 <b>{cnt}</b> joined · <b>{nxt} more</b> = FREE reward 🎁\n\n<i>Tap leaderboard to see top referrers!</i>",parse_mode="HTML",reply_markup=KM([IB("🏆 Leaderboard","ref_leaderboard")],[IB("⬅️ Back","menu")]))
+
+# UPGRADE 11: Referral Leaderboard
+async def ref_leaderboard(u,ctx):
+    q=u.callback_query; rows=qa("SELECT owner_id,count FROM referrals ORDER BY count DESC LIMIT 10")
+    if not rows: await safe_edit(q,"No referrals yet.",reply_markup=back_kb()); return
+    medals=["🥇","🥈","🥉"]+["🏅"]*7
+    txt="🏆 <b>Referral Leaderboard</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    for i,r in enumerate(rows):
+        u2=q1("SELECT username FROM users WHERE user_id=?",(r["owner_id"],)); un=u2["username"] if u2 and u2.get("username") else str(r["owner_id"])
+        txt+=f"{medals[i]} @{hl.escape(un)} · {r['count']} refs\n"
+    await safe_edit(q,txt,parse_mode="HTML",reply_markup=back_kb())
+
 async def contact_start(u,ctx):
     q=u.callback_query; vs=qa("SELECT id,name,emoji FROM vendors WHERE active=1 ORDER BY id")
     if len(vs)==1: ctx.user_data.update({"wf":"contact","contact_vid":vs[0]["id"]}); await safe_edit(q,"💬 Type your message:",reply_markup=cancel_kb()); return
@@ -371,28 +451,61 @@ async def dropchat_close(u,ctx):
 async def dropchat_open(u,ctx):
     q=u.callback_query; oid=q.data[4:]; ss("cc_"+oid,"0"); await safe_edit(q,f"🔓 Chat {oid} reopened.\n\n{fmt_chat(oid)}",parse_mode="HTML",reply_markup=dc_user_kb(oid,False))
 
+# ── ADMIN PANEL ────────────────────────────────────────────────────────────────
 async def cmd_admin(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     uid=u.effective_user.id
     if is_vendor_admin(uid):
         v=get_vendor(uid); ctx.user_data["cur_vid"]=v["id"]; await _vendor_panel(u.message,v); return
     if not is_admin(uid): return
+    await _platform_panel(u.message)
+
+async def _platform_panel(msg):
+    # UPGRADE 1: Expanded admin panel
     orders=qa("SELECT id,status,ship FROM orders ORDER BY rowid DESC LIMIT 30")
     unread=q1("SELECT COUNT(*) as c FROM messages WHERE reply IS NULL")["c"]; drops=len([o for o in orders if o["ship"]=="drop" and o["status"] in ("Pending","Paid")])
-    kb=[[IB(f"✅ {o['id']}",f"adm_ok_{o['id']}"),IB(f"❌ {o['id']}",f"adm_no_{o['id']}")] for o in orders if o["status"]=="Pending"]+[[IB(f"🚚 {o['id']}",f"adm_go_{o['id']}")] for o in orders if o["status"]=="Paid" and o["ship"]!="drop"]
-    kb+=[[IB("🏪 Vendors","adm_vendors"),IB("➕ Add Vendor","adm_addvendor")],
-         [IB(f"💬 Msgs{f' ({unread})' if unread else ''}","adm_msgs"),IB(f"📍 Drops{f' ({drops})' if drops else ''}","adm_drops")],
-         [IB("📊 Reviews","adm_rev_0"),IB("📢 Announce","adm_announce")],
-         [IB("👥 Admins","adm_admins"),IB("🏠 Edit Home","adm_edit_home")]]
-    await u.message.reply_text("🔷 <b>PhiVara Network — Platform Admin</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+    pending=[o for o in orders if o["status"]=="Pending"]; paid_tracked=[o for o in orders if o["status"]=="Paid" and o["ship"]!="drop"]
+    kb=[]
+    if pending: kb+=[[IB(f"✅ {o['id']}",f"adm_ok_{o['id']}"),IB(f"❌ {o['id']}",f"adm_no_{o['id']}")] for o in pending]
+    if paid_tracked: kb+=[[IB(f"🚚 {o['id']}",f"adm_go_{o['id']}")] for o in paid_tracked]
+    kb+=[
+        [IB("➕ Add Product","adm_addprod_go"),IB("🗑️ Remove Prod","adm_rmprod"),IB("✏️ Edit Desc","adm_editdesc")],
+        [IB("⚖️ Tiers","adm_tiers"),IB("👁️ Hide/Show","adm_hideprod"),IB("📂 Categories","adm_cats")],
+        [IB("⭐ Feature Prod","adm_feature"),IB("📦 Stock","adm_stock"),IB("🏷️ Discounts","adm_discounts")],
+        [IB("🏪 Vendors","adm_vendors"),IB("➕ Add Vendor","adm_addvendor"),IB("📊 Stats","adm_stats")],
+        [IB(f"💬 Msgs{(' ('+str(unread)+')') if unread else ''}","adm_msgs"),IB(f"📍 Drops{(' ('+str(drops)+')') if drops else ''}","adm_drops"),IB("📊 Reviews","adm_rev_0")],
+        [IB("👥 Admins","adm_admins"),IB("🏠 Edit Home","adm_edit_home"),IB("📢 Announce","adm_announce")],
+        [IB("🚫 Ban/Unban","adm_bans"),IB("📝 Cust Notes","adm_custnotes"),IB("🏆 Leaderboard","ref_leaderboard")],
+    ]
+    await msg.reply_text("🔷 <b>PhiVara Network — Platform Admin</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
 
 async def _vendor_panel(msg,v):
     vid=v["id"]; orders=qa("SELECT id,status,ship FROM orders WHERE vendor_id=? ORDER BY rowid DESC LIMIT 30",(vid,))
     unread=q1("SELECT COUNT(*) as c FROM messages WHERE reply IS NULL AND vendor_id=?",(vid,))["c"]; drops=len([o for o in orders if o["ship"]=="drop" and o["status"] in ("Pending","Paid")])
-    kb=[[IB(f"✅ {o['id']}",f"adm_ok_{o['id']}"),IB(f"❌ {o['id']}",f"adm_no_{o['id']}")] for o in orders if o["status"]=="Pending"]+[[IB(f"🚚 {o['id']}",f"adm_go_{o['id']}")] for o in orders if o["status"]=="Paid" and o["ship"]!="drop"]
-    kb+=[[IB("➕ Add Product","adm_addprod"),IB("🗑️ Remove","adm_rmprod"),IB("✏️ Edit Desc","adm_editdesc"),IB("⚖️ Tiers","adm_tiers")],
-         [IB("👁️ Hide/Show","adm_hideprod"),IB("📂 Categories","adm_cats"),IB("🏷️ Discounts","adm_discounts"),IB("📢 Announce","adm_announce")],
-         [IB(f"💬 Msgs{f' ({unread})' if unread else ''}","adm_msgs"),IB(f"📍 Drops{f' ({drops})' if drops else ''}","adm_drops"),IB("📊 Reviews","adm_rev_0")]]
+    pending=[o for o in orders if o["status"]=="Pending"]; paid_tracked=[o for o in orders if o["status"]=="Paid" and o["ship"]!="drop"]
+    kb=[]
+    if pending: kb+=[[IB(f"✅ {o['id']}",f"adm_ok_{o['id']}"),IB(f"❌ {o['id']}",f"adm_no_{o['id']}")] for o in pending]
+    if paid_tracked: kb+=[[IB(f"🚚 {o['id']}",f"adm_go_{o['id']}")] for o in paid_tracked]
+    kb+=[
+        [IB("➕ Add Product","adm_addprod_go"),IB("🗑️ Remove","adm_rmprod"),IB("✏️ Edit Desc","adm_editdesc"),IB("⚖️ Tiers","adm_tiers")],
+        [IB("👁️ Hide/Show","adm_hideprod"),IB("📂 Categories","adm_cats"),IB("⭐ Feature","adm_feature"),IB("📦 Stock","adm_stock")],
+        [IB("🏷️ Discounts","adm_discounts"),IB("📢 Announce","adm_announce"),IB("📊 Stats","adm_stats")],
+        [IB(f"💬 Msgs{(' ('+str(unread)+')') if unread else ''}","adm_msgs"),IB(f"📍 Drops{(' ('+str(drops)+')') if drops else ''}","adm_drops"),IB("📊 Reviews","adm_rev_0")],
+    ]
     await msg.reply_text(f"{v['emoji']} <b>{hl.escape(v['name'])} — Vendor Panel</b>\nPhiVara Network",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+
+# UPGRADE 3: Analytics
+async def adm_stats(u,ctx):
+    q=u.callback_query; uid=q.from_user.id
+    vid=get_vid(ctx,uid) if is_vendor_admin(uid) else None
+    tot,td,pending,top,avg=get_stats(vid)
+    top_txt="\n".join(f"  • {hl.escape(t['summary'][:40])} ({t['c']}x)" for t in top) or "  None yet"
+    txt=(f"📊 <b>{'Vendor ' if vid else 'Platform '}Analytics</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+         f"📦 Total Orders: <b>{tot['c']}</b> · 💷 £{tot['s']:.2f}\n"
+         f"☀️ Today: <b>{td['c']}</b> orders · 💷 £{td['s']:.2f}\n"
+         f"⏳ Pending: <b>{pending['c']}</b>\n"
+         f"📈 Avg Order: <b>£{avg['a']:.2f}</b>\n\n"
+         f"🔥 <b>Top Items:</b>\n{top_txt}")
+    await safe_edit(q,txt,parse_mode="HTML",reply_markup=back_kb())
 
 async def adm_vendors(u,ctx):
     q=u.callback_query
@@ -405,7 +518,7 @@ async def adm_addvendor_start(u,ctx):
     q=u.callback_query
     if not is_admin(u.effective_user.id): return
     ctx.user_data["wf"]="add_vendor"
-    await safe_edit(q,"🏪 <b>Add New Vendor</b>\n\nSend details as:\n<code>Name|🌿|Description|ltc_address|commission_%|admin_user_id</code>\n\nExample:\n<code>Green Gardens|🌱|Top quality outdoor|ltc1q...|15|987654321</code>",parse_mode="HTML",reply_markup=cancel_kb())
+    await safe_edit(q,"🏪 <b>Add New Vendor</b>\n\nSend details as:\n<code>Name|🌿|Description|ltc_address|commission_%|admin_user_id</code>",parse_mode="HTML",reply_markup=cancel_kb())
 async def adm_togglevend(u,ctx):
     q=u.callback_query
     if not is_admin(u.effective_user.id): return
@@ -417,7 +530,7 @@ async def adm_confirm(u,ctx):
     q=u.callback_query; oid=q.data[7:]; qx("UPDATE orders SET status='Paid' WHERE id=?",(oid,))
     r=q1("SELECT user_id,ship,gbp FROM orders WHERE id=?",(oid,))
     if r:
-        pts,cr=add_points(r["user_id"],r.get("gbp",0)); lnote=f"\n🎁 +{pts} pts!{f' 💳 £{cr:.0f} credit!' if cr else ''}"
+        pts,cr=add_points(r["user_id"],r.get("gbp",0)); lnote=f"\n🎁 +{pts} pts!{(' 💳 £'+str(int(cr))+' credit!') if cr else ''}"
         try:
             if r["ship"]=="drop": await ctx.bot.send_message(r["user_id"],f"✅ <b>Order {oid} confirmed!</b> Open Drop Chat to arrange.{lnote}",parse_mode="HTML",reply_markup=KM([IB("💬 Drop Chat",f"dcv_{oid}")]))
             else: await ctx.bot.send_message(r["user_id"],f"✅ Payment confirmed — <code>{oid}</code>! 🌟{lnote}",parse_mode="HTML",reply_markup=KM([IB("⭐ Leave Review",f"review_{oid}")]))
@@ -492,15 +605,15 @@ async def adm_discounts(u,ctx):
     q=u.callback_query; uid=q.from_user.id
     if not is_admin(uid) and not is_vendor_admin(uid): return
     vid=get_vid(ctx,uid); rows=qa("SELECT code,pct,active,expires FROM discount_codes WHERE vendor_id=? ORDER BY code",(vid,))
-    txt="🏷️ <b>Discount Codes</b>\n\n"+"".join(("✅" if r['active'] else "❌")+" <code>"+r['code']+"</code> "+str(int(r['pct']*100))+"%"+(" · exp "+r['expires'][:10] if r.get('expires') else "")+"\n" for r in rows)
-    kb=[[IB(f"{'🚫' if r['active'] else '✅'} {r['code']}",f"toggledisc_{r['code']}")] for r in rows]+[[IB("➕ Add Code","adm_adddisc")],[IB("⬅️ Back","menu")]]
+    txt="🏷️ <b>Discount Codes</b>\n\n"+"".join(("✅ " if r['active'] else "❌ ")+"<code>"+r['code']+"</code> "+str(int(r['pct']*100))+"%"+(" · exp "+r['expires'][:10] if r.get('expires') else "")+"\n" for r in rows)
+    kb=[[IB(("🚫 " if r['active'] else "✅ ")+r['code'],f"toggledisc_{r['code']}")] for r in rows]+[[IB("➕ Add Code","adm_adddisc")],[IB("⬅️ Back","menu")]]
     await safe_edit(q,txt or "No codes yet.",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
 async def adm_toggledisc(u,ctx):
     q=u.callback_query; c=q.data.split("toggledisc_")[1]; r=q1("SELECT active FROM discount_codes WHERE code=?",(c,))
     if r: qx("UPDATE discount_codes SET active=? WHERE code=?",(0 if r["active"] else 1,c))
     await adm_discounts(u,ctx)
 async def adm_adddisc_start(u,ctx):
-    q=u.callback_query; ctx.user_data["wf"]="disc_code"; await safe_edit(q,"🏷️ Add code:\n<code>CODE,PCT</code> or <code>CODE,PCT,HOURS</code>\ne.g. <code>SAVE20,20</code> or <code>FLASH50,50,4</code>",parse_mode="HTML",reply_markup=cancel_kb())
+    q=u.callback_query; ctx.user_data["wf"]="disc_code"; await safe_edit(q,"🏷️ Add code:\n<code>CODE,PCT</code> or <code>CODE,PCT,HOURS</code>\ne.g. <code>SAVE20,20</code>",parse_mode="HTML",reply_markup=cancel_kb())
 async def ann_start(u,ctx):
     q=u.callback_query; ctx.user_data.update({"wf":"ann_title"}); ctx.user_data.pop("ann_photo",""); await safe_edit(q,"📢 Enter announcement title:",reply_markup=cancel_kb())
 async def adm_cats(u,ctx):
@@ -560,6 +673,53 @@ async def adm_show_tiers(u,ctx):
     r=q1("SELECT name,tiers FROM products WHERE id=?",(pid,)); tiers=json.loads(r["tiers"]) if r.get("tiers") else TIERS[:]
     await q.message.reply_text(f"⚖️ <b>{hl.escape(r['name'])}</b>\n\n"+"".join(ft(t)+"\n" for t in tiers)+"\nSend new tiers (qty,price per line) or /cancel",parse_mode="HTML")
 
+# UPGRADE 12: Feature/Unfeature products
+async def adm_feature_list(u,ctx):
+    q=u.callback_query; uid=q.from_user.id; vid=get_vid(ctx,uid)
+    rows=qa("SELECT id,name,featured FROM products WHERE vendor_id=? ORDER BY id",(vid,))
+    if not rows: await safe_edit(q,"No products.",reply_markup=back_kb()); return
+    await safe_edit(q,"⭐ <b>Feature Products</b>\n\nFeatured products appear at the top.",parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[IB(("⭐ Unfeature " if r["featured"] else "☆ Feature ")+r["name"],f"togglefeat_{r['id']}")] for r in rows]+[[IB("⬅️ Back","menu")]]))
+async def adm_togglefeat(u,ctx):
+    q=u.callback_query; pid=int(q.data.split("_")[1]); row=q1("SELECT featured FROM products WHERE id=?",(pid,))
+    if row: qx("UPDATE products SET featured=? WHERE id=?",(0 if row["featured"] else 1,pid))
+    await adm_feature_list(u,ctx)
+
+# UPGRADE 4: Stock management
+async def adm_stock_list(u,ctx):
+    q=u.callback_query; uid=q.from_user.id; vid=get_vid(ctx,uid)
+    rows=qa("SELECT id,name,stock FROM products WHERE vendor_id=? ORDER BY id",(vid,))
+    if not rows: await safe_edit(q,"No products.",reply_markup=back_kb()); return
+    txt="📦 <b>Stock Levels</b>\n\n"+"".join(f"• {r['name']}: {'∞' if r['stock']==-1 else r['stock']}\n" for r in rows)
+    await safe_edit(q,txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[IB(f"📦 {r['name']}",f"setstock_{r['id']}")] for r in rows]+[[IB("⬅️ Back","menu")]]))
+async def adm_setstock_start(u,ctx):
+    q=u.callback_query; pid=int(q.data.split("_")[1]); r=q1("SELECT name,stock FROM products WHERE id=?",(pid,))
+    ctx.user_data.update({"stock_pid":pid,"wf":"set_stock"})
+    await safe_edit(q,f"📦 <b>{hl.escape(r['name'])}</b>\nCurrent: {'∞ unlimited' if r['stock']==-1 else r['stock']}\n\nEnter new stock (number, or -1 for unlimited):",parse_mode="HTML",reply_markup=cancel_kb())
+
+# UPGRADE 13: Customer Blacklist
+async def adm_bans(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    rows=qa("SELECT user_id,username FROM users WHERE banned=1 ORDER BY user_id")
+    txt="🚫 <b>Banned Users</b>\n\n"+("".join(f"• <code>{r['user_id']}</code> @{r['username'] or '?'}\n" for r in rows) if rows else "None.")
+    kb=[[IB("🚫 Ban User","adm_ban_start")]]+[[IB(f"✅ Unban {r['username'] or r['user_id']}",f"unban_{r['user_id']}")] for r in rows]+[[IB("⬅️ Back","menu")]]
+    await safe_edit(q,txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+async def adm_ban_start(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    ctx.user_data["wf"]="ban_user"; await safe_edit(q,"🚫 Enter user_id to ban:",reply_markup=cancel_kb())
+async def adm_unban(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    uid=int(q.data.split("_")[1]); qx("UPDATE users SET banned=0 WHERE user_id=?",(uid,)); await q.answer("✅ Unbanned",show_alert=True); await adm_bans(u,ctx)
+
+# UPGRADE 7: Customer notes (admin)
+async def adm_custnotes(u,ctx):
+    q=u.callback_query
+    if not is_admin(u.effective_user.id): return
+    ctx.user_data["wf"]="custnote_uid"; await safe_edit(q,"📝 Enter user_id to add/view note:",reply_markup=cancel_kb())
+
 async def cmd_reply(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if not is_admin(u.effective_user.id) and not is_vendor_admin(u.effective_user.id): return
     if not ctx.args or len(ctx.args)<2: await u.message.reply_text("Usage: /reply <id> <text>"); return
@@ -578,20 +738,33 @@ async def cmd_order(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     sl=SHIP.get(row["ship"],{}).get("label",row["ship"]); em={"Pending":"⏳","Paid":"✅","Dispatched":"🚚","Rejected":"❌"}
     note=q1("SELECT note FROM order_notes WHERE order_id=?",(oid,)); v=q1("SELECT name,emoji FROM vendors WHERE id=?",(row["vendor_id"],))
     txt=(f"🔖 <b>{oid}</b> {em.get(row['status'],'')}\n{v['emoji']} {v['name']} via PhiVara\n" if v else f"🔖 <b>{oid}</b>\n")
-    txt+=f"👤 {hl.escape(row['cust_name'])} · 🏠 {hl.escape(row['address'])}\n🚚 {sl} · 💷 £{row['gbp']:.2f}\n📦 {hl.escape(row['summary'])}\n💰 Vendor: £{row.get('vendor_gbp',0):.2f} · Platform: £{row.get('platform_gbp',0):.2f}"
+    txt+=f"👤 {hl.escape(row['cust_name'])} · 🏠 {hl.escape(row['address'])}\n🚚 {sl} · 💷 £{row['gbp']:.2f}\n💠 {row.get('ltc',0)} LTC\n📤 <code>{row.get('ltc_addr','')}</code>\n📦 {hl.escape(row['summary'])}\n💰 Vendor: £{row.get('vendor_gbp',0):.2f} · Platform: £{row.get('platform_gbp',0):.2f}"
     if note: txt+=f"\n📝 {hl.escape(note['note'])}"
     kb=([[IB("✅ Confirm",f"adm_ok_{oid}"),IB("❌ Reject",f"adm_no_{oid}")]] if row["status"]=="Pending" else [])+([[IB("🚚 Dispatch",f"adm_go_{oid}")]] if row["status"]=="Paid" and row["ship"]!="drop" else [])+([[IB("💬 Chat",f"dch_{oid}")]] if row["ship"]=="drop" else [])+[[IB("📝 Note",f"adm_note_{oid}")]]
     await u.message.reply_text(txt,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+
+# UPGRADE 5: /search command
+async def cmd_search(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    if not ctx.args: await u.message.reply_text("Usage: /search <term>"); return
+    term="%"+" ".join(ctx.args)+"%"; rows=qa("SELECT id,name,vendor_id FROM products WHERE name LIKE ? AND hidden=0 ORDER BY name",(term,))
+    if not rows: await u.message.reply_text("🔍 No products found."); return
+    kb=[[IB(f"🌿 {r['name']}",f"prod_{r['id']}")] for r in rows]+[[IB("⬅️ Menu","menu")]]
+    await u.message.reply_text(f"🔍 <b>Results for '{hl.escape(ctx.args[0])}'</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+
 async def cmd_customer(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if not is_admin(u.effective_user.id): return
     if not ctx.args: await u.message.reply_text("Usage: /customer @username or user_id"); return
     arg=ctx.args[0].lstrip("@")
-    try: cid=int(arg); row=q1("SELECT user_id,username FROM users WHERE user_id=?",(cid,))
-    except: row=q1("SELECT user_id,username FROM users WHERE username=?",(arg,))
+    try: cid=int(arg); row=q1("SELECT user_id,username,banned FROM users WHERE user_id=?",(cid,))
+    except: row=q1("SELECT user_id,username,banned FROM users WHERE username=?",(arg,))
     if not row: await u.message.reply_text("❌ Not found."); return
     cid=row["user_id"]; orders=qa("SELECT id,gbp,status,summary FROM orders WHERE user_id=? ORDER BY rowid DESC LIMIT 10",(cid,))
     spent=sum(o["gbp"] for o in orders if o["status"] in ("Paid","Dispatched")); lo=get_loyalty(cid)
-    await u.message.reply_text((f"👤 @{hl.escape(row['username'] or str(cid))} (<code>{cid}</code>)\n━━━━━━━━━━━━━━━━━━━━\n💷 £{spent:.2f} · {len(orders)} orders · ⭐ {lo['points']} pts · 💳 £{lo['credit']:.2f}\n\n"+"".join(f"• {o['id']} — {o['status']} — £{o['gbp']:.2f} — {hl.escape(o['summary'][:40])}\n" for o in orders))[:4000],parse_mode="HTML")
+    note=q1("SELECT note FROM customer_notes WHERE user_id=?",(cid,)); banned="🚫 BANNED\n" if row.get("banned") else ""
+    txt=(f"{banned}👤 @{hl.escape(row['username'] or str(cid))} (<code>{cid}</code>)\n━━━━━━━━━━━━━━━━━━━━\n💷 £{spent:.2f} · {len(orders)} orders · ⭐ {lo['points']} pts · 💳 £{lo['credit']:.2f}\n")
+    if note: txt+=f"📝 {hl.escape(note['note'])}\n"
+    txt+="\n"+"".join(f"• {o['id']} — {o['status']} — £{o['gbp']:.2f} — {hl.escape(o['summary'][:40])}\n" for o in orders)
+    await u.message.reply_text(txt[:4000],parse_mode="HTML")
 async def cmd_myorder(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     uid=u.effective_user.id
     if not is_known(uid) and not is_admin(uid): await u.message.reply_text("Please /start first."); return
@@ -599,15 +772,31 @@ async def cmd_myorder(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     oid=ctx.args[0]; row=q1("SELECT * FROM orders WHERE id=? AND user_id=?",(oid,uid))
     if not row: await u.message.reply_text("❌ Not found."); return
     sl=SHIP.get(row["ship"],{}).get("label",row["ship"]); em={"Pending":"🕐","Paid":"✅","Dispatched":"🚚","Rejected":"❌"}
-    await u.message.reply_text(f"🧾 <b>Order {oid}</b>\n━━━━━━━━━━━━━━━━━━━━\n{em.get(row['status'],'')} {row['status']}\n👤 {hl.escape(row['cust_name'])} · 🏠 {hl.escape(row['address'])}\n🚚 {sl} · 💷 £{row['gbp']:.2f}\n{hl.escape(row['summary'])}",parse_mode="HTML")
+    ltc_info=f"\n💠 {row['ltc']} LTC\n📤 <code>{row.get('ltc_addr','')}</code>" if row.get("ltc",0)>0 else ""
+    await u.message.reply_text(f"🧾 <b>Order {oid}</b>\n━━━━━━━━━━━━━━━━━━━━\n{em.get(row['status'],'')} {row['status']}\n👤 {hl.escape(row['cust_name'])} · 🏠 {hl.escape(row['address'])}\n🚚 {sl} · 💷 £{row['gbp']:.2f}{ltc_info}\n{hl.escape(row['summary'])}",parse_mode="HTML")
 async def cmd_addproduct(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if not is_admin(u.effective_user.id) and not is_vendor_admin(u.effective_user.id): return
-    ctx.user_data["wf"]="add_photo"; await u.message.reply_text("📸 Send product photo:")
+    ctx.user_data["wf"]="add_photo"; await u.message.reply_text("📸 Send product photo (or type 'skip' for no photo):")
 async def cmd_cancel(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear(); await u.message.reply_text("🚫 Cancelled.",reply_markup=menu())
 
+# UPGRADE 8: /stats command
+async def cmd_stats(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    if not is_admin(u.effective_user.id) and not is_vendor_admin(u.effective_user.id): return
+    uid=u.effective_user.id; vid=get_vid(ctx,uid) if is_vendor_admin(uid) else None
+    tot,td,pending,top,avg=get_stats(vid)
+    top_txt="\n".join(f"  • {hl.escape(t['summary'][:40])} ({t['c']}x)" for t in top) or "  None yet"
+    await u.message.reply_text(
+        f"📊 <b>Sales Stats</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📦 Total Orders: <b>{tot['c']}</b> · 💷 £{tot['s']:.2f}\n"
+        f"☀️ Today: <b>{td['c']}</b> · 💷 £{td['s']:.2f}\n"
+        f"⏳ Pending: <b>{pending['c']}</b>\n"
+        f"📈 Avg Order: <b>£{avg['a']:.2f}</b>\n\n"
+        f"🔥 <b>Top Items:</b>\n{top_txt}",parse_mode="HTML")
+
 async def on_message(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     uid=u.effective_user.id; txt=(u.message.text or "").strip()
+    if is_banned(uid): await u.message.reply_text("🚫 You are banned."); return
     if not is_known(uid) and not is_admin(uid) and not is_vendor_admin(uid): await u.message.reply_text("👋 Please /start first."); return
     wf=ctx.user_data.get("wf")
     if wf=="co_name":
@@ -619,6 +808,11 @@ async def on_message(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
         if pct: ctx.user_data.update({"co_disc_code":txt.upper(),"co_disc_pct":pct,"wf":None}); await u.message.reply_text(f"✅ Code applied — {int(pct*100)}% off!")
         else: ctx.user_data.update({"co_disc_code":None,"co_disc_pct":0,"wf":None}); await u.message.reply_text("❌ Invalid or expired code.")
         t,_=co_summary(ctx.user_data,uid); await u.message.reply_text(t,parse_mode="HTML",reply_markup=co_kb(ctx.user_data))
+    elif wf=="search":
+        term="%"+txt+"%"; rows=qa("SELECT id,name FROM products WHERE name LIKE ? AND hidden=0 ORDER BY name",(term,))
+        ctx.user_data["wf"]=None
+        if not rows: await u.message.reply_text("🔍 No products found.",reply_markup=menu()); return
+        await u.message.reply_text(f"🔍 <b>Results for '{hl.escape(txt)}'</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[IB(f"🌿 {r['name']}",f"prod_{r['id']}")] for r in rows]+[[IB("⬅️ Back","menu")]]))
     elif wf=="contact":
         uname=u.effective_user.username or str(uid); vid=ctx.user_data.get("contact_vid",1)
         mid=qxi("INSERT INTO messages(user_id,username,vendor_id,message) VALUES(?,?,?,?)",(uid,uname,vid,txt))
@@ -636,7 +830,7 @@ async def on_message(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     elif wf=="ann_body":
         title=ctx.user_data.pop("ann_title",""); photo=ctx.user_data.pop("ann_photo",""); vid=get_vid(ctx,uid)
         qx("INSERT INTO announcements(vendor_id,title,body,photo) VALUES(?,?,?,?)",(vid,title,txt,photo))
-        uids=qa("SELECT user_id FROM users"); sent=0
+        uids=qa("SELECT user_id FROM users WHERE banned=0"); sent=0
         for r in uids:
             try:
                 fn=ctx.bot.send_photo(r["user_id"],photo,caption=f"📢 <b>{hl.escape(title)}</b>\n\n{hl.escape(txt)}",parse_mode="HTML") if photo else ctx.bot.send_message(r["user_id"],f"📢 <b>{hl.escape(title)}</b>\n\n{hl.escape(txt)}",parse_mode="HTML")
@@ -646,11 +840,14 @@ async def on_message(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     elif wf=="review_text":
         oid=ctx.user_data.get("rev_order"); s=ctx.user_data.get("rev_stars",5); qx("INSERT OR REPLACE INTO reviews(order_id,user_id,stars,text) VALUES(?,?,?,?)",(oid,uid,s,txt))
         await u.message.reply_text(f"✅ {STARS.get(s,'')} Thanks! 🙏",reply_markup=menu()); ctx.user_data["wf"]=None
+    elif wf=="add_photo":
+        if txt.lower()=="skip": ctx.user_data.update({"ph":"","wf":"add_title"}); await u.message.reply_text("📝 Enter product title:")
+        else: await u.message.reply_text("📸 Send a photo or type 'skip':")
     elif wf=="add_title":
         ctx.user_data.update({"nm":txt,"wf":"add_desc"}); await u.message.reply_text("📄 Enter product description:")
     elif wf=="add_desc":
         d=ctx.user_data; vid=get_vid(ctx,uid); d["wf"]=None
-        qx("INSERT INTO products(vendor_id,name,description,photo,hidden,tiers) VALUES(?,?,?,?,0,?)",(vid,d["nm"],txt,d.get("ph",""),json.dumps(TIERS)))
+        qx("INSERT INTO products(vendor_id,name,description,photo,hidden,tiers,stock) VALUES(?,?,?,?,0,?,?)",(vid,d["nm"],txt,d.get("ph",""),json.dumps(TIERS),-1))
         await u.message.reply_text(f"✅ <b>{hl.escape(d['nm'])}</b> added!",parse_mode="HTML",reply_markup=menu())
     elif wf=="edit_desc":
         qx("UPDATE products SET description=? WHERE id=?",(txt,ctx.user_data.get("edit_pid"))); await u.message.reply_text("✅ Updated!",reply_markup=menu()); ctx.user_data["wf"]=None
@@ -663,6 +860,28 @@ async def on_message(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
         if errs or not new: await u.message.reply_text("❌ "+("\n".join(errs or ["No valid tiers."]))); return
         new.sort(key=lambda t:t["qty"]); qx("UPDATE products SET tiers=? WHERE id=?",(json.dumps(new),pid))
         await u.message.reply_text("✅ Tiers:\n"+"".join(ft(t)+"\n" for t in new),parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
+    elif wf=="set_stock":
+        try: sv=int(txt); assert sv>=-1
+        except: await u.message.reply_text("⚠️ Enter a number (-1 for unlimited)."); return
+        qx("UPDATE products SET stock=? WHERE id=?",(sv,ctx.user_data.get("stock_pid")))
+        await u.message.reply_text(f"✅ Stock set to {'∞' if sv==-1 else sv}.",reply_markup=menu()); ctx.user_data["wf"]=None
+    elif wf=="ban_user":
+        if not is_admin(uid): ctx.user_data["wf"]=None; return
+        try: bid=int(txt.strip())
+        except: await u.message.reply_text("⚠️ Enter numeric user_id."); return
+        if bid==ADMIN_ID: await u.message.reply_text("❌ Cannot ban owner."); ctx.user_data["wf"]=None; return
+        qx("UPDATE users SET banned=1 WHERE user_id=?",(bid,))
+        await u.message.reply_text(f"🚫 User <code>{bid}</code> banned.",parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
+    elif wf=="custnote_uid":
+        if not is_admin(uid): ctx.user_data["wf"]=None; return
+        try: cid=int(txt.strip())
+        except: await u.message.reply_text("⚠️ Enter numeric user_id."); return
+        existing=q1("SELECT note FROM customer_notes WHERE user_id=?",(cid,))
+        ctx.user_data.update({"custnote_uid":cid,"wf":"custnote_text"})
+        await u.message.reply_text(f"📝 Note for <code>{cid}</code>:\nCurrent: <i>{hl.escape(existing['note']) if existing else 'none'}</i>\n\nType new note:",parse_mode="HTML")
+    elif wf=="custnote_text":
+        cid=ctx.user_data.get("custnote_uid"); qx("INSERT OR REPLACE INTO customer_notes(user_id,note) VALUES(?,?)",(cid,txt))
+        await u.message.reply_text("✅ Note saved.",reply_markup=menu()); ctx.user_data["wf"]=None
     elif wf=="drop_msg_user":
         oid=ctx.user_data.get("dc_oid"); uname=u.effective_user.username or str(uid)
         qx("INSERT INTO drop_chats(order_id,user_id,sender,message) VALUES(?,?,?,?)",(oid,uid,"user",txt))
@@ -700,7 +919,7 @@ async def on_message(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     elif wf=="add_admin":
         if not is_admin(uid): ctx.user_data["wf"]=None; return
         try: new_id=int(txt.strip())
-        except: await u.message.reply_text("⚠️ Numeric user_id only (use @userinfobot)."); return
+        except: await u.message.reply_text("⚠️ Numeric user_id only."); return
         if q1("SELECT 1 FROM admins WHERE user_id=?",(new_id,)): await u.message.reply_text("⚠️ Already admin."); ctx.user_data["wf"]=None; return
         qx("INSERT OR IGNORE INTO admins(user_id,username) VALUES(?,?)",(new_id,str(new_id)))
         try: info=await ctx.bot.get_chat(new_id); un=info.username or info.first_name or str(new_id); qx("UPDATE admins SET username=? WHERE user_id=?",(un,new_id))
@@ -713,7 +932,7 @@ async def on_message(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
         try: com=float(parts[4]); adm_id=int(parts[5])
         except: await u.message.reply_text("⚠️ Invalid commission or admin_user_id."); return
         vid=qxi("INSERT INTO vendors(name,emoji,description,ltc_addr,commission_pct,admin_user_id) VALUES(?,?,?,?,?,?)",(parts[0],parts[1],parts[2],parts[3],com,adm_id))
-        await u.message.reply_text(f"✅ <b>{hl.escape(parts[0])}</b> added as Vendor #{vid}!\n\nTell their admin to use /admin to manage their shop.",parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
+        await u.message.reply_text(f"✅ <b>{hl.escape(parts[0])}</b> added as Vendor #{vid}!",parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
     else:
         await u.message.reply_text("Use /start to open the menu 👇",reply_markup=menu())
 
@@ -722,6 +941,15 @@ async def on_photo(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if not is_known(uid) and not is_admin(uid) and not is_vendor_admin(uid): return
     if wf=="add_photo": ctx.user_data.update({"ph":ph,"wf":"add_title"}); await u.message.reply_text("📝 Enter product title:")
     elif wf=="ann_photo": ctx.user_data.update({"ann_photo":ph,"wf":"ann_body"}); await u.message.reply_text("✏️ Enter announcement body:")
+
+# UPGRADE 9: Auto-expire pending orders after 48h
+async def auto_expire_job(ctx:ContextTypes.DEFAULT_TYPE):
+    cutoff=(datetime.now()-timedelta(hours=48)).isoformat()
+    rows=qa("SELECT id,user_id FROM orders WHERE status='Pending' AND created_at<?",(cutoff,))
+    for r in rows:
+        qx("UPDATE orders SET status='Rejected' WHERE id=?",(r["id"],))
+        try: await ctx.bot.send_message(r["user_id"],f"⏰ Order <code>{r['id']}</code> auto-cancelled (no payment after 48h).",parse_mode="HTML",reply_markup=menu())
+        except: pass
 
 async def review_reminder_job(ctx:ContextTypes.DEFAULT_TYPE):
     now=datetime.now(); t24=(now-timedelta(hours=24)).isoformat(); t48=(now-timedelta(hours=48)).isoformat()
@@ -733,20 +961,23 @@ async def review_reminder_job(ctx:ContextTypes.DEFAULT_TYPE):
 
 async def router(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     q=u.callback_query; d=q.data; uid=q.from_user.id
+    if is_banned(uid): await q.answer("🚫 You are banned.",show_alert=True); return
     if not is_known(uid) and not is_admin(uid) and not is_vendor_admin(uid): await q.answer("❌ Please /start first.",show_alert=True); return
-    if d.startswith("pick_"):       await pick_weight(u,ctx); return
-    if d.startswith("togglehide_"): await adm_togglehide(u,ctx); return
-    if d=="noop":                   await q.answer(); return
+    if d.startswith("pick_"):        await pick_weight(u,ctx); return
+    if d.startswith("togglehide_"):  await adm_togglehide(u,ctx); return
+    if d.startswith("togglefeat_"):  await adm_togglefeat(u,ctx); return
+    if d=="noop":                    await q.answer(); return
     await q.answer()
     if   d=="menu":              await safe_edit(q,f"🔷 <b>PhiVara Network</b>\n━━━━━━━━━━━━━━━━━━━━\n\n{open_badge()}\n🕙 <b>Mon–Sat · Orders close 11am</b>\n\n🏪 Verified Vendors · 🔒 Trusted\n\n👇 <b>Browse Vendors</b>",parse_mode="HTML",reply_markup=menu())
     elif d=="vendors":           await show_vendors(u,ctx)
     elif d.startswith("vend_"):  await show_vendor(u,ctx)
     elif d.startswith("cat_assign_"): await adm_cat_assign(u,ctx)
-    elif d.startswith("togglecat_"): await adm_togglecat(u,ctx)
+    elif d.startswith("togglecat_"):  await adm_togglecat(u,ctx)
     elif d.startswith("cat_"):   await show_category(u,ctx)
     elif d.startswith("prod_"):  await show_product(u,ctx)
     elif d=="basket":            await view_basket(u,ctx)
     elif d=="orders":            await view_orders(u,ctx)
+    elif d.startswith("reorder_"): await reorder(u,ctx)
     elif d.startswith("reviews_"): await show_reviews(u,ctx)
     elif d=="news":              await show_news(u,ctx)
     elif d=="contact":           await contact_start(u,ctx)
@@ -758,6 +989,8 @@ async def router(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     elif d.startswith("stars_"): await pick_stars(u,ctx)
     elif d=="loyalty":           await show_loyalty(u,ctx)
     elif d=="my_ref":            await show_my_ref(u,ctx)
+    elif d=="ref_leaderboard":   await ref_leaderboard(u,ctx)
+    elif d=="search_prompt":     await search_prompt(u,ctx)
     elif d=="checkout":          await checkout_start(u,ctx)
     elif d=="co_name":           await co_name_start(u,ctx)
     elif d=="co_addr":           await co_addr_start(u,ctx)
@@ -790,8 +1023,20 @@ async def router(u:Update,ctx:ContextTypes.DEFAULT_TYPE):
     elif d=="adm_vendors":       await adm_vendors(u,ctx)
     elif d=="adm_addvendor":     await adm_addvendor_start(u,ctx)
     elif d.startswith("togglevend_"): await adm_togglevend(u,ctx)
-    elif d=="adm_addprod":
-        if is_admin(uid) or is_vendor_admin(uid): ctx.user_data["wf"]="add_photo"; await q.message.reply_text("📸 Send product photo:")
+    elif d=="adm_stats":         await adm_stats(u,ctx)
+    elif d=="adm_feature":       await adm_feature_list(u,ctx)
+    elif d=="adm_stock":         await adm_stock_list(u,ctx)
+    elif d.startswith("setstock_"): await adm_setstock_start(u,ctx)
+    elif d=="adm_bans":          await adm_bans(u,ctx)
+    elif d=="adm_ban_start":     await adm_ban_start(u,ctx)
+    elif d.startswith("unban_"): await adm_unban(u,ctx)
+    elif d=="adm_custnotes":     await adm_custnotes(u,ctx)
+    elif d=="adm_addprod_go":
+        if is_admin(uid) or is_vendor_admin(uid):
+            ctx.user_data["wf"]="add_photo"
+            try: await q.message.delete()
+            except: pass
+            await q.message.reply_text("📸 Send product photo (or type 'skip' for no photo):")
     elif d.startswith("edtier_"): await adm_show_tiers(u,ctx)
     elif d.startswith("dcv_"):   await dropchat_view(u,ctx)
     elif d.startswith("dch_"):   await dropchat_history(u,ctx)
@@ -814,14 +1059,18 @@ def main():
     Thread(target=lambda:HTTPServer(("0.0.0.0",8080),_Ping).serve_forever(),daemon=True).start()
     init_db(); app=ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler(["start","Start"],cmd_start))
-    for cmd,fn in [("admin",cmd_admin),("reply",cmd_reply),("order",cmd_order),("customer",cmd_customer),("myorder",cmd_myorder),("addproduct",cmd_addproduct),("cancel",cmd_cancel)]:
+    for cmd,fn in [("admin",cmd_admin),("reply",cmd_reply),("order",cmd_order),("customer",cmd_customer),
+                   ("myorder",cmd_myorder),("addproduct",cmd_addproduct),("cancel",cmd_cancel),
+                   ("search",cmd_search),("stats",cmd_stats)]:
         app.add_handler(CommandHandler(cmd,fn))
     app.add_handler(CallbackQueryHandler(router))
     app.add_handler(MessageHandler(filters.PHOTO,on_photo))
     app.add_handler(MessageHandler(filters.TEXT&~filters.COMMAND,on_message))
-    if app.job_queue: app.job_queue.run_repeating(review_reminder_job,interval=3600,first=300)
-    else: print("⚠️ Job queue not available. Install python-telegram-bot[job-queue] for review reminders.")
-    print("🔷 PhiVara Network — Running"); app.run_polling(drop_pending_updates=True)
+    if app.job_queue:
+        app.job_queue.run_repeating(review_reminder_job,interval=3600,first=300)
+        app.job_queue.run_repeating(auto_expire_job,interval=3600,first=600)  # UPGRADE 9
+    else: print("⚠️ Job queue not available.")
+    print("🔷 PhiVara Network v2.0 — Running"); app.run_polling(drop_pending_updates=True)
 
 if __name__=="__main__":
     main()
