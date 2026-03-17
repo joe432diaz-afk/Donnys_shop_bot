@@ -48,7 +48,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS review_reminders(order_id TEXT PRIMARY KEY,user_id INTEGER,dispatched DATETIME);
     """)
     cur.execute("INSERT OR IGNORE INTO admins(user_id,username) VALUES(?,'owner')",(ADMIN_ID,))
-    cur.execute("INSERT OR IGNORE INTO vendors(id,name,emoji,description,ltc_addr,commission_pct,admin_user_id) VALUES(1,'Donny\'s Shop','🌿','Premium quality. Every time.','ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc',10,?)",(ADMIN_ID,))
+    cur.execute("INSERT OR IGNORE INTO vendors(id,name,emoji,description,ltc_addr,commission_pct,admin_user_id) VALUES(1,'Donny''s Shop','🌿','Premium quality. Every time.','ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc',10,?)",(ADMIN_ID,))
     cur.execute("INSERT OR IGNORE INTO discount_codes(code,vendor_id,pct,active) VALUES('SAVE10',1,0.10,1)")
     c.commit(); c.close()
 
@@ -492,7 +492,7 @@ async def adm_discounts(u,ctx):
     q=u.callback_query; uid=q.from_user.id
     if not is_admin(uid) and not is_vendor_admin(uid): return
     vid=get_vid(ctx,uid); rows=qa("SELECT code,pct,active,expires FROM discount_codes WHERE vendor_id=? ORDER BY code",(vid,))
-    txt="🏷️ <b>Discount Codes</b>\n\n"+"".join(f"{'✅' if r['active'] else '❌'} <code>{r['code']}</code> {int(r['pct']*100)}%{f" · exp {r['expires'][:10]}" if r.get('expires') else ''}\n" for r in rows)
+    txt="🏷️ <b>Discount Codes</b>\n\n"+"".join(f"{'✅' if r['active'] else '❌'} <code>{r['code']}</code> {int(r['pct']*100)}%{f\" · exp {r['expires'][:10]}\" if r.get('expires') else ''}\n" for r in rows)
     kb=[[IB(f"{'🚫' if r['active'] else '✅'} {r['code']}",f"toggledisc_{r['code']}")] for r in rows]+[[IB("➕ Add Code","adm_adddisc")],[IB("⬅️ Back","menu")]]
     await safe_edit(q,txt or "No codes yet.",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
 async def adm_toggledisc(u,ctx):
