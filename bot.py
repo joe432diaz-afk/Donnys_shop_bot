@@ -46,10 +46,21 @@ ADMIN_ID     = 7773622161
 CHANNEL_ID   = -1003833257976
 PLATFORM_LTC = "ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 
-# UPGRADE 1: Persistent DB on mounted volume — survives every redeploy
-DB_DIR = "/app/data"
-DB     = f"{DB_DIR}/shop.db"
-os.makedirs(DB_DIR, exist_ok=True)
+# ── DB PATH — works with or without a Railway volume ──────────────────────────
+# Railway volume: go to your service → Settings → Volumes → Mount path: /app/data
+# Without a volume the DB falls back to /tmp (resets on redeploy, but bot runs fine)
+_DB_CANDIDATES = ["/app/data", "/data", "/tmp"]
+DB_DIR = "/tmp"  # default
+for _d in _DB_CANDIDATES:
+    try:
+        os.makedirs(_d, exist_ok=True)
+        # verify we can write
+        _test = os.path.join(_d, ".write_test")
+        open(_test, "w").close(); os.remove(_test)
+        DB_DIR = _d; break
+    except: continue
+DB = os.path.join(DB_DIR, "shop.db")
+print(f"🗄️  Database: {DB}")
 
 SHIP = {
     "tracked24": {"label": "📦 Tracked24", "price": 5.0,  "ltc": True},
@@ -280,9 +291,16 @@ def is_banned(uid):       r = q1("SELECT banned FROM users WHERE user_id=?", (ui
 def get_vendor(uid):      return q1("SELECT * FROM vendors WHERE admin_user_id=? AND active=1", (uid,))
 def is_vendor_admin(uid): return not is_admin(uid) and bool(get_vendor(uid))
 def get_vid(ctx, uid):
+    # 1. If they are a vendor admin, always use their vendor ID
     v = get_vendor(uid)
-    if v: return v["id"]
-    return ctx.user_data.get("cur_vid", 1)
+    if v:
+        ctx.user_data["cur_vid"] = v["id"]  # keep in sync
+        return v["id"]
+    # 2. Platform admin may have selected a vendor
+    if ctx.user_data.get("cur_vid"):
+        return ctx.user_data["cur_vid"]
+    # 3. Default to vendor 1
+    return 1
 def fq(q): return f"{int(q)}g" if q == int(q) else f"{q}g"
 def ft(t):
     ppg = round(t["price"] / t["qty"], 2) if t["qty"] else t["price"]
@@ -1042,6 +1060,9 @@ async def dropchat_open(u, ctx):
 # ══════════════════════════════════════════════════════════════════════════════
 async def cmd_admin(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
+    # FIX: Always register admin/vendor-admin in users table so message flows work
+    qx("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",
+       (uid, u.effective_user.username or ""))
     if is_vendor_admin(uid):
         v = get_vendor(uid); ctx.user_data["cur_vid"] = v["id"]
         await _vendor_panel(u.message, v); return
@@ -1880,7 +1901,11 @@ async def cmd_cancel(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_message(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid=u.effective_user.id; txt=(u.message.text or "").strip()
     if is_banned(uid): await u.message.reply_text("🚫 You are banned."); return
-    if not is_known(uid) and not is_admin(uid) and not is_vendor_admin(uid):
+    # FIX: auto-register admins/vendor-admins so they never hit the "Please /start" wall
+    if is_admin(uid) or is_vendor_admin(uid):
+        qx("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",
+           (uid, u.effective_user.username or ""))
+    elif not is_known(uid):
         await u.message.reply_text("👋 Please /start first."); return
     wf=ctx.user_data.get("wf")
 
@@ -2137,7 +2162,11 @@ async def on_message(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_photo(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid=u.effective_user.id; wf=ctx.user_data.get("wf"); ph=u.message.photo[-1].file_id
-    if not is_known(uid) and not is_admin(uid) and not is_vendor_admin(uid): return
+    # FIX: auto-register admins/vendor-admins
+    if is_admin(uid) or is_vendor_admin(uid):
+        qx("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",
+           (uid, u.effective_user.username or ""))
+    elif not is_known(uid): return
     if wf=="add_photo":
         ctx.user_data.update({"ph":ph,"wf":"add_title"})
         await u.message.reply_text("✅ Photo saved!\n\n📝 <b>Step 2/3</b>\n\nEnter product title:",parse_mode="HTML")
@@ -2270,7 +2299,11 @@ async def low_stock_alert_job(ctx: ContextTypes.DEFAULT_TYPE):
 async def router(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q=u.callback_query; d=q.data; uid=q.from_user.id
     if is_banned(uid): await q.answer("🚫 You are banned.",show_alert=True); return
-    if not is_known(uid) and not is_admin(uid) and not is_vendor_admin(uid):
+    # FIX: auto-register admin/vendor-admin so they can use all buttons without /start
+    if is_admin(uid) or is_vendor_admin(uid):
+        qx("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",
+           (uid, u.effective_user.username or ""))
+    elif not is_known(uid):
         await q.answer("❌ Please /start first.",show_alert=True); return
     if d.startswith("pick_"):        await pick_weight(u,ctx); return
     if d.startswith("togglehide_"):  await adm_togglehide(u,ctx); return
@@ -2391,7 +2424,26 @@ class _Ping(BaseHTTPRequestHandler):
 def main():
     Thread(target=lambda: HTTPServer(("0.0.0.0", 8080), _Ping).serve_forever(), daemon=True).start()
     init_db()
-    app = ApplicationBuilder().token(TOKEN).build()
+    print(f"🔷 PhiVara Network v5.0 — DB at {DB}")
+
+    app = (ApplicationBuilder()
+           .token(TOKEN)
+           .connect_timeout(30)
+           .read_timeout(30)
+           .write_timeout(30)
+           .build())
+
+    # Global error handler — logs ALL exceptions so nothing is silent
+    async def error_handler(update, context):
+        import traceback
+        tb = "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
+        print(f"❌ ERROR:\n{tb}")
+        # Don't crash on Conflict — just log it
+        from telegram.error import Conflict
+        if isinstance(context.error, Conflict):
+            print("⚠️  Conflict: another bot instance is running. Kill old deployments on Railway.")
+    app.add_error_handler(error_handler)
+
     app.add_handler(CommandHandler(["start","Start"], cmd_start))
     for cmd, fn in [
         ("admin",      cmd_admin),
@@ -2422,7 +2474,11 @@ def main():
     else:
         print("⚠️ Job queue not available — install python-telegram-bot[job-queue]")
     print("🔷 PhiVara Network v5.0 — Running")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+        close_loop=False,
+    )
 
 if __name__ == "__main__":
     main()
