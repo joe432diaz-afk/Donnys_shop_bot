@@ -46,21 +46,30 @@ ADMIN_ID     = 7773622161
 CHANNEL_ID   = -1003833257976
 PLATFORM_LTC = "ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 
-# ── DB PATH — works with or without a Railway volume ──────────────────────────
-# Railway volume: go to your service → Settings → Volumes → Mount path: /app/data
-# Without a volume the DB falls back to /tmp (resets on redeploy, but bot runs fine)
-_DB_CANDIDATES = ["/app/data", "/data", "/tmp"]
-DB_DIR = "/tmp"  # default
-for _d in _DB_CANDIDATES:
-    try:
-        os.makedirs(_d, exist_ok=True)
-        # verify we can write
-        _test = os.path.join(_d, ".write_test")
-        open(_test, "w").close(); os.remove(_test)
-        DB_DIR = _d; break
-    except: continue
-DB = os.path.join(DB_DIR, "shop.db")
-print(f"🗄️  Database: {DB}")
+# ── DB PATH ────────────────────────────────────────────────────────────────────
+# Railway: Settings → Volumes → Add Volume → Mount path: /app/data
+# Or set env var DB_PATH=/app/data/shop.db in Railway Variables
+# The bot prints the path on startup — check Railway logs to confirm
+DB_PATH_ENV = os.getenv("DB_PATH", "")
+if DB_PATH_ENV:
+    DB = DB_PATH_ENV
+    DB_DIR = os.path.dirname(DB)
+else:
+    # Auto-detect best writable directory
+    _DB_CANDIDATES = ["/app/data", "/data", "/var/data", "/tmp"]
+    DB_DIR = "/tmp"
+    for _d in _DB_CANDIDATES:
+        try:
+            os.makedirs(_d, exist_ok=True)
+            _test = os.path.join(_d, ".write_test")
+            open(_test, "w").close(); os.remove(_test)
+            DB_DIR = _d; break
+        except: continue
+    DB = os.path.join(DB_DIR, "shop.db")
+
+# Ensure directory exists
+os.makedirs(DB_DIR, exist_ok=True)
+print(f"🗄️  Database path: {DB}  (set DB_PATH env var to override)")
 
 SHIP = {
     "tracked24": {"label": "📦 Tracked24", "price": 5.0,  "ltc": True},
@@ -346,9 +355,10 @@ def get_loyalty(uid):
            {"points": 0, "credit": 0.0, "lifetime": 0}
 
 def add_points(uid, gbp):
-    pts = int(gbp) * 2; lo = get_loyalty(uid)
+    # 1 point per £1 spent · 500 points = £1 credit
+    pts = int(gbp); lo = get_loyalty(uid)
     np = lo["points"] + pts; lf = lo["lifetime"] + pts
-    m = np // 100; cr = m * 25.0; np = np % 100
+    m = np // 500; cr = m * 1.0; np = np % 500
     qx("INSERT INTO loyalty(user_id,points,credit,lifetime) VALUES(?,?,?,?) "
        "ON CONFLICT(user_id) DO UPDATE SET points=?,credit=credit+?,lifetime=?",
        (uid, np, cr, lf, np, cr, lf))
@@ -958,12 +968,13 @@ async def show_news(u, ctx):
 
 async def show_loyalty(u, ctx):
     q = u.callback_query; uid = q.from_user.id; lo = get_loyalty(uid); pts = lo["points"]
-    bar = "█" * (pts // 10) + "░" * (10 - pts // 10)
+    bar = "█" * (pts // 50) + "░" * (10 - pts // 50)
+    remaining = 500 - pts
     await safe_edit(q,
         f"🎁 <b>Loyalty Rewards</b>\n━━━━━━━━━━━━━━━━━━━━{vip_label(uid)}\n\n"
-        f"⭐ <b>{pts}/100 pts</b>\n[{bar}]\n{100-pts} more = <b>£25 credit</b>\n"
+        f"⭐ <b>{pts}/500 pts</b>\n[{bar}]\n{remaining} more = <b>£1 credit</b>\n"
         f"💳 Available: <b>£{lo['credit']:.2f}</b>\n🏆 Lifetime: <b>{lo['lifetime']} pts</b>\n\n"
-        f"<i>2 pts per £1 · 100 pts = £25 credit</i>",
+        f"<i>1 pt per £1 spent · 500 pts = £1 credit</i>",
         parse_mode="HTML", reply_markup=back_kb())
 
 async def show_my_ref(u, ctx):
@@ -1875,6 +1886,36 @@ async def cmd_dispute(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except: pass
     await u.message.reply_text(f"⚠️ Dispute #{did} raised for order <code>{oid}</code>. Admin will review within 24h.",parse_mode="HTML")
 
+async def cmd_dbcheck(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin command to diagnose database path and verify data is persisting."""
+    if not is_admin(u.effective_user.id): return
+    import shutil
+    vendors  = q1("SELECT COUNT(*) as c FROM vendors") or {"c":0}
+    products = q1("SELECT COUNT(*) as c FROM products") or {"c":0}
+    users    = q1("SELECT COUNT(*) as c FROM users")    or {"c":0}
+    orders   = q1("SELECT COUNT(*) as c FROM orders")   or {"c":0}
+    try:
+        db_size = os.path.getsize(DB)
+        free    = shutil.disk_usage(DB_DIR).free // 1024 // 1024
+        disk_txt = f"📁 DB size: {db_size} bytes · Free: {free}MB"
+    except: disk_txt = "📁 Could not read disk info"
+    await u.message.reply_text(
+        f"🗄️ <b>Database Diagnostics</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"📍 Path: <code>{DB}</code>\n"
+        f"{disk_txt}\n\n"
+        f"👥 Users: <b>{users['c']}</b>\n"
+        f"🏪 Vendors: <b>{vendors['c']}</b>\n"
+        f"🌿 Products: <b>{products['c']}</b>\n"
+        f"📦 Orders: <b>{orders['c']}</b>\n\n"
+        f"<b>If vendors/products show 0 after adding them:</b>\n"
+        f"→ Railway hasn't mounted the volume yet\n"
+        f"→ Go to Railway → your service → <b>Settings → Volumes</b>\n"
+        f"→ Add volume with mount path: <code>/app/data</code>\n"
+        f"→ Redeploy, then run /admin and add your data again\n\n"
+        f"<b>Or set this Railway Variable:</b>\n"
+        f"<code>DB_PATH=/app/data/shop.db</code>",
+        parse_mode="HTML")
+
 async def cmd_ltccheck(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(u.effective_user.id): return
     try:
@@ -2460,6 +2501,7 @@ def main():
         ("set",        cmd_set),
         ("top",        cmd_top),
         ("copy",       cmd_copy),
+        ("dbcheck",    cmd_dbcheck),
     ]: app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(CallbackQueryHandler(router))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
