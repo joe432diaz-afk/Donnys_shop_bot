@@ -29,7 +29,7 @@
 # ║  19. Product copy — duplicate a product                     ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-import os, json, logging, requests, sqlite3, html as hl, time
+import os, json, logging, requests, html as hl, time
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from uuid import uuid4
@@ -37,6 +37,8 @@ from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton as _IB
 from telegram.ext import (ApplicationBuilder, CommandHandler, CallbackQueryHandler,
                            MessageHandler, ContextTypes, filters)
+import psycopg2
+import psycopg2.extras
 
 def IB(t, c): return _IB(text=t, callback_data=c)
 
@@ -46,30 +48,77 @@ ADMIN_ID     = 7773622161
 CHANNEL_ID   = -1003833257976
 PLATFORM_LTC = "ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc"
 
-# ── DB PATH ────────────────────────────────────────────────────────────────────
-# Railway: Settings → Volumes → Add Volume → Mount path: /app/data
-# Or set env var DB_PATH=/app/data/shop.db in Railway Variables
-# The bot prints the path on startup — check Railway logs to confirm
-DB_PATH_ENV = os.getenv("DB_PATH", "")
-if DB_PATH_ENV:
-    DB = DB_PATH_ENV
-    DB_DIR = os.path.dirname(DB)
-else:
-    # Auto-detect best writable directory
-    _DB_CANDIDATES = ["/app/data", "/data", "/var/data", "/tmp"]
-    DB_DIR = "/tmp"
-    for _d in _DB_CANDIDATES:
-        try:
-            os.makedirs(_d, exist_ok=True)
-            _test = os.path.join(_d, ".write_test")
-            open(_test, "w").close(); os.remove(_test)
-            DB_DIR = _d; break
-        except: continue
-    DB = os.path.join(DB_DIR, "shop.db")
+# ── POSTGRESQL ─────────────────────────────────────────────────────────────────
+# Railway: add a PostgreSQL plugin to your service — DATABASE_URL is set automatically
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable not set. Add a PostgreSQL plugin in Railway.")
 
-# Ensure directory exists
-os.makedirs(DB_DIR, exist_ok=True)
-print(f"🗄️  Database path: {DB}  (set DB_PATH env var to override)")
+def db():
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn.autocommit = False
+    return conn
+
+def _sql(s):
+    """Convert SQLite ? placeholders to PostgreSQL %s"""
+    return s.replace("?", "%s")
+
+def q1(s, p=()):
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_sql(s), p)
+        r = cur.fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+def qa(s, p=()):
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_sql(s), p)
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+def qx(s, p=()):
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_sql(s), p)
+        conn.commit()
+    except Exception as e:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+def qxi(s, p=()):
+    """Execute INSERT and return the generated id via RETURNING id"""
+    conn = db()
+    try:
+        cur = conn.cursor()
+        # Add RETURNING id if not present
+        sql = _sql(s)
+        if "RETURNING" not in sql.upper():
+            sql = sql.rstrip(";") + " RETURNING id"
+        cur.execute(sql, p)
+        r = cur.fetchone()
+        conn.commit()
+        return r["id"] if r else None
+    except Exception as e:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+def gs(k, d=""):
+    r = q1("SELECT value FROM settings WHERE key=%s", (k,))
+    return r["value"] if r else d
+
+def ss(k, v):
+    qx("INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=%s", (k, v, v))
+
+print("🗄️  Database: PostgreSQL (DATABASE_URL configured)")
 
 SHIP = {
     "tracked24": {"label": "📦 Tracked24", "price": 5.0,  "ltc": True},
@@ -89,7 +138,7 @@ logging.basicConfig(level=logging.WARNING)
 
 # ── DATABASE ───────────────────────────────────────────────────────────────────
 def db():
-    c = sqlite3.connect(DB); c.row_factory = sqlite3.Row; return c
+    c = psycopg2.connect(DB); c.row_factory = psycopg2.Row; return c
 
 def q1(s, p=()):
     c = db(); r = c.execute(s, p).fetchone(); c.close()
@@ -102,196 +151,161 @@ def qa(s, p=()):
 def qx(s, p=()):
     c = db(); c.execute(s, p); c.commit(); c.close()
 
-def qxi(s, p=()):
-    c = db(); cur = c.execute(s, p); r = cur.lastrowid; c.commit(); c.close(); return r
+# qxi defined above in PostgreSQL section
 
 def gs(k, d=""): r = q1("SELECT value FROM settings WHERE key=?", (k,)); return r["value"] if r else d
-def ss(k, v):    qx("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (k, v))
+def ss(k, v):    qx("INSERT INTO settings(key,value) VALUES(?,?)", (k, v))
 
 def init_db():
-    """
-    UPGRADE 1 — CRITICAL FIX: All seed inserts use INSERT OR IGNORE.
-    This means admins, vendors, products, discount codes are NEVER wiped
-    when you redeploy new code. The DB file lives at /app/data/shop.db
-    which is a mounted volume on Railway — it persists across deploys.
-    New columns are added with ALTER TABLE IF NOT EXISTS style checks.
-    """
-    c = db(); cur = c.cursor()
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS users(
-        user_id INTEGER PRIMARY KEY, username TEXT,
-        joined DATETIME DEFAULT CURRENT_TIMESTAMP,
-        banned INTEGER DEFAULT 0, vip_tier TEXT DEFAULT 'standard',
-        language TEXT DEFAULT 'en');
-
-    CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
-
-    CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY, username TEXT);
-
-    CREATE TABLE IF NOT EXISTS vendors(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT,
-        emoji TEXT DEFAULT '🏪', description TEXT DEFAULT '',
-        ltc_addr TEXT, commission_pct REAL DEFAULT 10,
-        admin_user_id INTEGER, active INTEGER DEFAULT 1,
-        banner_photo TEXT DEFAULT '');
-
-    CREATE TABLE IF NOT EXISTS products(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        vendor_id INTEGER DEFAULT 1, name TEXT, description TEXT,
-        photo TEXT, hidden INTEGER DEFAULT 0,
-        tiers TEXT DEFAULT '[]', category_id INTEGER DEFAULT 0,
-        stock INTEGER DEFAULT -1, featured INTEGER DEFAULT 0,
-        views INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
-
-    CREATE TABLE IF NOT EXISTS categories(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        vendor_id INTEGER DEFAULT 1, name TEXT, emoji TEXT DEFAULT '🌿');
-
-    CREATE TABLE IF NOT EXISTS cart(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, product_id INTEGER,
-        vendor_id INTEGER DEFAULT 1, qty REAL, price REAL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
-
-    CREATE TABLE IF NOT EXISTS orders(
-        id TEXT PRIMARY KEY, user_id INTEGER,
-        vendor_id INTEGER DEFAULT 1, cust_name TEXT, address TEXT,
-        summary TEXT DEFAULT '', gbp REAL,
-        vendor_gbp REAL DEFAULT 0, platform_gbp REAL DEFAULT 0,
-        ltc REAL DEFAULT 0, ltc_rate REAL DEFAULT 0,
-        ltc_addr TEXT DEFAULT '', status TEXT DEFAULT 'Pending',
-        ship TEXT DEFAULT 'tracked24',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        rate_expires DATETIME);
-
-    CREATE TABLE IF NOT EXISTS order_notes(order_id TEXT PRIMARY KEY, note TEXT);
-
-    CREATE TABLE IF NOT EXISTS order_timeline(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id TEXT, event TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
-
-    CREATE TABLE IF NOT EXISTS drop_chats(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id TEXT, user_id INTEGER, sender TEXT,
-        message TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
-
-    CREATE TABLE IF NOT EXISTS messages(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, username TEXT,
-        vendor_id INTEGER DEFAULT 1,
-        message TEXT, reply TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
-
-    CREATE TABLE IF NOT EXISTS reviews(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id TEXT UNIQUE, user_id INTEGER,
-        vendor_id INTEGER DEFAULT 1,
-        product_name TEXT DEFAULT '',
-        vendor_name TEXT DEFAULT '',
-        stars INTEGER, text TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
-
-    CREATE TABLE IF NOT EXISTS announcements(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        vendor_id INTEGER DEFAULT 0,
-        title TEXT, body TEXT, photo TEXT DEFAULT '',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
-
-    CREATE TABLE IF NOT EXISTS discount_codes(
-        code TEXT PRIMARY KEY, vendor_id INTEGER DEFAULT 1,
-        pct REAL, active INTEGER DEFAULT 1, expires TEXT,
-        uses INTEGER DEFAULT 0, max_uses INTEGER DEFAULT -1);
-
-    CREATE TABLE IF NOT EXISTS loyalty(
-        user_id INTEGER PRIMARY KEY,
-        points INTEGER DEFAULT 0, credit REAL DEFAULT 0,
-        lifetime INTEGER DEFAULT 0);
-
-    CREATE TABLE IF NOT EXISTS referrals(
-        code TEXT PRIMARY KEY, owner_id INTEGER,
-        count INTEGER DEFAULT 0, earnings REAL DEFAULT 0);
-
-    CREATE TABLE IF NOT EXISTS review_reminders(
-        order_id TEXT PRIMARY KEY, user_id INTEGER, dispatched DATETIME);
-
-    CREATE TABLE IF NOT EXISTS customer_notes(
-        user_id INTEGER PRIMARY KEY, note TEXT);
-
-    CREATE TABLE IF NOT EXISTS wishlist(
-        user_id INTEGER, product_id INTEGER,
-        PRIMARY KEY(user_id, product_id));
-
-    CREATE TABLE IF NOT EXISTS flash_sales(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id INTEGER UNIQUE, pct REAL,
-        expires DATETIME, active INTEGER DEFAULT 1);
-
-    CREATE TABLE IF NOT EXISTS disputes(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id TEXT, user_id INTEGER,
-        reason TEXT, reply TEXT DEFAULT '',
-        status TEXT DEFAULT 'Open',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
-
-    CREATE TABLE IF NOT EXISTS vendor_balances(
-        vendor_id INTEGER PRIMARY KEY,
-        owed REAL DEFAULT 0, paid REAL DEFAULT 0);
-
-    CREATE TABLE IF NOT EXISTS payout_requests(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        vendor_id INTEGER, amount REAL, ltc_addr TEXT,
-        status TEXT DEFAULT 'Pending',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
-
-    CREATE TABLE IF NOT EXISTS ltc_transactions(
-        txid TEXT PRIMARY KEY, order_id TEXT,
-        amount_ltc REAL, confirmed INTEGER DEFAULT 0,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
-
-    CREATE TABLE IF NOT EXISTS price_alerts(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, product_id INTEGER,
-        target_price REAL, active INTEGER DEFAULT 1);
-
-    CREATE TABLE IF NOT EXISTS bundles(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        vendor_id INTEGER DEFAULT 1, name TEXT,
-        description TEXT DEFAULT '', product_ids TEXT,
-        price REAL, active INTEGER DEFAULT 1);
-    """)
-
-    # UPGRADE 1: INSERT OR IGNORE — data survives every redeploy
-    cur.execute("INSERT OR IGNORE INTO admins(user_id,username) VALUES(?,'owner')", (ADMIN_ID,))
-    cur.execute(
-        "INSERT OR IGNORE INTO vendors(id,name,emoji,description,ltc_addr,commission_pct,admin_user_id) "
-        "VALUES(1,'Donny''s Shop','🌿','Premium quality. Every time.',?,10,?)",
-        (PLATFORM_LTC, ADMIN_ID))
-    cur.execute("INSERT OR IGNORE INTO discount_codes(code,vendor_id,pct,active) VALUES('SAVE10',1,0.10,1)")
-    cur.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('home_extra','')")
-    cur.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('min_order','0')")
-    cur.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('bulk_threshold','100')")
-    cur.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('bulk_pct','5')")
-
-    # UPGRADE 1: Safe migration — add new columns to existing DBs without breaking
-    migrations = [
-        "ALTER TABLE products ADD COLUMN views INTEGER DEFAULT 0",
-        "ALTER TABLE products ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP",
-        "ALTER TABLE vendors ADD COLUMN banner_photo TEXT DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'en'",
-        "ALTER TABLE discount_codes ADD COLUMN uses INTEGER DEFAULT 0",
-        "ALTER TABLE discount_codes ADD COLUMN max_uses INTEGER DEFAULT -1",
-        "ALTER TABLE reviews ADD COLUMN product_name TEXT DEFAULT ''",
-        "ALTER TABLE reviews ADD COLUMN vendor_name TEXT DEFAULT ''",
-        "ALTER TABLE reviews ADD COLUMN id INTEGER",
-        "ALTER TABLE referrals ADD COLUMN earnings REAL DEFAULT 0",
-        "ALTER TABLE disputes ADD COLUMN reply TEXT DEFAULT ''",
+    """Create all tables if they don't exist, then seed default data."""
+    conn = db(); cur = conn.cursor()
+    tables = [
+        """CREATE TABLE IF NOT EXISTS users(
+            user_id BIGINT PRIMARY KEY, username TEXT,
+            joined TIMESTAMP DEFAULT NOW(),
+            banned INTEGER DEFAULT 0, vip_tier TEXT DEFAULT 'standard',
+            language TEXT DEFAULT 'en')""",
+        """CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)""",
+        """CREATE TABLE IF NOT EXISTS admins(user_id BIGINT PRIMARY KEY, username TEXT)""",
+        """CREATE TABLE IF NOT EXISTS vendors(
+            id SERIAL PRIMARY KEY, name TEXT,
+            emoji TEXT DEFAULT '🏪', description TEXT DEFAULT '',
+            ltc_addr TEXT, commission_pct REAL DEFAULT 10,
+            admin_user_id BIGINT, active INTEGER DEFAULT 1,
+            banner_photo TEXT DEFAULT '')""",
+        """CREATE TABLE IF NOT EXISTS products(
+            id SERIAL PRIMARY KEY,
+            vendor_id INTEGER DEFAULT 1, name TEXT, description TEXT,
+            photo TEXT, hidden INTEGER DEFAULT 0,
+            tiers TEXT DEFAULT '[]', category_id INTEGER DEFAULT 0,
+            stock INTEGER DEFAULT -1, featured INTEGER DEFAULT 0,
+            views INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS categories(
+            id SERIAL PRIMARY KEY,
+            vendor_id INTEGER DEFAULT 1, name TEXT, emoji TEXT DEFAULT '🌿')""",
+        """CREATE TABLE IF NOT EXISTS cart(
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT, product_id INTEGER,
+            vendor_id INTEGER DEFAULT 1, qty REAL, price REAL,
+            created_at TIMESTAMP DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS orders(
+            id TEXT PRIMARY KEY, user_id BIGINT,
+            vendor_id INTEGER DEFAULT 1, cust_name TEXT, address TEXT,
+            summary TEXT DEFAULT '', gbp REAL,
+            vendor_gbp REAL DEFAULT 0, platform_gbp REAL DEFAULT 0,
+            ltc REAL DEFAULT 0, ltc_rate REAL DEFAULT 0,
+            ltc_addr TEXT DEFAULT '', status TEXT DEFAULT 'Pending',
+            ship TEXT DEFAULT 'tracked24',
+            created_at TIMESTAMP DEFAULT NOW(),
+            rate_expires TIMESTAMP)""",
+        """CREATE TABLE IF NOT EXISTS order_notes(order_id TEXT PRIMARY KEY, note TEXT)""",
+        """CREATE TABLE IF NOT EXISTS order_timeline(
+            id SERIAL PRIMARY KEY,
+            order_id TEXT, event TEXT,
+            created_at TIMESTAMP DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS drop_chats(
+            id SERIAL PRIMARY KEY,
+            order_id TEXT, user_id BIGINT, sender TEXT,
+            message TEXT, created_at TIMESTAMP DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS messages(
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT, username TEXT,
+            vendor_id INTEGER DEFAULT 1,
+            message TEXT, reply TEXT,
+            created_at TIMESTAMP DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS reviews(
+            id SERIAL PRIMARY KEY,
+            order_id TEXT UNIQUE, user_id BIGINT,
+            vendor_id INTEGER DEFAULT 1,
+            product_name TEXT DEFAULT '',
+            vendor_name TEXT DEFAULT '',
+            stars INTEGER, text TEXT,
+            created_at TIMESTAMP DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS announcements(
+            id SERIAL PRIMARY KEY,
+            vendor_id INTEGER DEFAULT 0,
+            title TEXT, body TEXT, photo TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS discount_codes(
+            code TEXT PRIMARY KEY, vendor_id INTEGER DEFAULT 1,
+            pct REAL, active INTEGER DEFAULT 1, expires TEXT,
+            uses INTEGER DEFAULT 0, max_uses INTEGER DEFAULT -1)""",
+        """CREATE TABLE IF NOT EXISTS loyalty(
+            user_id BIGINT PRIMARY KEY,
+            points INTEGER DEFAULT 0, credit REAL DEFAULT 0,
+            lifetime INTEGER DEFAULT 0)""",
+        """CREATE TABLE IF NOT EXISTS referrals(
+            code TEXT PRIMARY KEY, owner_id BIGINT,
+            count INTEGER DEFAULT 0, earnings REAL DEFAULT 0)""",
+        """CREATE TABLE IF NOT EXISTS review_reminders(
+            order_id TEXT PRIMARY KEY, user_id BIGINT, dispatched TIMESTAMP)""",
+        """CREATE TABLE IF NOT EXISTS customer_notes(
+            user_id BIGINT PRIMARY KEY, note TEXT)""",
+        """CREATE TABLE IF NOT EXISTS wishlist(
+            user_id BIGINT, product_id INTEGER,
+            PRIMARY KEY(user_id, product_id))""",
+        """CREATE TABLE IF NOT EXISTS flash_sales(
+            id SERIAL PRIMARY KEY,
+            product_id INTEGER UNIQUE, pct REAL,
+            expires TIMESTAMP, active INTEGER DEFAULT 1)""",
+        """CREATE TABLE IF NOT EXISTS disputes(
+            id SERIAL PRIMARY KEY,
+            order_id TEXT, user_id BIGINT,
+            reason TEXT, reply TEXT DEFAULT '',
+            status TEXT DEFAULT 'Open',
+            created_at TIMESTAMP DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS vendor_balances(
+            vendor_id INTEGER PRIMARY KEY,
+            owed REAL DEFAULT 0, paid REAL DEFAULT 0)""",
+        """CREATE TABLE IF NOT EXISTS payout_requests(
+            id SERIAL PRIMARY KEY,
+            vendor_id INTEGER, amount REAL, ltc_addr TEXT,
+            status TEXT DEFAULT 'Pending',
+            created_at TIMESTAMP DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS ltc_transactions(
+            txid TEXT PRIMARY KEY, order_id TEXT,
+            amount_ltc REAL, confirmed INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS price_alerts(
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT, product_id INTEGER,
+            target_price REAL, active INTEGER DEFAULT 1)""",
+        """CREATE TABLE IF NOT EXISTS bundles(
+            id SERIAL PRIMARY KEY,
+            vendor_id INTEGER DEFAULT 1, name TEXT,
+            description TEXT DEFAULT '', product_ids TEXT,
+            price REAL, active INTEGER DEFAULT 1)""",
     ]
-    for m in migrations:
-        try: cur.execute(m)
-        except: pass  # Column already exists — safe to ignore
+    for t in tables:
+        try: cur.execute(t); conn.commit()
+        except Exception as e: conn.rollback(); print(f"Table error: {e}")
 
-    c.commit(); c.close()
+    # Seed default data — ON CONFLICT DO NOTHING = safe on every redeploy
+    seeds = [
+        ("INSERT INTO admins(user_id,username) VALUES(%s,%s) ON CONFLICT DO NOTHING ON CONFLICT DO NOTHING",
+         (7773622161, "owner")),
+        ("INSERT INTO vendors(id,name,emoji,description,ltc_addr,commission_pct,admin_user_id) "
+         "VALUES(1,%s,%s,%s,%s,10,%s) ON CONFLICT DO NOTHING",
+         ("Donny's Shop","🌿","Premium quality. Every time.","ltc1qv4u6vr0gzp9g4lq0g3qev939vdnwxghn5gtnfc",7773622161)),
+        ("INSERT INTO discount_codes(code,vendor_id,pct,active) VALUES(%s,1,0.10,1) ON CONFLICT DO NOTHING",
+         ("SAVE10",)),
+        ("INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT DO NOTHING", ("home_extra","")),
+        ("INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT DO NOTHING", ("min_order","0")),
+        ("INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT DO NOTHING", ("bulk_threshold","100")),
+        ("INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT DO NOTHING", ("bulk_pct","5")),
+    ]
+    for sql, params in seeds:
+        try: cur.execute(sql, params); conn.commit()
+        except Exception as e: conn.rollback(); print(f"Seed error: {e}")
+
+    # Auto-increment vendors sequence to avoid id conflicts
+    try:
+        cur.execute("SELECT setval('vendors_id_seq', GREATEST((SELECT MAX(id) FROM vendors), 1))")
+        conn.commit()
+    except: conn.rollback()
+
+    conn.close()
+    print("✅ Database initialised")
 
 # ── CORE HELPERS ───────────────────────────────────────────────────────────────
 def is_admin(uid):        return uid == ADMIN_ID or bool(q1("SELECT 1 FROM admins WHERE user_id=?", (uid,)))
@@ -355,10 +369,10 @@ def get_loyalty(uid):
            {"points": 0, "credit": 0.0, "lifetime": 0}
 
 def add_points(uid, gbp):
-    # 1 point per £1 spent · 500 points = £1 credit
-    pts = int(gbp); lo = get_loyalty(uid)
+    # 25 points flat per order · 500 points = £50 store credit
+    pts = 25; lo = get_loyalty(uid)
     np = lo["points"] + pts; lf = lo["lifetime"] + pts
-    m = np // 500; cr = m * 1.0; np = np % 500
+    m = np // 500; cr = m * 50.0; np = np % 500
     qx("INSERT INTO loyalty(user_id,points,credit,lifetime) VALUES(?,?,?,?) "
        "ON CONFLICT(user_id) DO UPDATE SET points=?,credit=credit+?,lifetime=?",
        (uid, np, cr, lf, np, cr, lf))
@@ -368,7 +382,7 @@ def get_ref(uid):
     r = q1("SELECT code FROM referrals WHERE owner_id=?", (uid,))
     if r: return r["code"]
     c = str(uid)[-4:] + str(uuid4())[:4].upper()
-    qx("INSERT OR IGNORE INTO referrals(code,owner_id) VALUES(?,?)", (c, uid)); return c
+    qx("INSERT INTO referrals(code,owner_id) VALUES(?,?)", (c, uid)); return c
 
 def credit_ref(ref_code, new_uid):
     r = q1("SELECT owner_id,count FROM referrals WHERE code=? AND owner_id!=?", (ref_code, new_uid))
@@ -542,7 +556,7 @@ async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     purge(); uid = u.effective_user.id
     if is_banned(uid): await u.message.reply_text("🚫 You are banned."); return
     is_new = not q1("SELECT 1 FROM users WHERE user_id=?", (uid,))
-    qx("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",
+    qx("INSERT INTO users(user_id,username) VALUES(?,?)",
        (uid, u.effective_user.username or ""))
     if is_new and ctx.args:
         r_ = credit_ref(ctx.args[0], uid)
@@ -814,7 +828,7 @@ async def refresh_rate_cb(u, ctx):
 
 async def view_orders(u, ctx):
     q = u.callback_query; uid = q.from_user.id
-    rows = qa("SELECT id,gbp,status,ship,summary,vendor_id,ltc FROM orders WHERE user_id=? ORDER BY rowid DESC", (uid,))
+    rows = qa("SELECT id,gbp,status,ship,summary,vendor_id,ltc FROM orders WHERE user_id=? ORDER BY id DESC", (uid,))
     if not rows:
         await safe_edit(q, "📭 No orders yet!",
             reply_markup=KM([IB("🏪 Browse", "vendors")], [IB("⬅️ Back", "menu")])); return
@@ -938,7 +952,7 @@ async def view_wishlist(u, ctx):
 
 async def wishlist_add(u, ctx):
     q = u.callback_query; uid = q.from_user.id; pid = int(q.data.split("_")[2])
-    qx("INSERT OR IGNORE INTO wishlist(user_id,product_id) VALUES(?,?)", (uid, pid))
+    qx("INSERT INTO wishlist(user_id,product_id) VALUES(?,?)", (uid, pid))
     await q.answer("❤️ Added to wishlist!", show_alert=True)
 
 async def wishlist_rm(u, ctx):
@@ -969,12 +983,15 @@ async def show_news(u, ctx):
 async def show_loyalty(u, ctx):
     q = u.callback_query; uid = q.from_user.id; lo = get_loyalty(uid); pts = lo["points"]
     bar = "█" * (pts // 50) + "░" * (10 - pts // 50)
-    remaining = 500 - pts
+    remaining = 500 - pts; orders_needed = -(-remaining // 25)  # ceiling division
     await safe_edit(q,
         f"🎁 <b>Loyalty Rewards</b>\n━━━━━━━━━━━━━━━━━━━━{vip_label(uid)}\n\n"
-        f"⭐ <b>{pts}/500 pts</b>\n[{bar}]\n{remaining} more = <b>£1 credit</b>\n"
-        f"💳 Available: <b>£{lo['credit']:.2f}</b>\n🏆 Lifetime: <b>{lo['lifetime']} pts</b>\n\n"
-        f"<i>1 pt per £1 spent · 500 pts = £1 credit</i>",
+        f"⭐ <b>{pts}/500 pts</b>\n[{bar}]\n"
+        f"{remaining} more pts = <b>£50 store credit</b>\n"
+        f"(~{orders_needed} more orders)\n\n"
+        f"💳 Available credit: <b>£{lo['credit']:.2f}</b>\n"
+        f"🏆 Lifetime pts: <b>{lo['lifetime']}</b>\n\n"
+        f"<i>25 pts per order · 500 pts = £50 credit</i>",
         parse_mode="HTML", reply_markup=back_kb())
 
 async def show_my_ref(u, ctx):
@@ -1072,7 +1089,7 @@ async def dropchat_open(u, ctx):
 async def cmd_admin(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
     # FIX: Always register admin/vendor-admin in users table so message flows work
-    qx("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",
+    qx("INSERT INTO users(user_id,username) VALUES(?,?)",
        (uid, u.effective_user.username or ""))
     if is_vendor_admin(uid):
         v = get_vendor(uid); ctx.user_data["cur_vid"] = v["id"]
@@ -1081,7 +1098,7 @@ async def cmd_admin(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _platform_panel(u.message)
 
 async def _platform_panel(msg):
-    orders = qa("SELECT id,status,ship FROM orders ORDER BY rowid DESC LIMIT 30")
+    orders = qa("SELECT id,status,ship FROM orders ORDER BY id DESC LIMIT 30")
     unread = q1("SELECT COUNT(*) as c FROM messages WHERE reply IS NULL")["c"]
     drops = len([o for o in orders if o["ship"] == "drop" and o["status"] in ("Pending","Paid")])
     pending = [o for o in orders if o["status"] == "Pending"]
@@ -1109,7 +1126,7 @@ async def _platform_panel(msg):
 
 async def _vendor_panel(msg, v):
     vid = v["id"]
-    orders = qa("SELECT id,status,ship FROM orders WHERE vendor_id=? ORDER BY rowid DESC LIMIT 30", (vid,))
+    orders = qa("SELECT id,status,ship FROM orders WHERE vendor_id=? ORDER BY id DESC LIMIT 30", (vid,))
     unread = q1("SELECT COUNT(*) as c FROM messages WHERE reply IS NULL AND vendor_id=?", (vid,))["c"]
     drops = len([o for o in orders if o["ship"] == "drop" and o["status"] in ("Pending","Paid")])
     pending = [o for o in orders if o["status"] == "Pending"]
@@ -1191,7 +1208,7 @@ async def adm_dispatch(u, ctx):
             await ctx.bot.send_message(r["user_id"], receipt, parse_mode="HTML",
                 reply_markup=KM([IB("⭐ Leave Review", f"review_{oid}")], [IB("📦 My Orders", "orders")]))
         except: pass
-        qx("INSERT OR IGNORE INTO review_reminders(order_id,user_id,dispatched) VALUES(?,?,?)",
+        qx("INSERT INTO review_reminders(order_id,user_id,dispatched) VALUES(?,?,?)",
            (oid, r["user_id"], datetime.now().isoformat()))
     await safe_edit(q, f"🚚 Dispatched {oid}.")
 
@@ -1251,7 +1268,7 @@ async def adm_settings_cb(u, ctx):
 async def adm_report_cb(u, ctx):
     q = u.callback_query
     if not is_admin(u.effective_user.id): return
-    week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+    week_ago = (datetime.now() - timedelta(days=7))
     orders = q1("SELECT COUNT(*) as c,COALESCE(SUM(gbp),0) as s,COALESCE(SUM(platform_gbp),0) as p "
                 "FROM orders WHERE status IN ('Paid','Dispatched') AND created_at>=?", (week_ago,)) or {"c":0,"s":0,"p":0}
     new_users = q1("SELECT COUNT(*) as c FROM users WHERE joined>=?", (week_ago,)) or {"c":0}
@@ -1350,7 +1367,7 @@ async def adm_drops(u, ctx):
     vid = get_vid(ctx, uid)
     rows = qa("SELECT o.id,o.cust_name,o.status,"
               "(SELECT COUNT(*) FROM drop_chats d WHERE d.order_id=o.id) as msgs "
-              "FROM orders o WHERE o.ship='drop' AND o.vendor_id=? ORDER BY o.rowid DESC LIMIT 20", (vid,))
+              "FROM orders o WHERE o.ship='drop' AND o.vendor_id=? ORDER BY o.id DESC LIMIT 20", (vid,))
     if not rows: await safe_edit(q, "📍 No drop orders.", reply_markup=back_kb()); return
     em = {"Pending":"⏳","Paid":"✅","Dispatched":"🚚","Rejected":"❌"}
     kb = [[IB(("🔒" if gs("cc_"+o["id"],"0")=="1" else "💬") +
@@ -1377,7 +1394,7 @@ async def adm_edit_home(u, ctx):
 async def adm_admins(u, ctx):
     q = u.callback_query
     if not is_admin(u.effective_user.id): return
-    rows = qa("SELECT user_id,username FROM admins ORDER BY rowid")
+    rows = qa("SELECT user_id,username FROM admins ORDER BY id")
     txt = ("👥 <b>Admins</b>\n\n" +
            "".join(("👑" if r["user_id"] == ADMIN_ID else "🔑") +
                    f" <code>{r['user_id']}</code> @{r['username'] or '?'}\n" for r in rows))
@@ -1671,7 +1688,7 @@ async def dispute_close_cb(u, ctx):
 async def vendor_balance_cb(u, ctx):
     q = u.callback_query; uid = q.from_user.id; vid = get_vid(ctx, uid); bal = get_vendor_balance(vid)
     recent = qa("SELECT id,vendor_gbp,created_at FROM orders WHERE vendor_id=? "
-                "AND status IN ('Paid','Dispatched') ORDER BY rowid DESC LIMIT 10", (vid,))
+                "AND status IN ('Paid','Dispatched') ORDER BY id DESC LIMIT 10", (vid,))
     txt = (f"💰 <b>Your Earnings</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
            f"💳 Owed: <b>£{bal['owed']:.2f}</b>\n✅ Paid: £{bal['paid']:.2f}\n\n"
            "<b>Recent orders:</b>\n" +
@@ -1780,7 +1797,7 @@ async def cmd_invoice(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
     if not is_known(uid) and not is_admin(uid): await u.message.reply_text("Please /start first."); return
     if not ctx.args:
-        orders = qa("SELECT id,gbp,ltc FROM orders WHERE user_id=? AND status='Pending' AND ltc>0 ORDER BY rowid DESC LIMIT 5", (uid,))
+        orders = qa("SELECT id,gbp,ltc FROM orders WHERE user_id=? AND status='Pending' AND ltc>0 ORDER BY id DESC LIMIT 5", (uid,))
         if not orders: await u.message.reply_text("📭 No pending LTC orders.\nUsage: /invoice <order_id>"); return
         kb = [[IB(f"🧾 {o['id']} — £{o['gbp']:.2f} — {o['ltc']:.6f} LTC", f"show_invoice_{o['id']}")] for o in orders]
         await u.message.reply_text("🧾 <b>Pending Invoices</b>", parse_mode="HTML",
@@ -1799,7 +1816,7 @@ async def cmd_customer(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: cid=int(arg); row=q1("SELECT user_id,username,banned,vip_tier FROM users WHERE user_id=?",(cid,))
     except: row=q1("SELECT user_id,username,banned,vip_tier FROM users WHERE username=?",(arg,))
     if not row: await u.message.reply_text("❌ Not found."); return
-    cid=row["user_id"]; orders=qa("SELECT id,gbp,status,summary FROM orders WHERE user_id=? ORDER BY rowid DESC LIMIT 10",(cid,))
+    cid=row["user_id"]; orders=qa("SELECT id,gbp,status,summary FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 10",(cid,))
     spent=sum(o["gbp"] for o in orders if o["status"] in ("Paid","Dispatched")); lo=get_loyalty(cid)
     note=q1("SELECT note FROM customer_notes WHERE user_id=?",(cid,))
     banned="🚫 BANNED\n" if row.get("banned") else ""
@@ -1944,7 +1961,7 @@ async def on_message(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_banned(uid): await u.message.reply_text("🚫 You are banned."); return
     # FIX: auto-register admins/vendor-admins so they never hit the "Please /start" wall
     if is_admin(uid) or is_vendor_admin(uid):
-        qx("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",
+        qx("INSERT INTO users(user_id,username) VALUES(?,?)",
            (uid, u.effective_user.username or ""))
     elif not is_known(uid):
         await u.message.reply_text("👋 Please /start first."); return
@@ -2012,7 +2029,7 @@ async def on_message(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if v: vendor_name=v["name"]
             raw=(o.get("summary","") or "").split(",")[0].strip()
             product_name=_re.sub(r'\s+\d+(\.\d+)?g$','',raw).strip()
-        qx("INSERT OR REPLACE INTO reviews(order_id,user_id,vendor_id,vendor_name,product_name,stars,text) VALUES(?,?,?,?,?,?,?)",
+        qx("INSERT INTO reviews(order_id,user_id,vendor_id,vendor_name,product_name,stars,text) VALUES(?,?,?,?,?,?,?)",
            (oid,uid,vendor_id,vendor_name,product_name,s,txt))
         await u.message.reply_text(f"✅ {STARS.get(s,'')} Thanks for your review! 🙏",reply_markup=menu()); ctx.user_data["wf"]=None
 
@@ -2076,7 +2093,7 @@ async def on_message(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try: pct=float(parts[0].strip())/100; hrs=float(parts[1].strip()); assert 0<pct<=1 and hrs>0
         except: await u.message.reply_text("⚠️ Format: PCT,HOURS e.g. 20,4"); return
         pid=ctx.user_data.get("flash_pid"); exp=(datetime.now()+timedelta(hours=hrs)).isoformat()
-        qx("INSERT OR REPLACE INTO flash_sales(product_id,pct,expires,active) VALUES(?,?,?,1)",(pid,pct,exp))
+        qx("INSERT INTO flash_sales(product_id,pct,expires,active) VALUES(?,?,?,1)",(pid,pct,exp))
         r=q1("SELECT name FROM products WHERE id=?",(pid,))
         await u.message.reply_text(f"🔥 Flash sale: {int(pct*100)}% off {r['name'] if r else ''} for {hrs:.0f}h!",
             reply_markup=menu()); ctx.user_data["wf"]=None
@@ -2109,7 +2126,7 @@ async def on_message(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif wf=="custnote_text":
         cid=ctx.user_data.get("custnote_uid")
-        qx("INSERT OR REPLACE INTO customer_notes(user_id,note) VALUES(?,?)",(cid,txt))
+        qx("INSERT INTO customer_notes(user_id,note) VALUES(?,?)",(cid,txt))
         await u.message.reply_text("✅ Note saved.",reply_markup=menu()); ctx.user_data["wf"]=None
 
     elif wf=="drop_msg_user":
@@ -2142,7 +2159,7 @@ async def on_message(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             max_uses=int(parts[3].strip()) if len(parts)==4 else -1
         except: await u.message.reply_text("⚠️ Invalid format."); return
         vid=get_vid(ctx,uid)
-        qx("INSERT OR REPLACE INTO discount_codes(code,vendor_id,pct,active,expires,max_uses) VALUES(?,?,?,1,?,?)",
+        qx("INSERT INTO discount_codes(code,vendor_id,pct,active,expires,max_uses) VALUES(?,?,?,1,?,?)",
            (dc,vid,pct,exp,max_uses))
         await u.message.reply_text(f"✅ <code>{dc}</code> {int(pct*100)}% off added!",parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
 
@@ -2154,7 +2171,7 @@ async def on_message(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(f"✅ {emoji} {hl.escape(name)} created!",parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
 
     elif wf=="order_note":
-        oid=ctx.user_data.get("note_oid"); qx("INSERT OR REPLACE INTO order_notes(order_id,note) VALUES(?,?)",(oid,txt))
+        oid=ctx.user_data.get("note_oid"); qx("INSERT INTO order_notes(order_id,note) VALUES(?,?)",(oid,txt))
         await u.message.reply_text("✅ Note saved.",reply_markup=menu()); ctx.user_data["wf"]=None
 
     elif wf=="edit_home":
@@ -2168,7 +2185,7 @@ async def on_message(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try: new_id=int(txt.strip())
         except: await u.message.reply_text("⚠️ Numeric user_id only."); return
         if q1("SELECT 1 FROM admins WHERE user_id=?",(new_id,)): await u.message.reply_text("⚠️ Already admin."); ctx.user_data["wf"]=None; return
-        qx("INSERT OR IGNORE INTO admins(user_id,username) VALUES(?,?)",(new_id,str(new_id)))
+        qx("INSERT INTO admins(user_id,username) VALUES(?,?)",(new_id,str(new_id)))
         try:
             info=await ctx.bot.get_chat(new_id); un=info.username or info.first_name or str(new_id)
             qx("UPDATE admins SET username=? WHERE user_id=?",(un,new_id))
@@ -2205,7 +2222,7 @@ async def on_photo(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid=u.effective_user.id; wf=ctx.user_data.get("wf"); ph=u.message.photo[-1].file_id
     # FIX: auto-register admins/vendor-admins
     if is_admin(uid) or is_vendor_admin(uid):
-        qx("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",
+        qx("INSERT INTO users(user_id,username) VALUES(?,?)",
            (uid, u.effective_user.username or ""))
     elif not is_known(uid): return
     if wf=="add_photo":
@@ -2237,7 +2254,7 @@ async def ltc_payment_detector(ctx: ContextTypes.DEFAULT_TYPE):
         for order in pending:
             expected = order["ltc"]
             if expected > 0 and abs(ltc_received - expected) / expected < 0.02:
-                qx("INSERT OR IGNORE INTO ltc_transactions(txid,order_id,amount_ltc,confirmed) VALUES(?,?,?,?)",
+                qx("INSERT INTO ltc_transactions(txid,order_id,amount_ltc,confirmed) VALUES(?,?,?,?)",
                    (txid, order["id"], ltc_received, 1 if confirmations > 0 else 0))
                 qx("UPDATE orders SET status='Paid' WHERE id=?", (order["id"],))
                 add_timeline(order["id"], f"💠 Auto-detected: {ltc_received:.6f} LTC · {confirmations} confirmations")
@@ -2342,7 +2359,7 @@ async def router(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_banned(uid): await q.answer("🚫 You are banned.",show_alert=True); return
     # FIX: auto-register admin/vendor-admin so they can use all buttons without /start
     if is_admin(uid) or is_vendor_admin(uid):
-        qx("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",
+        qx("INSERT INTO users(user_id,username) VALUES(?,?)",
            (uid, u.effective_user.username or ""))
     elif not is_known(uid):
         await q.answer("❌ Please /start first.",show_alert=True); return
