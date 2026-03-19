@@ -37,8 +37,13 @@ from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton as _IB
 from telegram.ext import (ApplicationBuilder, CommandHandler, CallbackQueryHandler,
                            MessageHandler, ContextTypes, filters)
+import os
 import psycopg2
-import psycopg2.extras
+
+DB = os.getenv("DATABASE_URL")
+
+def db():
+    return psycopg2.connect(DB, sslmode='require')
 
 def IB(t, c): return _IB(text=t, callback_data=c)
 
