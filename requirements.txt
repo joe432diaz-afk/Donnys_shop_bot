@@ -1,3 +1,4 @@
 psycopg2-binary
 python-telegram-bot[job-queue]
 requests
+cryptography 
