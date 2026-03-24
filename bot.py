@@ -1050,6 +1050,13 @@ async def dropchat_msg_start(u, ctx):
 async def dropchat_reply_start(u, ctx):
     q = u.callback_query; uid = q.from_user.id
     if not is_admin(uid) and not is_vendor_admin(uid): return
+    v = get_vendor(uid)
+    # Super-admin (ADMIN_ID) with no vendor gets full access
+    if uid != ADMIN_ID:
+        if not v: return
+        order = q1("SELECT vendor_id FROM orders WHERE id=?", (q.data[4:],))
+        if not order or order["vendor_id"] != v["id"]:
+            await q.answer("❌ Not your order.", show_alert=True); return
     oid = q.data[4:]; ctx.user_data.update({"dc_oid": oid, "wf": "drop_msg_admin"})
     o = q1("SELECT cust_name FROM orders WHERE id=?", (oid,))
     cust_name = dec(o["cust_name"]) if o else ""
@@ -1061,6 +1068,12 @@ async def dropchat_reply_start(u, ctx):
 async def dropchat_history(u, ctx):
     q = u.callback_query; uid = q.from_user.id
     if not is_admin(uid) and not is_vendor_admin(uid): return
+    v = get_vendor(uid)
+    if uid != ADMIN_ID:
+        if not v: return
+        order = q1("SELECT vendor_id FROM orders WHERE id=?", (q.data[4:],))
+        if not order or order["vendor_id"] != v["id"]:
+            await q.answer("❌ Not your order.", show_alert=True); return
     oid = q.data[4:]; closed = gs("cc_"+oid, "0") == "1"
     o = q1("SELECT cust_name,summary,gbp FROM orders WHERE id=?", (oid,))
     note = q1("SELECT note FROM order_notes WHERE order_id=?", (oid,))
@@ -1075,7 +1088,16 @@ async def dropchat_history(u, ctx):
         reply_markup=dc_admin_kb(oid) if not closed else KM([IB("🔓 Reopen", f"dco_{oid}")]))
 
 async def dropchat_close(u, ctx):
-    q = u.callback_query; oid = q.data.split("_", 1)[1]; ss("cc_"+oid, "1")
+    q = u.callback_query; uid = q.from_user.id
+    oid = q.data.split("_", 1)[1]
+    if not is_admin(uid) and not is_vendor_admin(uid): return
+    v = get_vendor(uid)
+    if uid != ADMIN_ID:
+        if not v: return
+        order = q1("SELECT vendor_id FROM orders WHERE id=?", (oid,))
+        if not order or order["vendor_id"] != v["id"]:
+            await q.answer("❌ Not your order.", show_alert=True); return
+    ss("cc_"+oid, "1")
     r = q1("SELECT user_id FROM orders WHERE id=?", (oid,))
     if r:
         try: await ctx.bot.send_message(r["user_id"], f"🔒 Chat {oid} closed.", reply_markup=menu())
