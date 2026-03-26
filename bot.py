@@ -337,7 +337,9 @@ def fq(q): return f"{int(q)}g/qty" if q == int(q) else f"{q}g/qty"
 def ft(t):
     ppg = round(t["price"] / t["qty"], 2) if t["qty"] else t["price"]
     qty_int = int(t["qty"]) if t["qty"] == int(t["qty"]) else t["qty"]
-    return f"⚖️ {qty_int}g/qty · £{t['price']:.2f} (£{ppg}/g)"
+    min_q = t.get("min_qty", 1)
+    min_txt = f" · min {min_q}x" if min_q > 1 else ""
+    return f"⚖️ {qty_int}g/qty · £{t['price']:.2f} (£{ppg}/g){min_txt}"
 def KM(*rows): return InlineKeyboardMarkup(list(rows))
 def back_kb():   return KM([IB("⬅️ Back", "menu")])
 def cancel_kb(): return KM([IB("❌ Cancel", "menu")])
@@ -354,10 +356,9 @@ def ltc_price(force=False):
     except:
         return LTC_CACHE["rate"] if LTC_CACHE["rate"] > 0 else 60.0
 
-def is_open(cutoff=11):    n = datetime.now(); return n.weekday() < 6 and n.hour < cutoff
+def is_open(cutoff=11):    return True  # Always open
 def open_badge(cutoff=11):
-    return (f"🟢 <b>Open</b> · Orders close {cutoff}am Mon–Sat"
-            if is_open(cutoff) else "🔴 <b>Closed</b> · Opens Monday")
+    return f"🟢 <b>Open</b> · Orders close {cutoff}am Mon–Sat"
 
 def gdisc(code, vid=1):
     r = q1("SELECT pct,expires,uses,max_uses FROM discount_codes WHERE code=? AND active=1 AND vendor_id=?",
@@ -668,7 +669,9 @@ def _product_kb(pid, tiers, tier_idx, qty_mult, vid):
         tier_row.append(IB(label, f"prodsel_{pid}_{i}_{qty_mult}"))
 
     # Qty +/- row — qty_mult goes 1,2,3,4...
-    minus = IB("➖", f"prodqty_{pid}_{tier_idx}_{max(1, qty_mult-1)}")
+    min_q = t.get("min_qty", 1)
+    can_decrease = qty_mult > min_q
+    minus = IB("➖", f"prodqty_{pid}_{tier_idx}_{max(min_q, qty_mult-1)}") if can_decrease else IB("🚫", "noop")
     count = IB(f"{qty_mult}x = {total_g}g/qty · £{total_price:.2f}", "noop")
     plus  = IB("➕", f"prodqty_{pid}_{tier_idx}_{qty_mult+1}")
 
@@ -733,7 +736,10 @@ async def product_qty_change(u, ctx):
     """User tapped + or - — update qty multiplier."""
     q = u.callback_query; parts = q.data.split("_")
     pid, tier_idx, qty_mult = int(parts[1]), int(parts[2]), int(parts[3])
-    if qty_mult < 1: await q.answer(); return
+    row2 = q1("SELECT tiers FROM products WHERE id=?", (pid,))
+    tiers_raw = ctx.user_data.get(f"tiers_{pid}") or (json.loads(row2["tiers"]) if row2 and row2.get("tiers") else TIERS[:])
+    min_q = tiers_raw[tier_idx].get("min_qty", 1) if tier_idx < len(tiers_raw) else 1
+    if qty_mult < min_q: await q.answer(f"⚠️ Minimum is {min_q}x for this size.", show_alert=True); return
     row = q1("SELECT vendor_id,tiers,stock FROM products WHERE id=? AND hidden=0", (pid,))
     if not row: await q.answer("❌ Not available.", show_alert=True); return
     tiers = ctx.user_data.get(f"tiers_{pid}") or (json.loads(row["tiers"]) if row.get("tiers") else TIERS[:])
@@ -1085,19 +1091,108 @@ async def show_news(u, ctx):
     else:
         await safe_edit(q, txt[:4000], parse_mode="HTML", reply_markup=kb)
 
+async def show_bundles(u, ctx):
+    """Customer-facing bundle browser."""
+    q = u.callback_query; uid = q.from_user.id
+    vs = qa("SELECT id,name,emoji FROM vendors WHERE active=1 ORDER BY id")
+    # Show bundles across all vendors
+    bundles = qa("SELECT b.id,b.name,b.description,b.price,b.vendor_id,v.emoji,v.name as vname "
+                 "FROM bundles b JOIN vendors v ON b.vendor_id=v.id "
+                 "WHERE b.active=1 ORDER BY b.id")
+    if not bundles:
+        await safe_edit(q, "🎁 No bundles available yet.", reply_markup=back_kb()); return
+    txt = "🎁 <b>Bundle Deals</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    kb = []
+    for b in bundles:
+        txt += (
+            f"{b['emoji']} <b>{hl.escape(b['name'])}</b> — <b>£{b['price']:.2f}</b>\n"
+            f"<i>{hl.escape(b['description'])}</i>\n\n")
+        kb.append([IB(f"🛒 Add Bundle: {b['name']} £{b['price']:.2f}", f"bundle_add_{b['id']}")])
+    kb.append([IB("⬅️ Back", "menu")])
+    await safe_edit(q, txt[:4000], parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def bundle_add_to_cart(u, ctx):
+    """Add all bundle products to cart at bundle price."""
+    q = u.callback_query; uid = q.from_user.id
+    bid = int(q.data.split("bundle_add_")[1])
+    b = q1("SELECT * FROM bundles WHERE id=? AND active=1", (bid,))
+    if not b: await q.answer("❌ Bundle not found.", show_alert=True); return
+    pids = json.loads(b["product_ids"]) if b.get("product_ids") else []
+    if not pids: await q.answer("❌ Bundle is empty.", show_alert=True); return
+    # Split bundle price equally across items
+    per_item = round(b["price"] / len(pids), 2)
+    added = 0
+    for pid in pids:
+        row = q1("SELECT id,vendor_id,stock FROM products WHERE id=? AND hidden=0", (pid,))
+        if not row: continue
+        if row.get("stock", -1) == 0: continue
+        qx("INSERT INTO cart(user_id,product_id,vendor_id,qty,price) VALUES(?,?,?,?,?)",
+           (uid, pid, b["vendor_id"], 1.0, per_item))
+        added += 1
+    await q.answer(f"✅ {added} items from bundle added to basket!", show_alert=True)
+
+async def adm_bundles(u, ctx):
+    """Admin bundle management."""
+    q = u.callback_query; uid = q.from_user.id
+    if not is_admin(uid) and not is_vendor_admin(uid): return
+    vid = get_vid(ctx, uid)
+    bundles = qa("SELECT * FROM bundles WHERE vendor_id=? ORDER BY id", (vid,))
+    txt = "🎁 <b>Bundles</b>\n"
+
+
+    if bundles:
+        txt += "".join(
+            f"{'✅' if b['active'] else '❌'} <b>{hl.escape(b['name'])}</b> — £{b['price']:.2f}\n"
+            f"Products: {b['product_ids']}\n\n"
+            for b in bundles)
+
+
+async def adm_bundle_new(u, ctx):
+    q = u.callback_query; ctx.user_data["wf"] = "bundle_new"
+    vid = get_vid(ctx, u.callback_query.from_user.id)
+    prods = qa("SELECT id,name FROM products WHERE vendor_id=? AND hidden=0 ORDER BY id", (vid,))
+    prod_list = "\n".join(f"#{r['id']} {r['name']}" for r in prods)
+    await safe_edit(q,
+        f"🎁 <b>Create Bundle</b>\n\nAvailable products:\n{prod_list}\n\n"
+        "Send: <code>Bundle Name|description|price|id1,id2,id3</code>\n"
+        "Example: <code>Starter Pack|Great value trio|25.00|1,2,3</code>",
+        parse_mode="HTML", reply_markup=cancel_kb())
+
+async def adm_bundle_toggle(u, ctx):
+    q = u.callback_query; bid = int(q.data.split("adm_bundle_toggle_")[1])
+    b = q1("SELECT active FROM bundles WHERE id=?", (bid,))
+    if b: qx("UPDATE bundles SET active=? WHERE id=?", (0 if b["active"] else 1, bid))
+    await adm_bundles(u, ctx)
+
+async def adm_bundle_del(u, ctx):
+    q = u.callback_query; bid = int(q.data.split("adm_bundle_del_")[1])
+    qx("DELETE FROM bundles WHERE id=?", (bid,))
+    await adm_bundles(u, ctx)
+
 async def show_loyalty(u, ctx):
     q = u.callback_query; uid = q.from_user.id; lo = get_loyalty(uid); pts = lo["points"]
     bar = "█" * (pts // 50) + "░" * (10 - pts // 50)
     remaining = 500 - pts; orders_needed = -(-remaining // 25)
+    # Anonymous leaderboard — top 5 by lifetime points
+    leaders = qa("SELECT user_id,lifetime FROM loyalty ORDER BY lifetime DESC LIMIT 5")
+    medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
+    board = ""
+    for i, l in enumerate(leaders):
+        marker = " 👈 You" if l["user_id"] == uid else ""
+        # Anonymise: show only last 3 digits of user_id
+        anon = f"User ...{str(l['user_id'])[-3:]}"
+        board += f"{medals[i]} {anon} — {l['lifetime']} pts{marker}\n"
+    board_txt = f"\n\n🏆 <b>Top Earners</b>\n{board}" if board else ""
     await safe_edit(q,
         f"🎁 <b>Loyalty Rewards</b>\n━━━━━━━━━━━━━━━━━━━━{vip_label(uid)}\n\n"
         f"⭐ <b>{pts}/500 pts</b>\n[{bar}]\n"
         f"{remaining} more pts = <b>£50 store credit</b>\n"
         f"(~{orders_needed} more orders)\n\n"
         f"💳 Available credit: <b>£{lo['credit']:.2f}</b>\n"
-        f"🏆 Lifetime pts: <b>{lo['lifetime']}</b>\n\n"
+        f"🏆 Lifetime pts: <b>{lo['lifetime']}</b>"
+        f"{board_txt}\n\n"
         f"<i>25 pts per order · 500 pts = £50 credit</i>",
-        parse_mode="HTML", reply_markup=back_kb())
+        parse_mode="HTML", reply_markup=KM([IB("🎁 Bundles", "bundles")], [IB("⬅️ Back", "menu")]))
 
 async def show_my_ref(u, ctx):
     q = u.callback_query; uid = q.from_user.id; rc = get_ref(uid)
@@ -1218,6 +1313,84 @@ async def dropchat_open(u, ctx):
 # ══════════════════════════════════════════════════════════════════════════════
 # ADMIN PANEL
 # ══════════════════════════════════════════════════════════════════════════════
+async def cmd_owner(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Owner-only panel — full platform control."""
+    if u.effective_user.id != ADMIN_ID:
+        await u.message.reply_text("🚫 Owner only."); return
+    vendors = qa("SELECT id,name,emoji,admin_user_id FROM vendors ORDER BY id")
+    admins  = qa("SELECT user_id,username FROM admins ORDER BY user_id")
+    kb = [
+        [IB("🏪 Vendors","own_vendors"),        IB("➕ Add Vendor","adm_addvendor")],
+        [IB("👥 All Admins","adm_admins"),       IB("➕ Add Admin","adm_addadmin")],
+        [IB("🔗 Assign Admin→Vendor","own_assign")],
+        [IB("🚫 Bans","adm_bans"),               IB("📝 Cust Notes","adm_custnotes")],
+        [IB("⚙️ Settings","adm_settings"),       IB("🔗 Referral Reward","adm_ref_settings")],
+        [IB("💠 LTC Wallet","ltccheck_btn"),      IB("📈 Weekly Report","adm_report")],
+        [IB("💰 All Payouts","adm_payouts"),      IB("⚠️ Disputes","adm_disputes")],
+        [IB("📊 Platform Stats","adm_stats"),     IB("🏠 Edit Home","adm_edit_home")],
+    ]
+    vlist = "\n".join(f"{v['emoji']} <b>{hl.escape(v['name'])}</b> #{v['id']} → admin <code>{v['admin_user_id'] or 'none'}</code>" for v in vendors)
+    alist = "\n".join(f"{'👑' if r['user_id']==ADMIN_ID else '🔑'} @{r['username'] or '?'} <code>{r['user_id']}</code>" for r in admins)
+    await u.message.reply_text(
+        f"👑 <b>Owner Panel — PhiVara Network</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>Vendors:</b>\n{vlist}\n\n"
+        f"<b>Admins:</b>\n{alist}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def own_vendors_cb(u, ctx):
+    q = u.callback_query
+    if q.from_user.id != ADMIN_ID: return
+    await adm_vendors(u, ctx)
+
+async def own_assign_cb(u, ctx):
+    """Owner assigns an admin user to a vendor."""
+    q = u.callback_query
+    if q.from_user.id != ADMIN_ID: return
+    vendors = qa("SELECT id,name,emoji FROM vendors ORDER BY id")
+    await safe_edit(q, "🔗 <b>Assign Admin to Vendor</b>\n\nChoose vendor:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[IB(f"{v['emoji']} {v['name']}", f"own_assign_v_{v['id']}")] for v in vendors] +
+            [[IB("⬅️ Back", "menu")]]))
+
+async def own_assign_vendor_cb(u, ctx):
+    """Owner chose a vendor — now pick which admin to assign."""
+    q = u.callback_query
+    if q.from_user.id != ADMIN_ID: return
+    vid = int(q.data.split("own_assign_v_")[1])
+    v = q1("SELECT name FROM vendors WHERE id=?", (vid,))
+    ctx.user_data["assign_vid"] = vid
+    admins = qa("SELECT user_id,username FROM admins WHERE user_id!=? ORDER BY user_id", (ADMIN_ID,))
+    if not admins:
+        await safe_edit(q, "⚠️ No other admins to assign. Add one first via 👥 Admins.",
+            reply_markup=back_kb()); return
+    await safe_edit(q,
+        f"🔗 Assign admin to <b>{hl.escape(v['name'])}</b>\n\nChoose admin:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[IB(f"@{r['username'] or r['user_id']}", f"own_assign_a_{r['user_id']}")] for r in admins] +
+            [[IB("⬅️ Back", "own_assign")]]))
+
+async def own_assign_admin_cb(u, ctx):
+    """Owner confirmed admin→vendor assignment."""
+    q = u.callback_query
+    if q.from_user.id != ADMIN_ID: return
+    admin_uid = int(q.data.split("own_assign_a_")[1])
+    vid = ctx.user_data.get("assign_vid")
+    if not vid: await q.answer("❌ No vendor selected.", show_alert=True); return
+    qx("UPDATE vendors SET admin_user_id=? WHERE id=?", (admin_uid, vid))
+    v = q1("SELECT name FROM vendors WHERE id=?", (vid,))
+    a = q1("SELECT username FROM admins WHERE user_id=?", (admin_uid,))
+    try:
+        await ctx.bot.send_message(admin_uid,
+            f"🎉 You've been assigned as admin of <b>{hl.escape(v['name'] if v else '?')}</b>!\n"
+            f"Use /admin to access your vendor panel.",
+            parse_mode="HTML")
+    except: pass
+    await safe_edit(q,
+        f"✅ @{a['username'] if a else admin_uid} assigned to <b>{hl.escape(v['name'] if v else '?')}</b>!",
+        parse_mode="HTML", reply_markup=back_kb())
+
 async def cmd_admin(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
     qx("INSERT INTO users(user_id,username) VALUES(?,?) ON CONFLICT DO NOTHING",
@@ -1252,6 +1425,7 @@ async def _platform_panel(msg):
         [IB("👥 Admins","adm_admins"),          IB("🏠 Edit Home","adm_edit_home"),IB("📝 Cust Notes","adm_custnotes")],
         [IB("⚙️ Settings","adm_settings"),      IB("📈 Weekly Report","adm_report")],
         [IB("📦 All Orders","adm_orders"),       IB("🔗 Referral Reward","adm_ref_settings")],
+        [IB("🎁 Bundles","adm_bundles"),          IB("💬 All Messages","adm_msgs")],
     ]
     await msg.reply_text("🔷 <b>PhiVara Network — Admin v5.1 🔒</b>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
@@ -1465,6 +1639,16 @@ async def adm_vendor_cutoff(u, ctx):
         f"Send a number (e.g. <code>11</code> for 11am, <code>14</code> for 2pm):",
         parse_mode="HTML", reply_markup=cancel_kb())
 
+async def adm_edit_store_name(u, ctx):
+    """Vendor can rename their own store."""
+    q = u.callback_query; uid = q.from_user.id
+    if not is_admin(uid) and not is_vendor_admin(uid): return
+    vid = get_vid(ctx, uid)
+    v = q1("SELECT name FROM vendors WHERE id=?", (vid,))
+    ctx.user_data.update({"wf": "edit_store_name", "store_name_vid": vid})
+    await safe_edit(q,
+        f"🏪 <b>Rename Your Store</b>\n\nCurrent: <b>{hl.escape(v['name'] if v else '?')}</b>\n\nSend new store name:",
+        parse_mode="HTML", reply_markup=cancel_kb())
 async def adm_edit_about(u, ctx):
     """Let vendor admin edit their about/description page."""
     q = u.callback_query; uid = q.from_user.id
@@ -1553,14 +1737,43 @@ async def adm_togglevend(u, ctx):
 async def adm_msgs(u, ctx):
     q = u.callback_query; uid = q.from_user.id
     if not is_admin(uid) and not is_vendor_admin(uid): return
-    vid = get_vid(ctx, uid)
-    rows = qa("SELECT id,username,message,reply FROM messages WHERE vendor_id=? ORDER BY id DESC LIMIT 15", (vid,))
+    # ADMIN_ID sees all; vendor admins see only their vendor
+    if uid == ADMIN_ID:
+        rows = qa("SELECT m.id,m.username,m.message,m.reply,m.vendor_id,v.name as vname "
+                  "FROM messages m LEFT JOIN vendors v ON m.vendor_id=v.id "
+                  "ORDER BY m.id DESC LIMIT 30")
+    else:
+        vid = get_vid(ctx, uid)
+        rows = qa("SELECT id,username,message,reply,vendor_id,NULL as vname "
+                  "FROM messages WHERE vendor_id=? ORDER BY id DESC LIMIT 15", (vid,))
     if not rows: await safe_edit(q, "📭 No messages.", reply_markup=back_kb()); return
-    txt = ("💬 <b>Messages</b>\n\n" +
-           "".join(("✅" if r["reply"] else "⏳") +
-                   f" #{r['id']} @{r['username'] or '?'}\n{hl.escape(dec(r['message'])[:70])}\n/reply {r['id']}\n\n"
-                   for r in rows))
-    await safe_edit(q, txt[:4000], parse_mode="HTML", reply_markup=back_kb())
+    txt = "💬 <b>Messages</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    kb = []
+    for r in rows:
+        status = "✅" if r["reply"] else "⏳"
+        vname = f" [{hl.escape(r['vname'])}]" if r.get("vname") else ""
+        txt += f"{status}{vname} #{r['id']} @{r['username'] or '?'}\n{hl.escape(dec(r['message'])[:80])}\n\n"
+        if not r["reply"]:
+            kb.append([IB(f"↩️ Reply #{r['id']} — @{r['username'] or '?'}", f"msg_reply_{r['id']}")])
+    kb.append([IB("⬅️ Back", "menu")])
+    await safe_edit(q, txt[:4000], parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def msg_reply_start(u, ctx):
+    """Inline reply to a message from the messages panel."""
+    q = u.callback_query; uid = q.from_user.id
+    mid = int(q.data.split("msg_reply_")[1])
+    row = q1("SELECT id,username,message,vendor_id FROM messages WHERE id=?", (mid,))
+    if not row: await q.answer("❌ Not found.", show_alert=True); return
+    # Vendor ownership check
+    if uid != ADMIN_ID:
+        v = get_vendor(uid)
+        if not v or row["vendor_id"] != v["id"]:
+            await q.answer("❌ Not your message.", show_alert=True); return
+    ctx.user_data.update({"wf": "inline_msg_reply", "reply_mid": mid})
+    await safe_edit(q,
+        f"↩️ <b>Reply to @{row['username'] or '?'}:</b>\n"
+        f"<i>{hl.escape(dec(row['message'])[:200])}</i>\n\nType your reply:",
+        parse_mode="HTML", reply_markup=cancel_kb())
 
 async def adm_rev_cb(u, ctx):
     q = u.callback_query
@@ -1851,7 +2064,8 @@ async def adm_show_tiers(u, ctx):
     tiers = json.loads(r["tiers"]) if r.get("tiers") else TIERS[:]
     await q.message.reply_text(
         f"⚖️ <b>{hl.escape(r['name'])}</b>\n\n" + "".join(ft(t)+"\n" for t in tiers) +
-        "\nSend new tiers (qty,price per line) or /cancel", parse_mode="HTML")
+        "\nSend new tiers per line:\n<code>qty,price</code> or <code>qty,price,min_qty</code>\n""Example: <code>3.5,35,1</code> or <code>7,60,2</code>\n/cancel to abort",
+        parse_mode="HTML")
 
 async def adm_flash_list(u, ctx):
     q = u.callback_query; uid = q.from_user.id
@@ -2243,8 +2457,12 @@ async def on_message(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pid=ctx.user_data.get("tpid"); new=[]; errs=[]
         for i,line in enumerate(txt.splitlines(),1):
             p=line.strip().split(",")
-            try: assert len(p)==2; q2,pr=float(p[0]),float(p[1]); assert q2>0 and pr>0; new.append({"qty":q2,"price":pr})
-            except: errs.append(f"Line {i}: invalid")
+            try:
+                assert len(p) in (2,3)
+                q2,pr=float(p[0]),float(p[1]); assert q2>0 and pr>0
+                mq=int(p[2]) if len(p)==3 else 1; assert mq>=1
+                new.append({"qty":q2,"price":pr,"min_qty":mq})
+            except: errs.append(f"Line {i}: invalid — use qty,price or qty,price,min_qty")
         if errs or not new: await u.message.reply_text("❌ "+("\n".join(errs or ["No valid tiers."]))); return
         new.sort(key=lambda t:t["qty"])
         qx("UPDATE products SET tiers=? WHERE id=?",(json.dumps(new),pid))
@@ -2382,6 +2600,36 @@ async def on_message(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         vid=ctx.user_data.get("cutoff_vid",1)
         qx("UPDATE vendors SET cutoff_hour=? WHERE id=?",(hr,vid))
         await u.message.reply_text(f"✅ Cutoff set to {hr}:00.",reply_markup=menu()); ctx.user_data["wf"]=None
+
+    elif wf=="inline_msg_reply":
+        mid=ctx.user_data.get("reply_mid")
+        row=q1("SELECT user_id,username,message FROM messages WHERE id=?",(mid,))
+        if not row: await u.message.reply_text("❌ Not found."); ctx.user_data["wf"]=None; return
+        qx("UPDATE messages SET reply=? WHERE id=?",(enc(txt),mid))
+        try:
+            await ctx.bot.send_message(row["user_id"],
+                f"💬 <b>Reply to your message</b>\n<i>{hl.escape(dec(row['message'])[:100])}</i>\n\n✉️ {hl.escape(txt)}",
+                parse_mode="HTML",reply_markup=menu())
+            await u.message.reply_text(f"✅ Replied to @{row['username'] or mid}.",reply_markup=menu())
+        except Exception as e: await u.message.reply_text(f"❌ Could not send: {e}")
+        ctx.user_data["wf"]=None
+
+    elif wf=="bundle_new":
+        parts=[p.strip() for p in txt.split("|")]
+        if len(parts)!=4: await u.message.reply_text("⚠️ Format: Name|description|price|id1,id2,id3"); return
+        try: price=float(parts[2]); pids=json.dumps([int(x.strip()) for x in parts[3].split(",")])
+        except: await u.message.reply_text("⚠️ Invalid price or product IDs."); return
+        vid=get_vid(ctx,uid)
+        qxi("INSERT INTO bundles(vendor_id,name,description,product_ids,price,active) VALUES(?,?,?,?,?,1)",
+            (vid,parts[0],parts[1],pids,price))
+        await u.message.reply_text(f"✅ Bundle <b>{hl.escape(parts[0])}</b> created!",parse_mode="HTML",reply_markup=menu())
+        ctx.user_data["wf"]=None
+
+    elif wf=="edit_store_name":
+        vid=ctx.user_data.get("store_name_vid",1)
+        if not txt.strip(): await u.message.reply_text("⚠️ Name cannot be empty."); return
+        qx("UPDATE vendors SET name=? WHERE id=?",(txt.strip(),vid))
+        await u.message.reply_text(f"✅ Store renamed to <b>{hl.escape(txt.strip())}</b>!",parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
 
     elif wf=="edit_about":
         vid=ctx.user_data.get("about_vid",1)
@@ -2582,6 +2830,12 @@ async def router(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "adm_ref_settings":  lambda: adm_ref_settings(u,ctx),
         "adm_edit_about":    lambda: adm_edit_about(u,ctx),
         "adm_cutoff":        lambda: adm_vendor_cutoff(u,ctx),
+        "adm_rename_store":  lambda: adm_edit_store_name(u,ctx),
+        "adm_bundles":       lambda: adm_bundles(u,ctx),
+        "adm_bundle_new":    lambda: adm_bundle_new(u,ctx),
+        "own_vendors":       lambda: own_vendors_cb(u,ctx),
+        "own_assign":        lambda: own_assign_cb(u,ctx),
+        "bundles":           lambda: show_bundles(u,ctx),
         "vendor_balance":    lambda: vendor_balance_cb(u,ctx),
         "vendor_payout_req": lambda: vendor_payout_req(u,ctx),
         "ltccheck_btn":      lambda: ltccheck_btn_cb(u,ctx),
@@ -2684,6 +2938,7 @@ def main():
         ("set",        cmd_set),
         ("top",        cmd_top),
         ("copy",       cmd_copy),
+        ("owner",      cmd_owner),
     ]: app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(CallbackQueryHandler(router))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
