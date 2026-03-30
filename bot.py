@@ -286,6 +286,30 @@ def init_db():
     migrations = [
         "ALTER TABLE vendors ADD COLUMN IF NOT EXISTS about TEXT DEFAULT ''",
         "ALTER TABLE vendors ADD COLUMN IF NOT EXISTS cutoff_hour INTEGER DEFAULT 11",
+        """CREATE TABLE IF NOT EXISTS vendor_holiday(
+            vendor_id INTEGER PRIMARY KEY,
+            from_date TEXT, to_date TEXT,
+            message TEXT DEFAULT '')
+        """,
+        """CREATE TABLE IF NOT EXISTS product_qa(
+            id SERIAL PRIMARY KEY,
+            product_id INTEGER, user_id BIGINT,
+            question TEXT, answer TEXT DEFAULT '',
+            answered INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT NOW())
+        """,
+        """CREATE TABLE IF NOT EXISTS customer_tags(
+            user_id BIGINT, tag TEXT,
+            PRIMARY KEY(user_id, tag))
+        """,
+        """CREATE TABLE IF NOT EXISTS product_waitlist(
+            user_id BIGINT, product_id INTEGER,
+            created_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY(user_id, product_id))
+        """,
+        """CREATE TABLE IF NOT EXISTS order_customer_notes(
+            order_id TEXT PRIMARY KEY, note TEXT)
+        """,
     ]
     for m in migrations:
         try: cur.execute(m); conn.commit()
@@ -358,7 +382,7 @@ def ltc_price(force=False):
 
 def is_open(cutoff=11):    return True  # Always open
 def open_badge(cutoff=11):
-    return f"🟢 <b>Open</b> · Orders close {cutoff}am Mon–Sat"
+    return f"🟢 <b>Open</b> · Comms close {cutoff}am Mon–Sat"
 
 def gdisc(code, vid=1):
     r = q1("SELECT pct,expires,uses,max_uses FROM discount_codes WHERE code=? AND active=1 AND vendor_id=?",
@@ -474,6 +498,8 @@ def build_invoice(order_id):
             else:
                 rate_txt = "\n⚠️ Rate may have expired — contact us"
         except: pass
+    cust_note_row = q1("SELECT note FROM order_customer_notes WHERE order_id=?", (order_id,))
+    cust_note_disp = dec(cust_note_row["note"]) if cust_note_row else ""
     txt = (f"🧾 <b>INVOICE</b>\n{sep}\n"
            f"🏪 <b>{hl.escape(vendor['name'] if vendor else 'PhiVara')}</b>\n"
            f"<i>via PhiVara Network</i>\n{sep}\n"
@@ -482,8 +508,9 @@ def build_invoice(order_id):
            f"👤 {hl.escape(cust_name)}\n"
            f"🏠 {hl.escape(address)}\n"
            f"🚚 {sl}\n{sep}\n"
-           f"🛍️ {hl.escape(summary)}\n{sep}\n"
-           f"💷 <b>Total: £{o['gbp']:.2f}</b>\n")
+           f"🛍️ {hl.escape(summary)}\n"
+           + (f"📝 {hl.escape(cust_note_disp)}\n" if cust_note_disp else "")
+           + f"{sep}\n💷 <b>Total: £{o['gbp']:.2f}</b>\n")
     if needs_ltc:
         ltc_amt = o.get("ltc", 0); ltc_rate = o.get("ltc_rate", 0)
         txt += (f"{sep}\n💎 <b>PAYMENT DETAILS</b>\n{sep}\n"
@@ -525,6 +552,8 @@ def co_kb(ud):
          IB(("✅ " if s == "drop" else "") + "📍 Local Drop (Free)", "co_ship_drop")],
         [IB(("🏷️ " + str(ud.get("co_disc_code", "")) + " ✅") if dp else "🏷️ Discount Code", "co_disc")],
     ]
+    note = ud.get("co_note", "")
+    rows.append([IB((f"📝 Note: {note[:20]}…" if len(note)>20 else f"📝 Note: {note}") if note else "📝 Add Order Note", "co_note_start")])
     if n and s and (a or s == "drop"): rows.append([IB("🛒 Place Order", "co_confirm")])
     rows.append([IB("❌ Cancel", "menu")])
     return InlineKeyboardMarkup(rows)
@@ -540,12 +569,13 @@ def co_summary(ud, uid=None):
     addr = ud.get("co_addr") or ("Not required" if s == "drop" else "—")
     dl = (f"🏷️ {ud.get('co_disc_code', '')} -£{disc:.2f}\n") if dp else ""
     bl = f"📦 Bulk deal -£{bulk_disc:.2f}\n" if bulk_disc else ""
+    nl = f"📝 Note: {ud.get('co_note', '')}\n" if ud.get("co_note") else ""
     hint = ("📍 <i>Local drop.</i>" if s == "drop" else
             "📦 <i>Enter address above.</i>" if s == "tracked24" else
             "<i>Select delivery method.</i>")
     return (f"🛒 <b>Checkout</b>\n━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 {hl.escape(ud.get('co_name') or '—')}\n"
-            f"🏠 {hl.escape(addr)}\n🚚 {sl}\n{dl}{bl}"
+            f"🏠 {hl.escape(addr)}\n🚚 {sl}\n{dl}{bl}{nl}"
             f"━━━━━━━━━━━━━━━━━━━━\n💰 <b>Total: £{total:.2f}</b>\n\n{hint}"), total
 
 def dc_user_kb(oid, closed=False):
@@ -585,7 +615,7 @@ async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     vip = vip_label(uid); extra = gs("home_extra"); el = f"\n\n{extra}" if extra else ""
     await u.message.reply_text(
         f"🔷 <b>Welcome, {name}{vip}!</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{open_badge()}\n🕙 <b>Mon–Sat · Orders close 11am</b>\n\n"
+        f"{open_badge()}\n🕙 <b>Mon–Sat · Comms close 11am</b>\n\n"
         f"Your trusted marketplace.{el}\n\n"
         f"🏪 Verified Vendors · 🔒 Discreet · ⭐ 5-Star\n\n👇 <b>Tap Browse Vendors</b>",
         parse_mode="HTML", reply_markup=menu())
@@ -602,21 +632,37 @@ async def show_vendors(u, ctx):
             [[IB(f"{v['emoji']} {v['name']}", f"vend_{v['id']}")] for v in vs] +
             [[IB("⬅️ Back", "menu")]]))
 
+def get_vendor_holiday(vid):
+    """Returns holiday row if vendor is currently on holiday, else None."""
+    h = q1("SELECT * FROM vendor_holiday WHERE vendor_id=?", (vid,))
+    if not h: return None
+    try:
+        today = datetime.now().date()
+        f = datetime.fromisoformat(h["from_date"]).date()
+        t = datetime.fromisoformat(h["to_date"]).date()
+        return h if f <= today <= t else None
+    except: return None
+
 async def show_vendor_about(u, ctx):
     """Vendor description/about page shown before browsing products."""
     q = u.callback_query; vid = int(q.data.split("_")[1])
     v = q1("SELECT * FROM vendors WHERE id=? AND active=1", (vid,))
     if not v: await safe_edit(q, "❌ Vendor not found.", reply_markup=back_kb()); return
     cutoff = v.get("cutoff_hour", 11)
+    holiday = get_vendor_holiday(vid)
     badge = open_badge(cutoff)
     about = v.get("about","").strip() or v.get("description","").strip() or "No description yet."
     rev = q1("SELECT AVG(stars) as a, COUNT(*) as c FROM reviews WHERE vendor_id=?", (vid,))
     rating_txt = f"\n⭐ {rev['a']:.1f}/5 ({rev['c']} reviews)" if rev and rev.get("c",0) > 0 else ""
+    holiday_banner = ""
+    if holiday:
+        msg = holiday.get("message","") or "Back soon!"
+        holiday_banner = f"\n🏖️ <b>On Holiday until {holiday['to_date'][:10]}</b>\n<i>{hl.escape(msg)}</i>\n"
     txt = (
         f"{v['emoji']} <b>{hl.escape(v['name'])}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{badge}\n"
-        f"🕙 Orders close {cutoff}am Mon–Sat{rating_txt}\n\n"
+        f"{badge}{holiday_banner}\n"
+        f"🕙 Comms close {cutoff}am Mon–Sat{rating_txt}\n\n"
         f"{hl.escape(about)}")
     await safe_edit(q, txt, parse_mode="HTML",
         reply_markup=KM([IB("🛍️ Browse Products", f"vend_browse_{vid}")],
@@ -683,6 +729,7 @@ def _product_kb(pid, tiers, tier_idx, qty_mult, vid):
         [[minus, count, plus]] +
         [[IB(f"🧺 Add to Basket", f"pick_{pid}_{t['qty']*qty_mult}_{total_price}")],
          [IB("🧺 View Basket", "basket"), IB("❤️ Wishlist", f"wish_add_{pid}")],
+         [IB("❓ Ask a Question", f"qa_ask_{pid}"), IB("❓ View Q&A", f"qa_view_{pid}")],
          [IB("⬅️ Back", f"vend_{vid}")]]
     )
 
@@ -694,8 +741,11 @@ async def show_product(u, ctx):
     tiers = json.loads(row["tiers"]) if row.get("tiers") else TIERS[:]
     vid = row.get("vendor_id", 1); stock = row.get("stock", -1); stock_txt = ""
     if stock == 0:
-        await safe_edit(q, f"❌ <b>{hl.escape(row['name'])}</b> is out of stock.", parse_mode="HTML",
-            reply_markup=KM([IB("❤️ Wishlist", f"wish_add_{pid}")],
+        on_waitlist = bool(q1("SELECT 1 FROM product_waitlist WHERE user_id=? AND product_id=?", (q.from_user.id, pid)))
+        wl_btn = IB("✅ On Waitlist", "noop") if on_waitlist else IB("🔔 Notify Me", f"waitlist_join_{pid}")
+        await safe_edit(q, f"❌ <b>{hl.escape(row['name'])}</b> is out of stock.\n\nJoin the waitlist to be notified when it's back!", parse_mode="HTML",
+            reply_markup=KM([wl_btn],
+                            [IB("❤️ Wishlist", f"wish_add_{pid}")],
                             [IB("⬅️ Back", f"vend_{vid}")])); return
     elif 0 < stock <= 5: stock_txt = f"\n⚠️ <b>Only {stock} left!</b>"
     fp = flash_pct(pid); flash_txt = ""
@@ -712,6 +762,11 @@ async def show_product(u, ctx):
            "".join(ft(t) + "\n" for t in tiers))
     # Store tiers in user_data so +/- callbacks can access them
     ctx.user_data[f"tiers_{pid}"] = tiers
+    # Append public Q&A to caption
+    qa_rows = qa("SELECT question,answer FROM product_qa WHERE product_id=? AND answered=1 ORDER BY id DESC LIMIT 3", (pid,))
+    if qa_rows:
+        cap += "\n❓ <b>Q&A</b>\n" + "".join(
+            f"Q: {hl.escape(r['question'][:80])}\nA: {hl.escape(r['answer'][:120])}\n\n" for r in qa_rows)
     kb = _product_kb(pid, tiers, 0, 1, vid)
     try: await q.message.delete()
     except: pass
@@ -796,6 +851,16 @@ async def checkout_start(u, ctx):
     items = qa("SELECT vendor_id,price FROM cart WHERE user_id=?", (uid,))
     if not items: await safe_edit(q, "🧺 Basket empty.", reply_markup=menu()); return
     vids = list(set(r["vendor_id"] for r in items))
+    # Block checkout if vendor is on holiday
+    for hv in vids:
+        h = get_vendor_holiday(hv)
+        if h:
+            v = q1("SELECT name FROM vendors WHERE id=?", (hv,))
+            msg = h.get("message","") or "Back soon!"
+            await safe_edit(q,
+                f"🏖️ <b>{hl.escape(v['name'] if v else 'Vendor')} is on holiday</b>\n"
+                f"Until: {h['to_date'][:10]}\n<i>{hl.escape(msg)}</i>",
+                parse_mode="HTML", reply_markup=back_kb()); return
     if len(vids) > 1:
         await safe_edit(q, "⚠️ <b>Mixed vendors</b>\n\nCheckout one vendor at a time.", parse_mode="HTML",
             reply_markup=KM([IB("🗑️ Clear", "clear_cart")], [IB("⬅️ Back", "basket")])); return
@@ -878,6 +943,9 @@ async def co_confirm(u, ctx):
         enc(name), enc(addr_disp), enc(summary),
         gbp, vendor_gbp, platform_gbp, ltc, rate, PLATFORM_LTC, "Pending", sk, rate_expires))
     add_timeline(oid, "Order placed")
+    if ud.get("co_note"):
+        qx("INSERT INTO order_customer_notes(order_id,note) VALUES(?,?) ON CONFLICT DO NOTHING",
+           (oid, enc(ud["co_note"])))
     qx("DELETE FROM cart WHERE user_id=? AND vendor_id=?", (uid, vid))
     if ud.get("co_disc_code"): use_disc(ud["co_disc_code"])
     for r in items:
@@ -890,10 +958,12 @@ async def co_confirm(u, ctx):
            (oid, uid, "vendor", greeting))
     uname = q.from_user.username or str(uid)
     # Admin notification uses plaintext (admin channel — not persisted as PII in DB)
+    cust_note_txt = ud.get("co_note", "")
     notif = (f"🛒 <b>NEW ORDER — {oid}</b>\n{vendor['emoji']} {hl.escape(vendor['name'])}\n"
              f"👤 {hl.escape(name)} (@{uname}) · 🏠 {hl.escape(addr_disp)}\n"
              f"📦 {summary} · 🚚 {SHIP[sk]['label']} · 💷 £{gbp:.2f}\n"
-             f"💰 Vendor: £{vendor_gbp:.2f} · Platform: £{platform_gbp:.2f}")
+             f"💰 Vendor: £{vendor_gbp:.2f} · Platform: £{platform_gbp:.2f}"
+             + (f"\n📝 Customer note: {hl.escape(cust_note_txt)}" if cust_note_txt else ""))
     try: await ctx.bot.send_message(CHANNEL_ID, notif, parse_mode="HTML")
     except: pass
     # Public notification — NO name/address, just amount + user ID
@@ -2254,8 +2324,12 @@ async def cmd_customer(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
          f"━━━━━━━━━━━━━━━━━━━━\n💷 £{spent:.2f} · {len(orders)} orders · {tier}\n"
          f"⭐ {lo['points']} pts · 💳 £{lo['credit']:.2f}\n")
     if note: txt+=f"📝 {hl.escape(dec(note['note']))}\n"
+    tags = qa("SELECT tag FROM customer_tags WHERE user_id=?", (cid,))
+    if tags: txt += "🏷️ " + " ".join(f"[{t['tag']}]" for t in tags) + "\n"
     txt+="\n"+"".join(f"• {o['id']} — {o['status']} — £{o['gbp']:.2f} — {hl.escape(dec(o['summary'])[:40])}\n" for o in orders)
-    await u.message.reply_text(txt[:4000],parse_mode="HTML")
+    # Tag management buttons
+    tag_kb = [[IB("🏷️ Add Tag", f"tag_add_{cid}"), IB("🗑️ Remove Tag", f"tag_rm_list_{cid}")]]
+    await u.message.reply_text(txt[:4000],parse_mode="HTML", reply_markup=InlineKeyboardMarkup(tag_kb))
 
 async def cmd_myorder(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid=u.effective_user.id
@@ -2594,6 +2668,60 @@ async def on_message(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(f"✅ <b>{hl.escape(parts[0])}</b> added as Vendor #{vid}!",
             parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
 
+    elif wf=="co_note":
+        if txt.lower()=="clear": ctx.user_data["co_note"]=""
+        else: ctx.user_data["co_note"]=txt
+        ctx.user_data["wf"]=None
+        t,_=co_summary(ctx.user_data,uid)
+        await u.message.reply_text(t,parse_mode="HTML",reply_markup=co_kb(ctx.user_data))
+
+    elif wf=="qa_ask":
+        pid=ctx.user_data.get("qa_pid")
+        qxi("INSERT INTO product_qa(product_id,user_id,question) VALUES(?,?,?)",(pid,uid,txt))
+        # Notify vendor
+        prod=q1("SELECT name,vendor_id FROM products WHERE id=?",(pid,))
+        if prod:
+            vendor=q1("SELECT admin_user_id FROM vendors WHERE id=?",(prod["vendor_id"],))
+            notify_ids=[ADMIN_ID]
+            if vendor and vendor.get("admin_user_id") and vendor["admin_user_id"]!=ADMIN_ID:
+                notify_ids.append(vendor["admin_user_id"])
+            for rid in notify_ids:
+                try: await ctx.bot.send_message(rid,
+                    f"❓ <b>New Question on {hl.escape(prod['name'])}</b>\n{hl.escape(txt[:200])}\n\nUse ❓ Q&A in admin panel to answer.",
+                    parse_mode="HTML")
+                except: pass
+        await u.message.reply_text("✅ Question submitted! You'll see the answer on the product page.",reply_markup=menu()); ctx.user_data["wf"]=None
+
+    elif wf=="qa_answer":
+        qid=ctx.user_data.get("qa_id")
+        qx("UPDATE product_qa SET answer=?,answered=1 WHERE id=?",(txt,qid))
+        # Notify the customer who asked
+        asked=q1("SELECT user_id,question,product_id FROM product_qa WHERE id=?",(qid,))
+        if asked:
+            try: await ctx.bot.send_message(asked["user_id"],
+                f"✅ <b>Your question was answered!</b>\n<i>{hl.escape(asked['question'][:100])}</i>\n\n💬 {hl.escape(txt)}",
+                parse_mode="HTML",reply_markup=KM([IB("🛍️ View Product",f"prod_{asked['product_id']}")]))
+            except: pass
+        await u.message.reply_text("✅ Answer posted!",reply_markup=menu()); ctx.user_data["wf"]=None
+
+    elif wf=="tag_add":
+        cid=ctx.user_data.get("tag_uid")
+        tag=txt.strip()[:20]
+        if not is_admin(uid): ctx.user_data["wf"]=None; return
+        qx("INSERT INTO customer_tags(user_id,tag) VALUES(?,?) ON CONFLICT DO NOTHING",(cid,tag))
+        await u.message.reply_text(f"✅ Tag <b>{hl.escape(tag)}</b> added to user {cid}.",parse_mode="HTML",reply_markup=menu()); ctx.user_data["wf"]=None
+
+    elif wf=="set_holiday":
+        vid=ctx.user_data.get("holiday_vid",1)
+        parts=txt.strip().split(None,2)
+        if len(parts)<2: await u.message.reply_text("⚠️ Format: YYYY-MM-DD YYYY-MM-DD Optional message"); return
+        from_d,to_d=parts[0],parts[1]
+        msg=parts[2] if len(parts)>2 else ""
+        try: datetime.fromisoformat(from_d); datetime.fromisoformat(to_d)
+        except: await u.message.reply_text("⚠️ Invalid date format. Use YYYY-MM-DD."); return
+        qx("INSERT INTO vendor_holiday(vendor_id,from_date,to_date,message) VALUES(?,?,?,?) ON CONFLICT(vendor_id) DO UPDATE SET from_date=?,to_date=?,message=?",(vid,from_d,to_d,msg,from_d,to_d,msg))
+        await u.message.reply_text(f"✅ Holiday mode set: {from_d} → {to_d}",reply_markup=menu()); ctx.user_data["wf"]=None
+
     elif wf=="set_cutoff":
         try: hr=int(txt.strip()); assert 1<=hr<=23
         except: await u.message.reply_text("⚠️ Enter a number 1–23 (e.g. 11 for 11am)."); return
@@ -2746,6 +2874,38 @@ async def daily_report_job(ctx: ContextTypes.DEFAULT_TYPE):
             f"💰 Platform cut: <b>£{orders['p']:.2f}</b>",parse_mode="HTML")
     except: pass
 
+async def vendor_daily_summary_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Every morning send each vendor admin a summary of yesterday's activity."""
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    today = datetime.now().strftime("%Y-%m-%d")
+    vendors = qa("SELECT id,name,emoji,admin_user_id FROM vendors WHERE active=1 AND admin_user_id IS NOT NULL")
+    for v in vendors:
+        if not v.get("admin_user_id"): continue
+        vid = v["id"]
+        stats = q1(
+            "SELECT COUNT(*) as c, COALESCE(SUM(gbp),0) as rev, COALESCE(SUM(vendor_gbp),0) as earn "
+            "FROM orders WHERE vendor_id=? AND status IN ('Paid','Dispatched') "
+            "AND created_at>=? AND created_at<?", (vid, yesterday, today)
+        ) or {"c":0,"rev":0,"earn":0}
+        pending = q1("SELECT COUNT(*) as c FROM orders WHERE vendor_id=? AND status='Pending'", (vid,)) or {"c":0}
+        unread = q1("SELECT COUNT(*) as c FROM messages WHERE vendor_id=? AND reply IS NULL", (vid,)) or {"c":0}
+        low_stock = qa("SELECT name,stock FROM products WHERE vendor_id=? AND stock>0 AND stock<=3 AND hidden=0", (vid,))
+        if stats["c"] == 0 and pending["c"] == 0: continue  # nothing to report
+        ls_txt = ""
+        if low_stock:
+            ls_txt = "\n⚠️ <b>Low Stock:</b>\n" + "".join(f"  • {hl.escape(r['name'])} ({r['stock']} left)\n" for r in low_stock)
+        try:
+            await ctx.bot.send_message(v["admin_user_id"],
+                f"{v['emoji']} <b>Daily Summary — {yesterday}</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📦 Orders yesterday: <b>{stats['c']}</b>\n"
+                f"💷 Revenue: <b>£{stats['rev']:.2f}</b>\n"
+                f"💰 Your earnings: <b>£{stats['earn']:.2f}</b>\n"
+                f"⏳ Pending orders: <b>{pending['c']}</b>\n"
+                f"💬 Unread messages: <b>{unread['c']}</b>"
+                f"{ls_txt}",
+                parse_mode="HTML")
+        except: pass
+
 async def low_stock_alert_job(ctx: ContextTypes.DEFAULT_TYPE):
     rows=qa("SELECT id,name,stock,vendor_id FROM products WHERE stock>0 AND stock<=3 AND hidden=0")
     for r in rows:
@@ -2759,6 +2919,133 @@ async def low_stock_alert_job(ctx: ContextTypes.DEFAULT_TYPE):
                 f"⚠️ <b>Low Stock Alert</b>\n🌿 {hl.escape(r['name'])} — only <b>{r['stock']}</b> left!",
                 parse_mode="HTML")
             except: pass
+
+
+# ── CUSTOMER ORDER NOTE ────────────────────────────────────────────────────────
+async def co_note_start(u, ctx):
+    q = u.callback_query
+    ctx.user_data["wf"] = "co_note"
+    cur = ctx.user_data.get("co_note", "")
+    await safe_edit(q,
+        f"📝 <b>Order Note</b>\n\nCurrent: <i>{hl.escape(cur) if cur else 'None'}</i>\n\n"
+        "Type a note for the vendor (e.g. 'leave at door') or send <b>clear</b> to remove:",
+        parse_mode="HTML", reply_markup=cancel_kb())
+
+# ── PRODUCT Q&A ────────────────────────────────────────────────────────────────
+async def qa_ask_start(u, ctx):
+    q = u.callback_query; uid = q.from_user.id
+    pid = int(q.data.split("qa_ask_")[1])
+    ctx.user_data.update({"wf": "qa_ask", "qa_pid": pid})
+    await safe_edit(q,
+        "❓ <b>Ask a Question</b>\n\nType your question about this product.\n"
+        "<i>Your username will not be shown publicly.</i>",
+        parse_mode="HTML", reply_markup=cancel_kb())
+
+async def qa_view(u, ctx):
+    q = u.callback_query
+    pid = int(q.data.split("qa_view_")[1])
+    prod = q1("SELECT name FROM products WHERE id=?", (pid,))
+    rows = qa("SELECT question,answer,answered FROM product_qa WHERE product_id=? ORDER BY id DESC", (pid,))
+    if not rows:
+        await q.answer("No questions yet.", show_alert=True); return
+    txt = f"❓ <b>Q&A — {hl.escape(prod['name'] if prod else '')}</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    for r in rows:
+        txt += f"Q: {hl.escape(r['question'])}\n"
+        txt += f"A: {hl.escape(r['answer']) if r['answered'] else '<i>Awaiting answer</i>'}\n\n"
+    await safe_edit(q, txt[:4000], parse_mode="HTML", reply_markup=back_kb())
+
+async def adm_qa_panel(u, ctx):
+    """Admin panel to answer product questions."""
+    q = u.callback_query; uid = q.from_user.id
+    if not is_admin(uid) and not is_vendor_admin(uid): return
+    vid = get_vid(ctx, uid)
+    # Get unanswered questions for this vendor's products
+    rows = qa(
+        "SELECT pq.id, pq.question, p.name as pname FROM product_qa pq "
+        "JOIN products p ON pq.product_id=p.id "
+        "WHERE p.vendor_id=? AND pq.answered=0 ORDER BY pq.id DESC LIMIT 20", (vid,))
+    if not rows:
+        await safe_edit(q, "❓ No unanswered questions.", reply_markup=back_kb()); return
+    txt = "❓ <b>Unanswered Questions</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    kb = []
+    for r in rows:
+        txt += f"#{r['id']} [{hl.escape(r['pname'])}]\n{hl.escape(r['question'][:100])}\n\n"
+        kb.append([IB(f"↩️ Answer #{r['id']}", f"qa_answer_{r['id']}")])
+    kb.append([IB("⬅️ Back", "menu")])
+    await safe_edit(q, txt[:4000], parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def qa_answer_start(u, ctx):
+    q = u.callback_query; uid = q.from_user.id
+    if not is_admin(uid) and not is_vendor_admin(uid): return
+    qid = int(q.data.split("qa_answer_")[1])
+    row = q1("SELECT question,product_id FROM product_qa WHERE id=?", (qid,))
+    if not row: await q.answer("❌ Not found.", show_alert=True); return
+    ctx.user_data.update({"wf": "qa_answer", "qa_id": qid})
+    await safe_edit(q,
+        f"↩️ <b>Answer Question</b>\n\n<i>{hl.escape(row['question'])}</i>\n\nType your answer:",
+        parse_mode="HTML", reply_markup=cancel_kb())
+
+# ── CUSTOMER TAGS ──────────────────────────────────────────────────────────────
+async def tag_add_start(u, ctx):
+    q = u.callback_query
+    if not is_admin(u.effective_user.id): return
+    cid = int(q.data.split("tag_add_")[1])
+    ctx.user_data.update({"wf": "tag_add", "tag_uid": cid})
+    existing = qa("SELECT tag FROM customer_tags WHERE user_id=?", (cid,))
+    ex_txt = ", ".join(t["tag"] for t in existing) if existing else "None"
+    await safe_edit(q,
+        f"🏷️ <b>Add Tag to User {cid}</b>\nCurrent tags: {ex_txt}\n\nSend tag name (e.g. VIP, Wholesale, Flagged):",
+        parse_mode="HTML", reply_markup=cancel_kb())
+
+async def tag_rm_list(u, ctx):
+    q = u.callback_query
+    if not is_admin(u.effective_user.id): return
+    cid = int(q.data.split("tag_rm_list_")[1])
+    tags = qa("SELECT tag FROM customer_tags WHERE user_id=?", (cid,))
+    if not tags: await q.answer("No tags to remove.", show_alert=True); return
+    await safe_edit(q, f"🗑️ Remove which tag from {cid}?",
+        reply_markup=InlineKeyboardMarkup(
+            [[IB(f"🗑️ {t['tag']}", f"tag_rm_{cid}_{t['tag']}")] for t in tags] +
+            [[IB("⬅️ Back", "menu")]]))
+
+async def tag_rm_do(u, ctx):
+    q = u.callback_query
+    if not is_admin(u.effective_user.id): return
+    parts = q.data.split("tag_rm_")[1].split("_", 1)
+    cid, tag = int(parts[0]), parts[1]
+    qx("DELETE FROM customer_tags WHERE user_id=? AND tag=?", (cid, tag))
+    await q.answer(f"✅ Tag '{tag}' removed.", show_alert=True)
+    await safe_edit(q, "✅ Tag removed.", reply_markup=back_kb())
+
+# ── WAITLIST ───────────────────────────────────────────────────────────────────
+async def waitlist_join(u, ctx):
+    q = u.callback_query; uid = q.from_user.id
+    pid = int(q.data.split("waitlist_join_")[1])
+    qx("INSERT INTO product_waitlist(user_id,product_id) VALUES(?,?) ON CONFLICT DO NOTHING", (uid, pid))
+    await q.answer("🔔 You'll be notified when this is back in stock!", show_alert=True)
+
+# ── VENDOR HOLIDAY ─────────────────────────────────────────────────────────────
+async def adm_holiday(u, ctx):
+    q = u.callback_query; uid = q.from_user.id
+    if not is_admin(uid) and not is_vendor_admin(uid): return
+    vid = get_vid(ctx, uid)
+    h = q1("SELECT * FROM vendor_holiday WHERE vendor_id=?", (vid,))
+    if h:
+        txt = (f"🏖️ <b>Holiday Mode</b>\nActive: {h['from_date'][:10]} → {h['to_date'][:10]}\n"
+               f"Message: <i>{hl.escape(h['message'] or 'None')}</i>")
+        kb = KM([IB("🗑️ Cancel Holiday", f"holiday_cancel_{vid}")], [IB("⬅️ Back", "menu")])
+    else:
+        txt = "🏖️ <b>Holiday Mode</b>\n\nNot active.\n\nTo set, send dates in this format:\n<code>YYYY-MM-DD YYYY-MM-DD Your message here</code>\nExample: <code>2026-04-01 2026-04-07 Back on the 8th!</code>"
+        ctx.user_data.update({"wf": "set_holiday", "holiday_vid": vid})
+        kb = cancel_kb()
+    await safe_edit(q, txt, parse_mode="HTML", reply_markup=kb)
+
+async def holiday_cancel(u, ctx):
+    q = u.callback_query; uid = q.from_user.id
+    if not is_admin(uid) and not is_vendor_admin(uid): return
+    vid = int(q.data.split("holiday_cancel_")[1])
+    qx("DELETE FROM vendor_holiday WHERE vendor_id=?", (vid,))
+    await safe_edit(q, "✅ Holiday mode cancelled.", reply_markup=back_kb())
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTER
@@ -2780,7 +3067,7 @@ async def router(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     ROUTES = {
-        "menu":              lambda: safe_edit(q,f"🔷 <b>PhiVara Network</b>\n━━━━━━━━━━━━━━━━━━━━\n\n{open_badge()}\n🕙 Mon–Sat · Orders close 11am\n\n👇 Browse Vendors",parse_mode="HTML",reply_markup=menu()),
+        "menu":              lambda: safe_edit(q,f"🔷 <b>PhiVara Network</b>\n━━━━━━━━━━━━━━━━━━━━\n\n{open_badge()}\n🕙 Mon–Sat · Comms close 11am\n\n👇 Browse Vendors",parse_mode="HTML",reply_markup=menu()),
         "vendors":           lambda: show_vendors(u,ctx),
         "basket":            lambda: view_basket(u,ctx),
         "orders":            lambda: view_orders(u,ctx),
@@ -2797,6 +3084,9 @@ async def router(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "co_addr_skip":      lambda: co_addr_skip(u,ctx),
         "co_disc":           lambda: co_disc_start(u,ctx),
         "co_refresh":        lambda: co_refresh_cb(u,ctx),
+        "co_note_start":     lambda: co_note_start(u,ctx),
+        "adm_qa":            lambda: adm_qa_panel(u,ctx),
+        "adm_holiday":       lambda: adm_holiday(u,ctx),
         "co_confirm":        lambda: co_confirm(u,ctx),
         "adm_vendors":       lambda: adm_vendors(u,ctx),
         "adm_addvendor":     lambda: adm_addvendor_start(u,ctx),
@@ -2949,7 +3239,8 @@ def main():
         app.job_queue.run_repeating(auto_expire_job,       interval=3600,  first=600)
         app.job_queue.run_repeating(pending_reminder_job,  interval=7200,  first=1800)
         app.job_queue.run_repeating(daily_report_job,      interval=86400, first=3600)
-        app.job_queue.run_repeating(low_stock_alert_job,   interval=3600,  first=900)
+        app.job_queue.run_repeating(low_stock_alert_job,       interval=3600,  first=900)
+        app.job_queue.run_repeating(vendor_daily_summary_job,  interval=86400, first=7200)
     else:
         print("⚠️ Job queue unavailable — install python-telegram-bot[job-queue]")
     print("🔷 PhiVara Network v5.1 — Running 🔒")
