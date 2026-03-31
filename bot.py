@@ -146,6 +146,12 @@ VIP_LEVELS = [("Diamond","💎",1500),("Gold","🥇",500),("Silver","🥈",200),
 RPP        = 5
 LTC_CACHE  = {"rate": 0.0, "ts": 0}
 
+def get_active_wallet():
+    """Return the currently active crypto wallet address."""
+    r = q1("SELECT address FROM crypto_wallets WHERE is_active=1 ORDER BY id DESC LIMIT 1")
+    return r["address"] if r else PLATFORM_LTC
+
+
 logging.basicConfig(level=logging.WARNING)
 
 # ── DATABASE INIT ──────────────────────────────────────────────────────────────
@@ -309,6 +315,13 @@ def init_db():
         """,
         """CREATE TABLE IF NOT EXISTS order_customer_notes(
             order_id TEXT PRIMARY KEY, note TEXT)
+        """,
+        """CREATE TABLE IF NOT EXISTS crypto_wallets(
+            id SERIAL PRIMARY KEY,
+            label TEXT NOT NULL,
+            address TEXT NOT NULL,
+            is_active INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT NOW())
         """,
     ]
     for m in migrations:
@@ -517,7 +530,7 @@ def build_invoice(order_id):
                 f"💠 Send exactly: <b>{ltc_amt:.6f} LTC</b>\n")
         if ltc_rate > 0:
             txt += f"📊 Rate: £{ltc_rate:.2f} per LTC{rate_txt}\n"
-        txt += (f"\n📤 <b>Send to:</b>\n<code>{PLATFORM_LTC}</code>\n\n"
+        txt += (f"\n📤 <b>Send to:</b>\n<code>{get_active_wallet()}</code>\n\n"
                 f"⚠️ <i>Exact amount only. Auto-detected on-chain.\n"
                 f"Tap below once sent as backup.</i>")
         if o["status"] == "Pending":
@@ -941,7 +954,7 @@ async def co_confirm(u, ctx):
        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
        (oid, uid, vid,
         enc(name), enc(addr_disp), enc(summary),
-        gbp, vendor_gbp, platform_gbp, ltc, rate, PLATFORM_LTC, "Pending", sk, rate_expires))
+        gbp, vendor_gbp, platform_gbp, ltc, rate, get_active_wallet(), "Pending", sk, rate_expires))
     add_timeline(oid, "Order placed")
     if ud.get("co_note"):
         qx("INSERT INTO order_customer_notes(order_id,note) VALUES(?,?) ON CONFLICT DO NOTHING",
@@ -1063,7 +1076,7 @@ async def user_paid(u, ctx):
     notif = (f"💰 <b>MANUAL PAYMENT CLAIM — {oid}</b>\n"
              f"👤 {hl.escape(cust_name)} · {hl.escape(summary)}\n"
              f"💷 £{row['gbp']:.2f} · 💠 {row['ltc']:.6f} LTC\n"
-             f"📤 Platform: <code>{PLATFORM_LTC}</code>")
+             f"📤 Platform: <code>{get_active_wallet()}</code>")
     adm_kb = InlineKeyboardMarkup([[IB("✅ Confirm", f"adm_ok_{oid}"), IB("❌ Reject", f"adm_no_{oid}")]])
     notify_ids = [ADMIN_ID]
     if vendor and vendor.get("admin_user_id") and vendor["admin_user_id"] != ADMIN_ID:
@@ -1075,7 +1088,7 @@ async def user_paid(u, ctx):
         f"⏳ <b>Payment Submitted</b>\n━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 Order <code>{oid}</code>\n🛍️ {hl.escape(summary)}\n"
         f"🚚 {sl} · 💷 £{row['gbp']:.2f}\n"
-        f"💠 {row['ltc']:.6f} LTC → <code>{PLATFORM_LTC}</code>\n"
+        f"💠 {row['ltc']:.6f} LTC → <code>{get_active_wallet()}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n✅ Awaiting verification.",
         parse_mode="HTML", reply_markup=KM([IB("📦 My Orders", "orders")]))
 
@@ -1380,6 +1393,90 @@ async def dropchat_open(u, ctx):
     await safe_edit(q, f"🔓 Chat {oid} reopened.\n\n{fmt_chat(oid)}",
         parse_mode="HTML", reply_markup=dc_user_kb(oid, False))
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CRYPTO WALLET MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+async def adm_wallets(u, ctx):
+    """Show all saved crypto wallet addresses with active indicator."""
+    q = u.callback_query; uid = q.from_user.id
+    if not is_admin(uid): return
+    wallets = qa("SELECT id,label,address,is_active FROM crypto_wallets ORDER BY id")
+    active_addr = get_active_wallet()
+    txt = "💠 <b>Crypto Wallets</b>\n────────────────────\n\n"
+    kb = []
+    if wallets:
+        for w in wallets:
+            check = "✅ " if w["is_active"] else "○ "
+            txt += f"{check}<b>{hl.escape(w['label'])}</b>\n<code>{w['address']}</code>\n\n"
+            row = [IB(f"{'✅ Active' if w['is_active'] else '☑️ Set Active'}", f"wallet_setactive_{w['id']}")]
+            if not w["is_active"]:
+                row.append(IB("🗑️ Remove", f"wallet_del_{w['id']}"))
+            kb.append(row)
+    else:
+        txt += "<i>No wallets saved yet. The hardcoded address is being used.</i>\n\n"
+        txt += f"Current: <code>{PLATFORM_LTC}</code>\n"
+    kb.append([IB("➕ Add Wallet", "wallet_add")])
+    kb.append([IB("⬅️ Back", "menu")])
+    await safe_edit(q, txt[:4000], parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def wallet_add_start(u, ctx):
+    q = u.callback_query
+    if not is_admin(u.effective_user.id): return
+    ctx.user_data["wf"] = "wallet_add"
+    await safe_edit(q,
+        "💠 <b>Add Crypto Wallet</b>\n\n"
+        "Send: <code>Label|Address</code>\n"
+        "Example: <code>Main Wallet|ltc1qxxxxx</code>",
+        parse_mode="HTML", reply_markup=cancel_kb())
+
+async def wallet_setactive(u, ctx):
+    q = u.callback_query
+    if not is_admin(u.effective_user.id): return
+    wid = int(q.data.split("wallet_setactive_")[1])
+    # Deactivate all, then activate chosen one
+    qx("UPDATE crypto_wallets SET is_active=0")
+    qx("UPDATE crypto_wallets SET is_active=1 WHERE id=?", (wid,))
+    w = q1("SELECT label,address FROM crypto_wallets WHERE id=?", (wid,))
+    await q.answer(f"✅ {w['label']} set as active wallet", show_alert=True)
+    await adm_wallets(u, ctx)
+
+async def wallet_del(u, ctx):
+    q = u.callback_query
+    if not is_admin(u.effective_user.id): return
+    wid = int(q.data.split("wallet_del_")[1])
+    w = q1("SELECT label,is_active FROM crypto_wallets WHERE id=?", (wid,))
+    if w and w["is_active"]:
+        await q.answer("❌ Cannot delete the active wallet. Set another as active first.", show_alert=True); return
+    qx("DELETE FROM crypto_wallets WHERE id=?", (wid,))
+    await q.answer("✅ Wallet removed.", show_alert=True)
+    await adm_wallets(u, ctx)
+
+async def owner_rm_vendor_wallet(u, ctx):
+    """Owner can remove a vendor's saved LTC payout address."""
+    q = u.callback_query
+    if q.from_user.id != ADMIN_ID: return
+    vendors = qa("SELECT id,name,emoji,ltc_addr FROM vendors WHERE ltc_addr IS NOT NULL AND ltc_addr!='' ORDER BY id")
+    if not vendors:
+        await safe_edit(q, "No vendor wallets on file.", reply_markup=back_kb()); return
+    txt = "🗑️ <b>Remove Vendor Wallet</b>\n\nChoose a vendor to clear their payout address:\n\n"
+    kb = []
+    for v in vendors:
+        txt += f"{v['emoji']} <b>{hl.escape(v['name'])}</b>\n<code>{v['ltc_addr'] or 'none'}</code>\n\n"
+        if v.get("ltc_addr"):
+            kb.append([IB(f"🗑️ Clear {v['name']}", f"owner_clrwallet_{v['id']}")])
+    kb.append([IB("⬅️ Back", "menu")])
+    await safe_edit(q, txt[:4000], parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def owner_clrwallet(u, ctx):
+    q = u.callback_query
+    if q.from_user.id != ADMIN_ID: return
+    vid = int(q.data.split("owner_clrwallet_")[1])
+    v = q1("SELECT name FROM vendors WHERE id=?", (vid,))
+    qx("UPDATE vendors SET ltc_addr='' WHERE id=?", (vid,))
+    await q.answer(f"✅ Wallet cleared for {v['name'] if v else vid}", show_alert=True)
+    await owner_rm_vendor_wallet(u, ctx)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ADMIN PANEL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1396,6 +1493,7 @@ async def cmd_owner(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [IB("🚫 Bans","adm_bans"),               IB("📝 Cust Notes","adm_custnotes")],
         [IB("⚙️ Settings","adm_settings"),       IB("🔗 Referral Reward","adm_ref_settings")],
         [IB("💠 LTC Wallet","ltccheck_btn"),      IB("📈 Weekly Report","adm_report")],
+        [IB("💠 Manage Wallets","adm_wallets"),    IB("🗑️ Remove Vendor Wallet","own_rm_vendor_wallet")],
         [IB("💰 All Payouts","adm_payouts"),      IB("⚠️ Disputes","adm_disputes")],
         [IB("📊 Platform Stats","adm_stats"),     IB("🏠 Edit Home","adm_edit_home")],
     ]
@@ -1488,6 +1586,7 @@ async def _platform_panel(msg):
         [IB("⭐ Feature","adm_feature"),        IB("📦 Stock","adm_stock"),        IB("🔥 Flash Sale","adm_flash")],
         [IB("🏷️ Discounts","adm_discounts"),   IB("📢 Announce","adm_announce"),  IB("📊 Stats","adm_stats")],
         [IB("🏪 Vendors","adm_vendors"),        IB("➕ Add Vendor","adm_addvendor"),IB("💠 LTC Check","ltccheck_btn")],
+        [IB("💠 Manage Wallets","adm_wallets")],
         [IB(f"💬 Msgs{(' ('+str(unread)+')') if unread else ''}","adm_msgs"),
          IB(f"📍 Drops{(' ('+str(drops)+')') if drops else ''}","adm_drops"),
          IB("📊 Reviews","adm_rev_0")],
@@ -1763,13 +1862,14 @@ async def ltccheck_btn_cb(u, ctx):
     q = u.callback_query
     if not is_admin(u.effective_user.id): return
     try:
-        data = requests.get(f"https://api.blockcypher.com/v1/ltc/main/addrs/{PLATFORM_LTC}/balance", timeout=10).json()
+        active_wallet = get_active_wallet()
+        data = requests.get(f"https://api.blockcypher.com/v1/ltc/main/addrs/{active_wallet}/balance", timeout=10).json()
         bal_ltc = data.get("balance", 0) / 100000000
         unconf  = data.get("unconfirmed_balance", 0) / 100000000
         rate    = ltc_price()
         await safe_edit(q,
             f"💠 <b>Platform Wallet</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-            f"<code>{PLATFORM_LTC}</code>\n\n"
+            f"<code>{active_wallet}</code>\n\n"
             f"✅ Confirmed: <b>{bal_ltc:.6f} LTC</b> (≈ £{bal_ltc*rate:.2f})\n"
             f"⏳ Unconfirmed: <b>{unconf:.6f} LTC</b>\n"
             f"📊 Rate: £{rate:.2f}/LTC",
@@ -2401,10 +2501,11 @@ async def cmd_dispute(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_ltccheck(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(u.effective_user.id): return
     try:
-        data=requests.get(f"https://api.blockcypher.com/v1/ltc/main/addrs/{PLATFORM_LTC}/balance",timeout=10).json()
+        active_wallet=get_active_wallet()
+        data=requests.get(f"https://api.blockcypher.com/v1/ltc/main/addrs/{active_wallet}/balance",timeout=10).json()
         bal_ltc=data.get("balance",0)/100000000; unconf=data.get("unconfirmed_balance",0)/100000000; rate=ltc_price()
         await u.message.reply_text(
-            f"💠 <b>Platform LTC Wallet</b>\n━━━━━━━━━━━━━━━━━━━━\n<code>{PLATFORM_LTC}</code>\n\n"
+            f"💠 <b>Platform LTC Wallet</b>\n━━━━━━━━━━━━━━━━━━━━\n<code>{active_wallet}</code>\n\n"
             f"✅ Confirmed: <b>{bal_ltc:.6f} LTC</b> (≈ £{bal_ltc*rate:.2f})\n"
             f"⏳ Unconfirmed: <b>{unconf:.6f} LTC</b>\n📊 Rate: £{rate:.2f}",parse_mode="HTML")
     except Exception as e: await u.message.reply_text(f"❌ Could not fetch: {e}")
@@ -2722,6 +2823,22 @@ async def on_message(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         qx("INSERT INTO vendor_holiday(vendor_id,from_date,to_date,message) VALUES(?,?,?,?) ON CONFLICT(vendor_id) DO UPDATE SET from_date=?,to_date=?,message=?",(vid,from_d,to_d,msg,from_d,to_d,msg))
         await u.message.reply_text(f"✅ Holiday mode set: {from_d} → {to_d}",reply_markup=menu()); ctx.user_data["wf"]=None
 
+    elif wf=="wallet_add":
+        if not is_admin(uid): ctx.user_data["wf"]=None; return
+        parts=[p.strip() for p in txt.split("|",1)]
+        if len(parts)!=2 or not parts[1].strip():
+            await u.message.reply_text("⚠️ Format: Label|Address e.g. Main Wallet|ltc1qxxx"); return
+        label,addr=parts[0],parts[1]
+        # If no wallets yet, make this one active by default
+        existing=q1("SELECT COUNT(*) as c FROM crypto_wallets")
+        is_first=1 if (not existing or existing["c"]==0) else 0
+        qxi("INSERT INTO crypto_wallets(label,address,is_active) VALUES(?,?,?)",(label,addr,is_first))
+        await u.message.reply_text(
+            f"✅ Wallet <b>{hl.escape(label)}</b> added!"
+            + (" Set as active (first wallet)." if is_first else " Use 💠 Wallets panel to set as active."),
+            parse_mode="HTML",reply_markup=menu())
+        ctx.user_data["wf"]=None
+
     elif wf=="set_cutoff":
         try: hr=int(txt.strip()); assert 1<=hr<=23
         except: await u.message.reply_text("⚠️ Enter a number 1–23 (e.g. 11 for 11am)."); return
@@ -2786,15 +2903,16 @@ async def on_photo(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def ltc_payment_detector(ctx: ContextTypes.DEFAULT_TYPE):
     pending = qa("SELECT id,ltc,user_id,vendor_id,gbp,vendor_gbp FROM orders WHERE status='Pending' AND ltc>0 AND ship='tracked24'")
     if not pending: return
+    active_wallet = get_active_wallet()
     try:
-        resp = requests.get(f"https://api.blockcypher.com/v1/ltc/main/addrs/{PLATFORM_LTC}/full?limit=50", timeout=15)
+        resp = requests.get(f"https://api.blockcypher.com/v1/ltc/main/addrs/{active_wallet}/full?limit=50", timeout=15)
         if resp.status_code != 200: return
         txs = resp.json().get("txs", [])
     except: return
     for tx in txs:
         txid = tx.get("hash","")
         if not txid or q1("SELECT 1 FROM ltc_transactions WHERE txid=?", (txid,)): continue
-        total_sat = sum(o.get("value",0) for o in tx.get("outputs",[]) if PLATFORM_LTC in o.get("addresses",[]))
+        total_sat = sum(o.get("value",0) for o in tx.get("outputs",[]) if active_wallet in o.get("addresses",[]))
         if total_sat == 0: continue
         ltc_received = total_sat / 100000000; confirmations = tx.get("confirmations", 0)
         for order in pending:
@@ -3129,6 +3247,9 @@ async def router(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "vendor_balance":    lambda: vendor_balance_cb(u,ctx),
         "vendor_payout_req": lambda: vendor_payout_req(u,ctx),
         "ltccheck_btn":      lambda: ltccheck_btn_cb(u,ctx),
+        "adm_wallets":       lambda: adm_wallets(u,ctx),
+        "wallet_add":        lambda: wallet_add_start(u,ctx),
+        "own_rm_vendor_wallet": lambda: owner_rm_vendor_wallet(u,ctx),
     }
     if d in ROUTES: await ROUTES[d](); return
 
